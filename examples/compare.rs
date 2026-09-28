@@ -18,10 +18,12 @@ const WAT: &str = r#"
 const COUNTS: [usize; 4] = [1, 1_000, 1_000_000, 10_000_000];
 const MIX_ROUNDS: u32 = 32;
 const MIX_MULTIPLIER: u32 = 0x9e37_79b1;
+const OTHER_MULTIPLIER: u32 = 0x85eb_ca6b;
 
 fn main() -> Result<()> {
     let large = match std::env::args().nth(1).as_deref() {
-        Some("--mix") => return compare_mix(),
+        Some("--mix") => return compare_compute(false),
+        Some("--control") => return compare_compute(true),
         Some("--metal-native-100m") => true,
         Some(argument) => return Err(format!("unknown argument: {argument}").into()),
         None => false,
@@ -122,8 +124,9 @@ fn compare_large(metal: &Kernel) -> Result<()> {
     Ok(())
 }
 
-fn compare_mix() -> Result<()> {
-    let wasm = wat::parse_str(mix_wat())?;
+fn compare_compute(control: bool) -> Result<()> {
+    let wasm = wat::parse_str(if control { control_wat() } else { mix_wat() })?;
+    let expected: fn(u32) -> u32 = if control { control_native } else { mix_native };
     let metal = Kernel::new(&wasm, "calculate")?;
     let wasmtime_engine = wasmtime::Engine::default();
     let wasmtime_module = wasmtime::Module::new(&wasmtime_engine, &wasm)?;
@@ -151,38 +154,49 @@ fn compare_mix() -> Result<()> {
         }
         Ok(output)
     };
-    let warmup = [42u32];
+    let warmup = [42u32, 43];
     metal.run_timed(&warmup)?;
     run_wasmtime(&warmup)?;
     run_wasmi(&warmup)?;
-    std::hint::black_box(mix_native(warmup[0]));
+    std::hint::black_box(expected(warmup[0]));
 
-    println!("count,metal_total_us,metal_gpu_us,wasmtime_us,wasmi_us,native_us,samples");
+    println!("pattern,count,metal_total_us,metal_gpu_us,wasmtime_us,wasmi_us,native_us,samples");
+    let patterns: &[(&str, bool)] = if control {
+        &[("grouped", true), ("mixed", false)]
+    } else {
+        &[("straight", false)]
+    };
     for count in [1_000, 1_000_000, 10_000_000, 100_000_000] {
-        eprintln!("measuring {count} mixed invocations...");
-        let inputs: Vec<u32> = (0..count).map(|value| value as u32).collect();
-        let (metal_total, metal_gpu) = measure_metal(&metal, &inputs, mix_native)?;
-        let native = measure(&inputs, 3, 1, mix_native, |inputs| {
-            Ok(inputs.iter().copied().map(mix_native).collect())
-        })?;
-        if count == 100_000_000 {
-            println!(
-                "{count},{:.2},{:.2},,,{:.2},3",
-                micros(metal_total),
-                micros(metal_gpu),
-                micros(native)
-            );
-        } else {
-            let wasmtime = measure(&inputs, 3, 1, mix_native, &mut run_wasmtime)?;
-            let wasmi = measure(&inputs, 3, 1, mix_native, &mut run_wasmi)?;
-            println!(
-                "{count},{:.2},{:.2},{:.2},{:.2},{:.2},3",
-                micros(metal_total),
-                micros(metal_gpu),
-                micros(wasmtime),
-                micros(wasmi),
-                micros(native)
-            );
+        for &(pattern, grouped) in patterns {
+            eprintln!("measuring {pattern} at {count} invocations...");
+            let inputs: Vec<u32> = if control {
+                control_inputs(count, grouped)
+            } else {
+                (0..count).map(|value| value as u32).collect()
+            };
+            let (metal_total, metal_gpu) = measure_metal(&metal, &inputs, expected)?;
+            let native = measure(&inputs, 3, 1, expected, |inputs| {
+                Ok(inputs.iter().copied().map(expected).collect())
+            })?;
+            if count == 100_000_000 {
+                println!(
+                    "{pattern},{count},{:.2},{:.2},,,{:.2},3",
+                    micros(metal_total),
+                    micros(metal_gpu),
+                    micros(native)
+                );
+            } else {
+                let wasmtime = measure(&inputs, 3, 1, expected, &mut run_wasmtime)?;
+                let wasmi = measure(&inputs, 3, 1, expected, &mut run_wasmi)?;
+                println!(
+                    "{pattern},{count},{:.2},{:.2},{:.2},{:.2},{:.2},3",
+                    micros(metal_total),
+                    micros(metal_gpu),
+                    micros(wasmtime),
+                    micros(wasmi),
+                    micros(native)
+                );
+            }
         }
     }
     Ok(())
@@ -200,6 +214,79 @@ fn mix_wat() -> String {
     wat
 }
 
+fn control_wat() -> String {
+    format!(
+        r#"(module
+            (func (export "calculate") (param i32) (result i32) (local i32 i32)
+                local.get 0
+                local.set 1
+                i32.const 0
+                local.set 2
+                loop
+                    local.get 0
+                    i32.const 1
+                    i32.and
+                    if
+                        local.get 1
+                        i32.const 5
+                        i32.rotl
+                        local.get 0
+                        i32.xor
+                        i32.const {odd_multiplier}
+                        i32.mul
+                        local.get 2
+                        i32.add
+                        local.set 1
+                    else
+                        local.get 1
+                        i32.const 13
+                        i32.rotl
+                        local.get 0
+                        i32.xor
+                        i32.const {even_multiplier}
+                        i32.mul
+                        local.get 2
+                        i32.add
+                        local.set 1
+                    end
+                    local.get 2
+                    i32.const 1
+                    i32.add
+                    local.tee 2
+                    i32.const {rounds}
+                    i32.ne
+                    br_if 0
+                end
+                local.get 1))"#,
+        odd_multiplier = MIX_MULTIPLIER as i32,
+        even_multiplier = OTHER_MULTIPLIER as i32,
+        rounds = MIX_ROUNDS
+    )
+}
+
+fn control_inputs(count: usize, grouped: bool) -> Vec<u32> {
+    let even_count = ((count / 2).div_ceil(32) * 32).min(count);
+    let odd_count = count - even_count;
+    let paired_count = even_count.min(odd_count);
+    (0..count)
+        .map(|index| {
+            if grouped {
+                if index < even_count {
+                    (2 * index) as u32
+                } else {
+                    (2 * (index - even_count) + 1) as u32
+                }
+            } else if index < 2 * paired_count {
+                index as u32
+            } else if even_count > odd_count {
+                (2 * (index - odd_count)) as u32
+            } else {
+                (2 * (index - even_count) + 1) as u32
+            }
+        })
+        .collect()
+}
+
 fn run_native(inputs: &[u32]) -> Result<Vec<u32>> {
     Ok(inputs.iter().copied().map(calculate_native).collect())
 }
@@ -215,6 +302,23 @@ fn mix_native(mut value: u32) -> u32 {
         value = (value.rotate_left(5) ^ value)
             .wrapping_mul(MIX_MULTIPLIER)
             .wrapping_add(round);
+    }
+    value
+}
+
+#[inline(always)]
+fn control_native(input: u32) -> u32 {
+    let mut value = input;
+    for round in 0..MIX_ROUNDS {
+        value = if input & 1 != 0 {
+            (value.rotate_left(5) ^ input)
+                .wrapping_mul(MIX_MULTIPLIER)
+                .wrapping_add(round)
+        } else {
+            (value.rotate_left(13) ^ input)
+                .wrapping_mul(OTHER_MULTIPLIER)
+                .wrapping_add(round)
+        };
     }
     value
 }
@@ -277,4 +381,27 @@ fn verify_output(inputs: &[u32], output: &[u32], expected: fn(u32) -> u32) -> Re
 
 fn micros(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::control_inputs;
+
+    #[test]
+    fn control_patterns_have_the_same_values_and_grouped_branches_agree() {
+        for count in [1_000, 1_000_000] {
+            let grouped = control_inputs(count, true);
+            let mixed = control_inputs(count, false);
+            assert!(
+                grouped
+                    .chunks(32)
+                    .all(|chunk| chunk.iter().all(|value| value & 1 == chunk[0] & 1))
+            );
+            let mut grouped_sorted = grouped;
+            let mut mixed_sorted = mixed;
+            grouped_sorted.sort_unstable();
+            mixed_sorted.sort_unstable();
+            assert_eq!(grouped_sorted, mixed_sorted);
+        }
+    }
 }

@@ -9,7 +9,9 @@ use metal::{
     CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus, MTLResourceOptions,
     MTLSize,
 };
-use wasmparser::{ExternalKind, FunctionBody, Operator, Parser, Payload, ValType, Validator};
+use wasmparser::{
+    BlockType, ExternalKind, FunctionBody, Operator, Parser, Payload, ValType, Validator,
+};
 
 /// A compiled `(param i32) (result i32)` WebAssembly export.
 pub struct Kernel {
@@ -217,45 +219,351 @@ fn translate_body(body: &FunctionBody<'_>) -> Result<String, Error> {
         local_count = end;
     }
 
-    let mut stack = Vec::<String>::new();
-    let mut next_value = 0usize;
-    let mut ended = false;
-    for operator in body.get_operators_reader()? {
-        let operator = operator?;
-        match operator {
-            Operator::End => {
-                ended = true;
-                break;
+    let mut operators = body.get_operators_reader()?.into_iter();
+    let (instructions, end) = read_instructions(&mut operators)?;
+    if end != End::Block || operators.next().is_some() {
+        return Err(Error::Unsupported("invalid function body".into()));
+    }
+    let declarations_at = source.len();
+    source.push_str("uint flow = 0u;\nuint result = 0u;\n");
+    let mut compiler = Compiler {
+        source,
+        declarations: String::new(),
+        local_count,
+        next_value: 0,
+        next_frame: 1,
+        frames: vec![Frame {
+            id: 1,
+            result: Some("result".into()),
+            loop_label: false,
+        }],
+    };
+    let mut stack = Vec::new();
+    let reachable = compiler.emit_instructions(&instructions, &mut stack)?;
+    compiler.finish_path(reachable, &mut stack, 0, Some("result"))?;
+    compiler.source.push_str("output[id] = result;\n}\n");
+    compiler
+        .source
+        .insert_str(declarations_at, &compiler.declarations);
+    Ok(compiler.source)
+}
+
+#[derive(PartialEq, Eq)]
+enum End {
+    Block,
+    Else,
+}
+
+enum Instruction<'a> {
+    Basic(Operator<'a>),
+    Block(BlockType, Vec<Instruction<'a>>),
+    Loop(BlockType, Vec<Instruction<'a>>),
+    If(BlockType, Vec<Instruction<'a>>, Vec<Instruction<'a>>),
+}
+
+fn read_instructions<'a>(
+    operators: &mut impl Iterator<Item = Result<Operator<'a>, wasmparser::BinaryReaderError>>,
+) -> Result<(Vec<Instruction<'a>>, End), Error> {
+    let mut instructions = Vec::new();
+    while let Some(operator) = operators.next() {
+        match operator? {
+            Operator::End => return Ok((instructions, End::Block)),
+            Operator::Else => return Ok((instructions, End::Else)),
+            Operator::Block { blockty } => {
+                let (body, end) = read_instructions(operators)?;
+                if end != End::Block {
+                    return Err(Error::Unsupported("else outside if".into()));
+                }
+                instructions.push(Instruction::Block(blockty, body));
             }
-            Operator::I32Const { value } => stack.push(format!("{}u", value as u32)),
+            Operator::Loop { blockty } => {
+                let (body, end) = read_instructions(operators)?;
+                if end != End::Block {
+                    return Err(Error::Unsupported("else outside if".into()));
+                }
+                instructions.push(Instruction::Loop(blockty, body));
+            }
+            Operator::If { blockty } => {
+                let (then_body, end) = read_instructions(operators)?;
+                let else_body = if end == End::Else {
+                    let (else_body, end) = read_instructions(operators)?;
+                    if end != End::Block {
+                        return Err(Error::Unsupported("invalid if".into()));
+                    }
+                    else_body
+                } else {
+                    Vec::new()
+                };
+                instructions.push(Instruction::If(blockty, then_body, else_body));
+            }
+            operator => instructions.push(Instruction::Basic(operator)),
+        }
+    }
+    Err(Error::Unsupported("missing end instruction".into()))
+}
+
+#[derive(Clone)]
+struct Frame {
+    id: usize,
+    result: Option<String>,
+    loop_label: bool,
+}
+
+struct Compiler {
+    source: String,
+    declarations: String,
+    local_count: usize,
+    next_value: usize,
+    next_frame: usize,
+    frames: Vec<Frame>,
+}
+
+impl Compiler {
+    fn emit_value(&mut self, stack: &mut Vec<String>, expression: String) {
+        let name = format!("v{}", self.next_value);
+        self.next_value += 1;
+        self.declarations.push_str(&format!("uint {name} = 0u;\n"));
+        self.source.push_str(&format!("{name} = {expression};\n"));
+        stack.push(name);
+    }
+
+    fn new_frame(&mut self, blockty: BlockType, loop_label: bool) -> Result<Frame, Error> {
+        let result = match blockty {
+            BlockType::Empty => None,
+            BlockType::Type(ValType::I32) => {
+                let name = format!("v{}", self.next_value);
+                self.next_value += 1;
+                self.declarations.push_str(&format!("uint {name} = 0u;\n"));
+                Some(name)
+            }
+            _ => {
+                return Err(Error::Unsupported(
+                    "only inline empty or i32 result block types are supported".into(),
+                ));
+            }
+        };
+        self.next_frame += 1;
+        Ok(Frame {
+            id: self.next_frame,
+            result,
+            loop_label,
+        })
+    }
+
+    fn finish_path(
+        &mut self,
+        reachable: bool,
+        stack: &mut Vec<String>,
+        base: usize,
+        result: Option<&str>,
+    ) -> Result<(), Error> {
+        if !reachable {
+            return Ok(());
+        }
+        if stack.len() != base + usize::from(result.is_some()) {
+            return Err(Error::Unsupported(
+                "block has the wrong result stack".into(),
+            ));
+        }
+        if let Some(result) = result {
+            let value = pop(stack)?;
+            self.source
+                .push_str(&format!("if (flow == 0u) {result} = {value};\n"));
+        }
+        Ok(())
+    }
+
+    fn emit_instructions(
+        &mut self,
+        instructions: &[Instruction<'_>],
+        stack: &mut Vec<String>,
+    ) -> Result<bool, Error> {
+        let mut guards = 0;
+        let mut reachable = true;
+        for instruction in instructions {
+            let guard = match instruction {
+                Instruction::Basic(operator) => match operator {
+                    Operator::Br { relative_depth } => {
+                        self.emit_branch(*relative_depth, stack, None)?;
+                        reachable = false;
+                        break;
+                    }
+                    Operator::BrIf { relative_depth } => {
+                        let condition = pop(stack)?;
+                        self.emit_branch(*relative_depth, stack, Some(condition))?;
+                        true
+                    }
+                    Operator::Return => {
+                        self.emit_branch((self.frames.len() - 1) as u32, stack, None)?;
+                        reachable = false;
+                        break;
+                    }
+                    _ => {
+                        self.emit_basic(operator, stack)?;
+                        false
+                    }
+                },
+                Instruction::Block(blockty, body) => {
+                    self.emit_block(*blockty, body, stack, false)?;
+                    true
+                }
+                Instruction::Loop(blockty, body) => {
+                    self.emit_block(*blockty, body, stack, true)?;
+                    true
+                }
+                Instruction::If(blockty, then_body, else_body) => {
+                    self.emit_if(*blockty, then_body, else_body, stack)?;
+                    true
+                }
+            };
+            if guard {
+                self.source.push_str("if (flow == 0u) {\n");
+                guards += 1;
+            }
+        }
+        for _ in 0..guards {
+            self.source.push_str("}\n");
+        }
+        Ok(reachable)
+    }
+
+    fn emit_branch(
+        &mut self,
+        depth: u32,
+        stack: &[String],
+        condition: Option<String>,
+    ) -> Result<(), Error> {
+        let frame = self
+            .frames
+            .iter()
+            .rev()
+            .nth(depth as usize)
+            .ok_or_else(|| Error::Unsupported("branch depth out of range".into()))?
+            .clone();
+        if let Some(ref condition) = condition {
+            self.source
+                .push_str(&format!("if ({condition} != 0u) {{\n"));
+        }
+        if !frame.loop_label
+            && let Some(result) = frame.result
+        {
+            let value = stack
+                .last()
+                .ok_or_else(|| Error::Unsupported("branch result is missing".into()))?;
+            self.source.push_str(&format!("{result} = {value};\n"));
+        }
+        self.source.push_str(&format!("flow = {}u;\n", frame.id));
+        if condition.is_some() {
+            self.source.push_str("}\n");
+        }
+        Ok(())
+    }
+
+    fn emit_block(
+        &mut self,
+        blockty: BlockType,
+        body: &[Instruction<'_>],
+        stack: &mut Vec<String>,
+        loop_label: bool,
+    ) -> Result<(), Error> {
+        let frame = self.new_frame(blockty, loop_label)?;
+        let mut inner_stack = stack.clone();
+        self.frames.push(frame.clone());
+        if loop_label {
+            self.source.push_str("while (true) {\n");
+        } else {
+            self.source.push_str("{\n");
+        }
+        let reachable = self.emit_instructions(body, &mut inner_stack)?;
+        self.finish_path(
+            reachable,
+            &mut inner_stack,
+            stack.len(),
+            frame.result.as_deref(),
+        )?;
+        if loop_label {
+            self.source.push_str(&format!(
+                "if (flow == {}u) {{ flow = 0u; continue; }}\nbreak;\n",
+                frame.id
+            ));
+        }
+        self.source.push_str("}\n");
+        if !loop_label {
+            self.source
+                .push_str(&format!("if (flow == {}u) flow = 0u;\n", frame.id));
+        }
+        self.frames.pop();
+        if let Some(result) = frame.result {
+            stack.push(result);
+        }
+        Ok(())
+    }
+
+    fn emit_if(
+        &mut self,
+        blockty: BlockType,
+        then_body: &[Instruction<'_>],
+        else_body: &[Instruction<'_>],
+        stack: &mut Vec<String>,
+    ) -> Result<(), Error> {
+        let condition = pop(stack)?;
+        let frame = self.new_frame(blockty, false)?;
+        self.frames.push(frame.clone());
+        self.source
+            .push_str(&format!("if ({condition} != 0u) {{\n"));
+        let mut then_stack = stack.clone();
+        let then_reachable = self.emit_instructions(then_body, &mut then_stack)?;
+        self.finish_path(
+            then_reachable,
+            &mut then_stack,
+            stack.len(),
+            frame.result.as_deref(),
+        )?;
+        self.source.push_str("} else {\n");
+        let mut else_stack = stack.clone();
+        let else_reachable = self.emit_instructions(else_body, &mut else_stack)?;
+        self.finish_path(
+            else_reachable,
+            &mut else_stack,
+            stack.len(),
+            frame.result.as_deref(),
+        )?;
+        self.source.push_str("}\n");
+        self.source
+            .push_str(&format!("if (flow == {}u) flow = 0u;\n", frame.id));
+        self.frames.pop();
+        if let Some(result) = frame.result {
+            stack.push(result);
+        }
+        Ok(())
+    }
+
+    fn emit_basic(
+        &mut self,
+        operator: &Operator<'_>,
+        stack: &mut Vec<String>,
+    ) -> Result<(), Error> {
+        match operator {
+            Operator::I32Const { value } => stack.push(format!("{}u", *value as u32)),
             Operator::LocalGet { local_index } => {
-                check_local(local_index, local_count)?;
-                emit(
-                    &mut source,
-                    &mut stack,
-                    &mut next_value,
-                    format!("l{local_index}"),
-                );
+                check_local(*local_index, self.local_count)?;
+                self.emit_value(stack, format!("l{local_index}"));
             }
             Operator::LocalSet { local_index } | Operator::LocalTee { local_index } => {
-                check_local(local_index, local_count)?;
-                let value = pop(&mut stack)?;
-                source.push_str(&format!("l{local_index} = {value};\n"));
+                check_local(*local_index, self.local_count)?;
+                let value = pop(stack)?;
+                self.source
+                    .push_str(&format!("l{local_index} = {value};\n"));
                 if matches!(operator, Operator::LocalTee { .. }) {
                     stack.push(value);
                 }
             }
             Operator::Drop => {
-                pop(&mut stack)?;
+                pop(stack)?;
             }
             Operator::I32Eqz => {
-                let value = pop(&mut stack)?;
-                emit(
-                    &mut source,
-                    &mut stack,
-                    &mut next_value,
-                    format!("uint({value} == 0u)"),
-                );
+                let value = pop(stack)?;
+                self.emit_value(stack, format!("uint({value} == 0u)"));
             }
             Operator::I32Add
             | Operator::I32Sub
@@ -269,8 +577,8 @@ fn translate_body(body: &FunctionBody<'_>) -> Result<String, Error> {
             | Operator::I32Rotr
             | Operator::I32Eq
             | Operator::I32Ne => {
-                let rhs = pop(&mut stack)?;
-                let lhs = pop(&mut stack)?;
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
                 let expression = match operator {
                     Operator::I32Add => format!("{lhs} + {rhs}"),
                     Operator::I32Sub => format!("{lhs} - {rhs}"),
@@ -290,18 +598,12 @@ fn translate_body(body: &FunctionBody<'_>) -> Result<String, Error> {
                     Operator::I32Ne => format!("uint({lhs} != {rhs})"),
                     _ => unreachable!(),
                 };
-                emit(&mut source, &mut stack, &mut next_value, expression);
+                self.emit_value(stack, expression);
             }
             _ => return Err(Error::Unsupported(format!("instruction {operator:?}"))),
         }
+        Ok(())
     }
-    if !ended || stack.len() != 1 {
-        return Err(Error::Unsupported(
-            "function must leave one i32 result".into(),
-        ));
-    }
-    source.push_str(&format!("output[id] = {};\n}}\n", stack.pop().unwrap()));
-    Ok(source)
 }
 
 fn check_local(index: u32, count: usize) -> Result<(), Error> {
@@ -317,13 +619,6 @@ fn pop(stack: &mut Vec<String>) -> Result<String, Error> {
     stack
         .pop()
         .ok_or_else(|| Error::Unsupported("operand stack underflow".into()))
-}
-
-fn emit(source: &mut String, stack: &mut Vec<String>, next_value: &mut usize, expression: String) {
-    let name = format!("v{}", *next_value);
-    *next_value += 1;
-    source.push_str(&format!("uint {name} = {expression};\n"));
-    stack.push(name);
 }
 
 #[cfg(test)]
@@ -360,13 +655,53 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_control_flow() {
+    fn chooses_each_if_result() {
         let wasm = wat::parse_str(
             "(module (func (export \"branch\") (param i32) (result i32) local.get 0 if (result i32) i32.const 1 else i32.const 2 end))",
         )
         .unwrap();
-        let error = Kernel::new(&wasm, "branch").err().unwrap();
-        assert!(matches!(error, Error::Unsupported(_)));
+        let kernel = Kernel::new(&wasm, "branch").unwrap();
+        assert_eq!(kernel.run(&[0, 1, u32::MAX]).unwrap(), [2, 1, 1]);
+    }
+
+    #[test]
+    fn repeats_a_loop_with_br_if() {
+        let wasm = wat::parse_str(
+            "(module (func (export \"repeat\") (param i32) (result i32) (local i32) i32.const 0 local.set 1 loop local.get 0 i32.const 3 i32.mul local.set 0 local.get 1 i32.const 1 i32.add local.tee 1 i32.const 4 i32.ne br_if 0 end local.get 0))",
+        )
+        .unwrap();
+        let kernel = Kernel::new(&wasm, "repeat").unwrap();
+        assert_eq!(kernel.run(&[0, 1, 3]).unwrap(), [0, 81, 243]);
+    }
+
+    #[test]
+    fn branches_out_of_nested_blocks_with_a_result() {
+        let wasm = wat::parse_str(
+            "(module (func (export \"nested\") (param i32) (result i32) block (result i32) loop local.get 0 i32.const 1 i32.and if i32.const 42 br 2 end i32.const 7 br 1 end i32.const 99 end))",
+        )
+        .unwrap();
+        let kernel = Kernel::new(&wasm, "nested").unwrap();
+        assert_eq!(kernel.run(&[0, 1, 2, 3]).unwrap(), [7, 42, 7, 42]);
+    }
+
+    #[test]
+    fn conditional_branch_keeps_its_value_on_fallthrough() {
+        let wasm = wat::parse_str(
+            "(module (func (export \"select\") (param i32) (result i32) block (result i32) i32.const 7 local.get 0 br_if 0 i32.const 2 i32.add end))",
+        )
+        .unwrap();
+        let kernel = Kernel::new(&wasm, "select").unwrap();
+        assert_eq!(kernel.run(&[0, 1]).unwrap(), [9, 7]);
+    }
+
+    #[test]
+    fn returns_from_inside_a_conditional() {
+        let wasm = wat::parse_str(
+            "(module (func (export \"early\") (param i32) (result i32) local.get 0 if i32.const 99 return end local.get 0))",
+        )
+        .unwrap();
+        let kernel = Kernel::new(&wasm, "early").unwrap();
+        assert_eq!(kernel.run(&[0, 1, 2]).unwrap(), [0, 99, 99]);
     }
 
     #[test]
