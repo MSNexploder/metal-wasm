@@ -2,7 +2,7 @@
 
 Run many independent invocations of one WebAssembly function on a Metal GPU. Each input value gets its own Metal thread and produces one output value.
 
-This version accepts a `.wasm` module with an exported `(param i32) (result i32)` function. It supports `i32` constants, locals, drop, equality, add, subtract, multiply, bitwise operations, shifts, and rotations. It also supports `block`, `if`/`else`, `loop`, `br`, `br_if`, and `return`, with inline empty or single `i32` result block types. Type-index block signatures are unsupported. Other instructions and module sections return an `Unsupported` error. There is no linear memory, imports, calls, or shared state yet. Values use `u32` in Rust to preserve the raw WebAssembly `i32` bits.
+This version accepts a `.wasm` module with an exported `(param i32) (result i32)` function. It supports all self-contained scalar `i32` instructions: constants, locals, drop, select, comparisons, arithmetic, division, remainder, bit counts, bitwise operations, shifts, rotations, and sign extension. It supports `block`, `if`/`else`, `loop`, `br`, `br_if`, `br_table`, `return`, `nop`, and `unreachable`. Blocks can use type-index signatures with multiple `i32` parameters and results. If an invocation traps, `run` returns `Error::Trap` with the first input index and the reason; results for that batch are discarded. Other instructions and module sections return an `Unsupported` error. There is no linear memory, imports, calls, or shared state yet. Values use `u32` in Rust to preserve the raw WebAssembly `i32` bits.
 
 ```rust
 use metal_wasm::Kernel;

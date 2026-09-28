@@ -10,7 +10,7 @@ use metal::{
     MTLSize,
 };
 use wasmparser::{
-    BlockType, ExternalKind, FunctionBody, Operator, Parser, Payload, ValType, Validator,
+    BlockType, ExternalKind, FuncType, FunctionBody, Operator, Parser, Payload, ValType, Validator,
 };
 
 /// A compiled `(param i32) (result i32)` WebAssembly export.
@@ -18,6 +18,7 @@ pub struct Kernel {
     device: Device,
     queue: metal::CommandQueue,
     pipeline: ComputePipelineState,
+    can_trap: bool,
 }
 
 /// An error while validating, compiling, or running a WebAssembly export.
@@ -26,12 +27,16 @@ pub enum Error {
     InvalidWasm(wasmparser::BinaryReaderError),
     Unsupported(String),
     Metal(String),
+    Trap {
+        input_index: usize,
+        reason: &'static str,
+    },
 }
 
 impl Kernel {
     /// Compile a WebAssembly export for the system's default Metal device.
     pub fn new(wasm: &[u8], export: &str) -> Result<Self, Error> {
-        let source = translate(wasm, export)?;
+        let (source, can_trap) = translate(wasm, export)?;
         let device = Device::system_default()
             .ok_or_else(|| Error::Metal("no Metal device is available".into()))?;
         let library = device
@@ -48,6 +53,7 @@ impl Kernel {
             device,
             queue,
             pipeline,
+            can_trap,
         })
     }
 
@@ -84,12 +90,19 @@ impl Kernel {
         let output = self
             .device
             .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+        let traps = self.can_trap.then(|| {
+            self.device
+                .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+        });
         let command = self.queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline);
         encoder.set_buffer(0, Some(&input), 0);
         encoder.set_buffer(1, Some(&output), 0);
         encoder.set_bytes(2, size_of::<u32>() as u64, (&count as *const u32).cast());
+        if let Some(traps) = &traps {
+            encoder.set_buffer(3, Some(traps), 0);
+        }
         let width = self
             .pipeline
             .thread_execution_width()
@@ -104,6 +117,24 @@ impl Kernel {
                 "Metal command failed: {:?}",
                 command.status()
             )));
+        }
+        if let Some(traps) = &traps {
+            let codes =
+                unsafe { std::slice::from_raw_parts(traps.contents().cast::<u32>(), inputs.len()) };
+            if let Some((input_index, code)) =
+                codes.iter().enumerate().find(|(_, code)| **code != 0)
+            {
+                let reason = match code {
+                    1 => "integer divide by zero",
+                    2 => "integer overflow",
+                    3 => "unreachable executed",
+                    _ => "unknown trap",
+                };
+                return Err(Error::Trap {
+                    input_index,
+                    reason,
+                });
+            }
         }
 
         // Metal-rs does not wrap these MTLCommandBuffer properties.
@@ -129,6 +160,15 @@ impl fmt::Display for Error {
             Self::InvalidWasm(error) => write!(formatter, "invalid WebAssembly: {error}"),
             Self::Unsupported(reason) => write!(formatter, "unsupported WebAssembly: {reason}"),
             Self::Metal(reason) => write!(formatter, "Metal error: {reason}"),
+            Self::Trap {
+                input_index,
+                reason,
+            } => {
+                write!(
+                    formatter,
+                    "WebAssembly trap at input {input_index}: {reason}"
+                )
+            }
         }
     }
 }
@@ -141,7 +181,7 @@ impl From<wasmparser::BinaryReaderError> for Error {
     }
 }
 
-fn translate(wasm: &[u8], export_name: &str) -> Result<String, Error> {
+fn translate(wasm: &[u8], export_name: &str) -> Result<(String, bool), Error> {
     Validator::new().validate_all(wasm)?;
 
     let mut types = Vec::new();
@@ -196,13 +236,30 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<String, Error> {
     let body = bodies
         .get(index)
         .ok_or_else(|| Error::Unsupported("exported function body is missing".into()))?;
-    translate_body(body)
+    translate_body(body, &types)
 }
 
-fn translate_body(body: &FunctionBody<'_>) -> Result<String, Error> {
+fn translate_body(body: &FunctionBody<'_>, types: &[FuncType]) -> Result<(String, bool), Error> {
     let mut source = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
-    source.push_str("kernel void run_wasm(device const uint* input [[buffer(0)]], device uint* output [[buffer(1)]], constant uint& count [[buffer(2)]], uint id [[thread_position_in_grid]]) {\n");
+    let can_trap = body.get_operators_reader()?.into_iter().any(|op| {
+        matches!(
+            op,
+            Ok(Operator::I32DivS
+                | Operator::I32DivU
+                | Operator::I32RemS
+                | Operator::I32RemU
+                | Operator::Unreachable)
+        )
+    });
+    source.push_str("kernel void run_wasm(device const uint* input [[buffer(0)]], device uint* output [[buffer(1)]], constant uint& count [[buffer(2)]]");
+    if can_trap {
+        source.push_str(", device uint* traps [[buffer(3)]]");
+    }
+    source.push_str(", uint id [[thread_position_in_grid]]) {\n");
     source.push_str("if (id >= count) return;\n");
+    if can_trap {
+        source.push_str("traps[id] = 0u;\n");
+    }
     source.push_str("uint l0 = input[id];\n");
     let mut local_count = 1usize;
     for local in body.get_locals_reader()? {
@@ -232,20 +289,22 @@ fn translate_body(body: &FunctionBody<'_>) -> Result<String, Error> {
         local_count,
         next_value: 0,
         next_frame: 1,
+        types,
         frames: vec![Frame {
             id: 1,
-            result: Some("result".into()),
+            params: Vec::new(),
+            results: vec!["result".into()],
             loop_label: false,
         }],
     };
     let mut stack = Vec::new();
     let reachable = compiler.emit_instructions(&instructions, &mut stack)?;
-    compiler.finish_path(reachable, &mut stack, 0, Some("result"))?;
+    compiler.finish_path(reachable, &mut stack, 0, &["result".into()])?;
     compiler.source.push_str("output[id] = result;\n}\n");
     compiler
         .source
         .insert_str(declarations_at, &compiler.declarations);
-    Ok(compiler.source)
+    Ok((compiler.source, can_trap))
 }
 
 #[derive(PartialEq, Eq)]
@@ -305,49 +364,100 @@ fn read_instructions<'a>(
 #[derive(Clone)]
 struct Frame {
     id: usize,
-    result: Option<String>,
+    params: Vec<String>,
+    results: Vec<String>,
     loop_label: bool,
 }
 
-struct Compiler {
+struct Compiler<'a> {
     source: String,
     declarations: String,
     local_count: usize,
     next_value: usize,
     next_frame: usize,
+    types: &'a [FuncType],
     frames: Vec<Frame>,
 }
 
-impl Compiler {
-    fn emit_value(&mut self, stack: &mut Vec<String>, expression: String) {
+impl Compiler<'_> {
+    fn fresh_value(&mut self) -> String {
         let name = format!("v{}", self.next_value);
         self.next_value += 1;
         self.declarations.push_str(&format!("uint {name} = 0u;\n"));
+        name
+    }
+
+    fn emit_value(&mut self, stack: &mut Vec<String>, expression: String) {
+        let name = self.fresh_value();
         self.source.push_str(&format!("{name} = {expression};\n"));
         stack.push(name);
     }
 
     fn new_frame(&mut self, blockty: BlockType, loop_label: bool) -> Result<Frame, Error> {
-        let result = match blockty {
-            BlockType::Empty => None,
-            BlockType::Type(ValType::I32) => {
-                let name = format!("v{}", self.next_value);
-                self.next_value += 1;
-                self.declarations.push_str(&format!("uint {name} = 0u;\n"));
-                Some(name)
+        let (params, results) = match blockty {
+            BlockType::Empty => (0, 0),
+            BlockType::Type(ValType::I32) => (0, 1),
+            BlockType::FuncType(index) => {
+                let ty = self
+                    .types
+                    .get(index as usize)
+                    .ok_or_else(|| Error::Unsupported("block type index is out of range".into()))?;
+                if ty
+                    .params()
+                    .iter()
+                    .chain(ty.results())
+                    .any(|ty| *ty != ValType::I32)
+                {
+                    return Err(Error::Unsupported(
+                        "only i32 block signatures are supported".into(),
+                    ));
+                }
+                (ty.params().len(), ty.results().len())
             }
             _ => {
                 return Err(Error::Unsupported(
-                    "only inline empty or i32 result block types are supported".into(),
+                    "only i32 block signatures are supported".into(),
                 ));
             }
         };
         self.next_frame += 1;
         Ok(Frame {
             id: self.next_frame,
-            result,
+            params: (0..params).map(|_| self.fresh_value()).collect(),
+            results: (0..results).map(|_| self.fresh_value()).collect(),
             loop_label,
         })
+    }
+
+    fn assign_slots(&mut self, slots: &[String], values: &[String]) {
+        if values.iter().any(|value| slots.contains(value)) {
+            // Loop branches can swap parameter slots; read all values before writing any.
+            let snapshots: Vec<_> = values
+                .iter()
+                .map(|value| {
+                    let name = self.fresh_value();
+                    self.source.push_str(&format!("{name} = {value};\n"));
+                    name
+                })
+                .collect();
+            for (slot, value) in slots.iter().zip(snapshots) {
+                self.source.push_str(&format!("{slot} = {value};\n"));
+            }
+        } else {
+            for (slot, value) in slots.iter().zip(values) {
+                self.source.push_str(&format!("{slot} = {value};\n"));
+            }
+        }
+    }
+
+    fn enter_frame(&mut self, frame: &Frame, stack: &mut Vec<String>) -> Result<usize, Error> {
+        if stack.len() < frame.params.len() {
+            return Err(Error::Unsupported("block parameter is missing".into()));
+        }
+        let base = stack.len() - frame.params.len();
+        self.assign_slots(&frame.params, &stack[base..]);
+        stack.truncate(base);
+        Ok(base)
     }
 
     fn finish_path(
@@ -355,20 +465,20 @@ impl Compiler {
         reachable: bool,
         stack: &mut Vec<String>,
         base: usize,
-        result: Option<&str>,
+        results: &[String],
     ) -> Result<(), Error> {
         if !reachable {
             return Ok(());
         }
-        if stack.len() != base + usize::from(result.is_some()) {
+        if stack.len() != base + results.len() {
             return Err(Error::Unsupported(
                 "block has the wrong result stack".into(),
             ));
         }
-        if let Some(result) = result {
-            let value = pop(stack)?;
-            self.source
-                .push_str(&format!("if (flow == 0u) {result} = {value};\n"));
+        if !results.is_empty() {
+            self.source.push_str("if (flow == 0u) {\n");
+            self.assign_slots(results, &stack[base..]);
+            self.source.push_str("}\n");
         }
         Ok(())
     }
@@ -393,8 +503,32 @@ impl Compiler {
                         self.emit_branch(*relative_depth, stack, Some(condition))?;
                         true
                     }
+                    Operator::BrTable { targets } => {
+                        let index = pop(stack)?;
+                        for (case, depth) in targets.targets().enumerate() {
+                            self.source.push_str(&format!(
+                                "{}if ({index} == {case}u) {{\n",
+                                if case == 0 { "" } else { "else " }
+                            ));
+                            self.emit_branch(depth?, stack, None)?;
+                            self.source.push_str("} ");
+                        }
+                        if !targets.is_empty() {
+                            self.source.push_str("else ");
+                        }
+                        self.source.push_str("{\n");
+                        self.emit_branch(targets.default(), stack, None)?;
+                        self.source.push_str("}\n");
+                        reachable = false;
+                        break;
+                    }
                     Operator::Return => {
                         self.emit_branch((self.frames.len() - 1) as u32, stack, None)?;
+                        reachable = false;
+                        break;
+                    }
+                    Operator::Unreachable => {
+                        self.source.push_str("traps[id] = 3u; return;\n");
                         reachable = false;
                         break;
                     }
@@ -444,14 +578,15 @@ impl Compiler {
             self.source
                 .push_str(&format!("if ({condition} != 0u) {{\n"));
         }
-        if !frame.loop_label
-            && let Some(result) = frame.result
-        {
-            let value = stack
-                .last()
-                .ok_or_else(|| Error::Unsupported("branch result is missing".into()))?;
-            self.source.push_str(&format!("{result} = {value};\n"));
+        let slots = if frame.loop_label {
+            &frame.params
+        } else {
+            &frame.results
+        };
+        if stack.len() < slots.len() {
+            return Err(Error::Unsupported("branch value is missing".into()));
         }
+        self.assign_slots(slots, &stack[stack.len() - slots.len()..]);
         self.source.push_str(&format!("flow = {}u;\n", frame.id));
         if condition.is_some() {
             self.source.push_str("}\n");
@@ -467,7 +602,9 @@ impl Compiler {
         loop_label: bool,
     ) -> Result<(), Error> {
         let frame = self.new_frame(blockty, loop_label)?;
+        let base = self.enter_frame(&frame, stack)?;
         let mut inner_stack = stack.clone();
+        inner_stack.extend(frame.params.iter().cloned());
         self.frames.push(frame.clone());
         if loop_label {
             self.source.push_str("while (true) {\n");
@@ -475,12 +612,7 @@ impl Compiler {
             self.source.push_str("{\n");
         }
         let reachable = self.emit_instructions(body, &mut inner_stack)?;
-        self.finish_path(
-            reachable,
-            &mut inner_stack,
-            stack.len(),
-            frame.result.as_deref(),
-        )?;
+        self.finish_path(reachable, &mut inner_stack, base, &frame.results)?;
         if loop_label {
             self.source.push_str(&format!(
                 "if (flow == {}u) {{ flow = 0u; continue; }}\nbreak;\n",
@@ -493,9 +625,7 @@ impl Compiler {
                 .push_str(&format!("if (flow == {}u) flow = 0u;\n", frame.id));
         }
         self.frames.pop();
-        if let Some(result) = frame.result {
-            stack.push(result);
-        }
+        stack.extend(frame.results);
         Ok(())
     }
 
@@ -508,33 +638,24 @@ impl Compiler {
     ) -> Result<(), Error> {
         let condition = pop(stack)?;
         let frame = self.new_frame(blockty, false)?;
+        let base = self.enter_frame(&frame, stack)?;
         self.frames.push(frame.clone());
         self.source
             .push_str(&format!("if ({condition} != 0u) {{\n"));
         let mut then_stack = stack.clone();
+        then_stack.extend(frame.params.iter().cloned());
         let then_reachable = self.emit_instructions(then_body, &mut then_stack)?;
-        self.finish_path(
-            then_reachable,
-            &mut then_stack,
-            stack.len(),
-            frame.result.as_deref(),
-        )?;
+        self.finish_path(then_reachable, &mut then_stack, base, &frame.results)?;
         self.source.push_str("} else {\n");
         let mut else_stack = stack.clone();
+        else_stack.extend(frame.params.iter().cloned());
         let else_reachable = self.emit_instructions(else_body, &mut else_stack)?;
-        self.finish_path(
-            else_reachable,
-            &mut else_stack,
-            stack.len(),
-            frame.result.as_deref(),
-        )?;
+        self.finish_path(else_reachable, &mut else_stack, base, &frame.results)?;
         self.source.push_str("}\n");
         self.source
             .push_str(&format!("if (flow == {}u) flow = 0u;\n", frame.id));
         self.frames.pop();
-        if let Some(result) = frame.result {
-            stack.push(result);
-        }
+        stack.extend(frame.results);
         Ok(())
     }
 
@@ -544,6 +665,7 @@ impl Compiler {
         stack: &mut Vec<String>,
     ) -> Result<(), Error> {
         match operator {
+            Operator::Nop => {}
             Operator::I32Const { value } => stack.push(format!("{}u", *value as u32)),
             Operator::LocalGet { local_index } => {
                 check_local(*local_index, self.local_count)?;
@@ -565,29 +687,91 @@ impl Compiler {
                 let value = pop(stack)?;
                 self.emit_value(stack, format!("uint({value} == 0u)"));
             }
+            Operator::I32Clz
+            | Operator::I32Ctz
+            | Operator::I32Popcnt
+            | Operator::I32Extend8S
+            | Operator::I32Extend16S => {
+                let value = pop(stack)?;
+                let expression = match operator {
+                    Operator::I32Clz => format!("({value} == 0u ? 32u : clz({value}))"),
+                    Operator::I32Ctz => format!("({value} == 0u ? 32u : ctz({value}))"),
+                    Operator::I32Popcnt => format!("popcount({value})"),
+                    Operator::I32Extend8S => {
+                        format!("as_type<uint>(as_type<int>({value} << 24u) >> 24u)")
+                    }
+                    Operator::I32Extend16S => {
+                        format!("as_type<uint>(as_type<int>({value} << 16u) >> 16u)")
+                    }
+                    _ => unreachable!(),
+                };
+                self.emit_value(stack, expression);
+            }
+            Operator::Select | Operator::TypedSelect { ty: ValType::I32 } => {
+                let condition = pop(stack)?;
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                self.emit_value(stack, format!("({condition} != 0u ? {lhs} : {rhs})"));
+            }
             Operator::I32Add
             | Operator::I32Sub
             | Operator::I32Mul
+            | Operator::I32DivS
+            | Operator::I32DivU
+            | Operator::I32RemS
+            | Operator::I32RemU
             | Operator::I32And
             | Operator::I32Or
             | Operator::I32Xor
             | Operator::I32Shl
             | Operator::I32ShrU
+            | Operator::I32ShrS
             | Operator::I32Rotl
             | Operator::I32Rotr
             | Operator::I32Eq
-            | Operator::I32Ne => {
+            | Operator::I32Ne
+            | Operator::I32LtS
+            | Operator::I32LtU
+            | Operator::I32GtS
+            | Operator::I32GtU
+            | Operator::I32LeS
+            | Operator::I32LeU
+            | Operator::I32GeS
+            | Operator::I32GeU => {
                 let rhs = pop(stack)?;
                 let lhs = pop(stack)?;
+                if matches!(
+                    operator,
+                    Operator::I32DivS | Operator::I32DivU | Operator::I32RemS | Operator::I32RemU
+                ) {
+                    self.source
+                        .push_str(&format!("if ({rhs} == 0u) {{ traps[id] = 1u; return; }}\n"));
+                }
+                if matches!(operator, Operator::I32DivS) {
+                    self.source.push_str(&format!(
+                        "if ({lhs} == 2147483648u && {rhs} == 4294967295u) {{ traps[id] = 2u; return; }}\n"
+                    ));
+                }
                 let expression = match operator {
                     Operator::I32Add => format!("{lhs} + {rhs}"),
                     Operator::I32Sub => format!("{lhs} - {rhs}"),
                     Operator::I32Mul => format!("{lhs} * {rhs}"),
+                    Operator::I32DivS => {
+                        format!("as_type<uint>(as_type<int>({lhs}) / as_type<int>({rhs}))")
+                    }
+                    Operator::I32DivU => format!("{lhs} / {rhs}"),
+                    Operator::I32RemS => format!(
+                        "({lhs} == 2147483648u && {rhs} == 4294967295u ? 0u : as_type<uint>(as_type<int>({lhs}) % as_type<int>({rhs})))"
+                    ),
+                    Operator::I32RemU => format!("{lhs} % {rhs}"),
                     Operator::I32And => format!("{lhs} & {rhs}"),
                     Operator::I32Or => format!("{lhs} | {rhs}"),
                     Operator::I32Xor => format!("{lhs} ^ {rhs}"),
                     Operator::I32Shl => format!("{lhs} << ({rhs} & 31u)"),
                     Operator::I32ShrU => format!("{lhs} >> ({rhs} & 31u)"),
+                    Operator::I32ShrS => {
+                        format!("as_type<uint>(as_type<int>({lhs}) >> ({rhs} & 31u))")
+                    }
                     Operator::I32Rotl => format!(
                         "({lhs} << ({rhs} & 31u)) | ({lhs} >> ((32u - ({rhs} & 31u)) & 31u))"
                     ),
@@ -596,6 +780,14 @@ impl Compiler {
                     ),
                     Operator::I32Eq => format!("uint({lhs} == {rhs})"),
                     Operator::I32Ne => format!("uint({lhs} != {rhs})"),
+                    Operator::I32LtS => format!("uint(as_type<int>({lhs}) < as_type<int>({rhs}))"),
+                    Operator::I32LtU => format!("uint({lhs} < {rhs})"),
+                    Operator::I32GtS => format!("uint(as_type<int>({lhs}) > as_type<int>({rhs}))"),
+                    Operator::I32GtU => format!("uint({lhs} > {rhs})"),
+                    Operator::I32LeS => format!("uint(as_type<int>({lhs}) <= as_type<int>({rhs}))"),
+                    Operator::I32LeU => format!("uint({lhs} <= {rhs})"),
+                    Operator::I32GeS => format!("uint(as_type<int>({lhs}) >= as_type<int>({rhs}))"),
+                    Operator::I32GeU => format!("uint({lhs} >= {rhs})"),
                     _ => unreachable!(),
                 };
                 self.emit_value(stack, expression);
@@ -729,5 +921,177 @@ mod tests {
             let expected: Vec<_> = inputs.iter().map(|&value| rotate(value, 33)).collect();
             assert_eq!(kernel.run(&inputs).unwrap(), expected);
         }
+    }
+
+    fn matches_wasmtime(wat: &str, inputs: &[u32]) {
+        let wasm = wat::parse_str(wat).unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+        let mut store = wasmtime::Store::new(&engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+        let function = instance
+            .get_typed_func::<i32, i32>(&mut store, "f")
+            .unwrap();
+        let expected: Vec<_> = inputs
+            .iter()
+            .map(|&input| function.call(&mut store, input as i32).unwrap() as u32)
+            .collect();
+        assert_eq!(kernel.run(inputs).unwrap(), expected, "{wat}");
+    }
+
+    #[test]
+    fn scalar_i32_operations_match_wasmtime() {
+        let mut inputs = vec![
+            0,
+            1,
+            2,
+            7,
+            31,
+            32,
+            33,
+            127,
+            128,
+            255,
+            256,
+            i32::MAX as u32,
+            i32::MIN as u32,
+            u32::MAX,
+        ];
+        let mut state = 0x1234_5678u32;
+        for _ in 0..128 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            inputs.push(state);
+        }
+        for op in [
+            "i32.clz",
+            "i32.ctz",
+            "i32.popcnt",
+            "i32.extend8_s",
+            "i32.extend16_s",
+        ] {
+            matches_wasmtime(
+                &format!(
+                    "(module (func (export \"f\") (param i32) (result i32) local.get 0 {op}))"
+                ),
+                &inputs,
+            );
+        }
+        for (op, rhs) in [
+            ("i32.div_s", 3),
+            ("i32.div_s", -1),
+            ("i32.div_u", 3),
+            ("i32.rem_s", 3),
+            ("i32.rem_s", -1),
+            ("i32.rem_u", 3),
+            ("i32.shr_s", 33),
+            ("i32.lt_s", -1),
+            ("i32.lt_u", -1),
+            ("i32.gt_s", -1),
+            ("i32.gt_u", -1),
+            ("i32.le_s", -1),
+            ("i32.le_u", -1),
+            ("i32.ge_s", -1),
+            ("i32.ge_u", -1),
+        ] {
+            let safe_inputs: Vec<_> = inputs
+                .iter()
+                .copied()
+                .filter(|&input| !(op == "i32.div_s" && rhs == -1 && input == i32::MIN as u32))
+                .collect();
+            matches_wasmtime(
+                &format!(
+                    "(module (func (export \"f\") (param i32) (result i32) local.get 0 i32.const {rhs} {op}))"
+                ),
+                &safe_inputs,
+            );
+        }
+        for select in ["select", "select (result i32)"] {
+            matches_wasmtime(
+                &format!(
+                    "(module (func (export \"f\") (param i32) (result i32) i32.const 7 i32.const 9 local.get 0 {select} nop))"
+                ),
+                &inputs,
+            );
+        }
+    }
+
+    #[test]
+    fn branch_table_targets_nested_labels() {
+        matches_wasmtime(
+            "(module (func (export \"f\") (param i32) (result i32) block (result i32) block (result i32) i32.const 42 local.get 0 br_table 0 1 2 end i32.const 3 i32.add end))",
+            &[0, 1, 2, 3, u32::MAX],
+        );
+        matches_wasmtime(
+            "(module (func (export \"f\") (param i32) (result i32) i32.const 42 local.get 0 br_table 0))",
+            &[0, 1, u32::MAX],
+        );
+    }
+
+    #[test]
+    fn typed_blocks_pass_multiple_values_and_loop_arguments() {
+        matches_wasmtime(
+            "(module (type $pair (func (param i32 i32) (result i32 i32))) (func (export \"f\") (param i32) (result i32) local.get 0 i32.const 7 block (type $pair) i32.const 1 i32.add end i32.sub))",
+            &[0, 1, 7, u32::MAX],
+        );
+        matches_wasmtime(
+            "(module (type $pair (func (param i32 i32) (result i32 i32))) (func (export \"f\") (param i32) (result i32) (local i32 i32) local.get 0 i32.const 7 loop (type $pair) local.set 2 local.set 1 local.get 0 if i32.const 0 local.set 0 local.get 2 local.get 1 br 1 end local.get 1 local.get 2 end i32.sub))",
+            &[0, 1, 7, u32::MAX],
+        );
+        matches_wasmtime(
+            "(module (type $value (func (param i32) (result i32))) (func (export \"f\") (param i32) (result i32) local.get 0 local.get 0 if (type $value) i32.const 1 i32.add else i32.const 2 i32.add end))",
+            &[0, 1, 7, u32::MAX],
+        );
+        matches_wasmtime(
+            "(module (type $pair (func (param i32 i32) (result i32 i32))) (func (export \"f\") (param i32) (result i32) local.get 0 i32.const 7 block (type $pair) local.get 0 if i32.const 1 i32.const 2 br 1 end end i32.sub))",
+            &[0, 1, 7, u32::MAX],
+        );
+    }
+
+    #[test]
+    fn reports_only_executed_traps_with_input_index() {
+        for (body, inputs, index, reason) in [
+            (
+                "local.get 0 i32.const 0 i32.div_u",
+                vec![1, 2, 3],
+                0,
+                "integer divide by zero",
+            ),
+            (
+                "local.get 0 i32.const -1 i32.div_s",
+                vec![1, i32::MIN as u32],
+                1,
+                "integer overflow",
+            ),
+            (
+                "local.get 0 if unreachable end i32.const 7",
+                vec![0, 0, 1],
+                2,
+                "unreachable executed",
+            ),
+        ] {
+            let wasm = wat::parse_str(format!(
+                "(module (func (export \"f\") (param i32) (result i32) {body}))"
+            ))
+            .unwrap();
+            let kernel = Kernel::new(&wasm, "f").unwrap();
+            let engine = wasmtime::Engine::default();
+            let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+            let mut store = wasmtime::Store::new(&engine, ());
+            let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+            let function = instance
+                .get_typed_func::<i32, i32>(&mut store, "f")
+                .unwrap();
+            assert!(function.call(&mut store, inputs[index] as i32).is_err());
+            assert!(matches!(
+                kernel.run(&inputs),
+                Err(Error::Trap { input_index, reason: actual })
+                    if input_index == index && actual == reason
+            ));
+        }
+        matches_wasmtime(
+            "(module (func (export \"f\") (param i32) (result i32) local.get 0 if (result i32) i32.const 8 else i32.const 0 i32.const 1 i32.div_u end))",
+            &[0, 1, 2],
+        );
     }
 }
