@@ -1161,6 +1161,7 @@ impl Compiler<'_> {
         let address = pop(stack)?;
         let index = self.memory_address(&address, memarg, width)?;
         let value = self.fresh_value();
+        self.source.push_str(&format!("{value} = 0ul;\n"));
         for byte in 0..width {
             self.source.push_str(&format!(
                 "{value} |= ulong(memory[ulong({index}) + {byte}ul]) << {}u;\n",
@@ -2572,6 +2573,26 @@ mod tests {
                 reason: "out of bounds memory access"
             })
         ));
+    }
+
+    #[test]
+    fn repeated_loads_in_a_loop_discard_prior_bits() {
+        let wasm = wat::parse_str(
+            r#"(module
+            (memory 1)
+            (data (i32.const 0) "\ff\00")
+            (func (export "f") (param i32) (result i32) (local i32 i32)
+                i32.const 0 local.set 1
+                loop
+                    local.get 1 i32.load8_u local.set 2
+                    local.get 1 i32.const 1 i32.add local.tee 1
+                    i32.const 2 i32.ne br_if 0
+                end
+                local.get 2))"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        assert_eq!(kernel.run(&[0, 1]).unwrap(), [0, 0]);
     }
 
     #[test]
