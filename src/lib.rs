@@ -120,6 +120,12 @@ struct InstanceBuffers {
     passive_data: Option<metal::Buffer>,
 }
 
+struct MemoryInput<'a> {
+    offset: usize,
+    width: usize,
+    rows: &'a [Vec<u8>],
+}
+
 #[derive(Default)]
 struct TableInfo {
     mutable: bool,
@@ -258,7 +264,7 @@ impl Kernel {
             let bytes = size_of_val(chunk);
             let input = unsafe { std::slice::from_raw_parts(chunk.as_ptr().cast::<u8>(), bytes) };
             let (output, elapsed) = self
-                .dispatch(input, bytes, chunk.len() as u32, &instance_buffers)
+                .dispatch(input, bytes, chunk.len() as u32, &instance_buffers, None)
                 .map_err(|error| shift_trap(error, values.len()))?;
             let result =
                 unsafe { std::slice::from_raw_parts(output.contents().cast::<u32>(), chunk.len()) };
@@ -270,7 +276,8 @@ impl Kernel {
 
     /// Run one independent invocation per row. Each row must match the export's parameters.
     pub fn run_values(&self, inputs: &[Vec<Value>]) -> Result<Vec<Vec<Value>>, Error> {
-        self.run_values_impl(inputs, None).map(|(values, _)| values)
+        self.run_values_impl(inputs, None, None)
+            .map(|(values, _)| values)
     }
 
     /// Run each invocation and copy a byte range from an exported memory for each lane.
@@ -287,14 +294,69 @@ impl Kernel {
         if range.start > range.end {
             return Err(Error::Unsupported("invalid memory range".into()));
         }
-        let (values, memory) = self.run_values_impl(inputs, Some((owner, range)))?;
+        let (values, memory) = self.run_values_impl(inputs, Some((owner, range)), None)?;
         Ok((values, memory))
+    }
+
+    /// Copy one equally sized byte slice into each lane's exported memory after
+    /// its data segments and start functions run, then invoke the export.
+    /// The input range must fit the memory's initial size. An empty output range
+    /// returns values without copying memory back.
+    pub fn run_values_with_memory_io(
+        &self,
+        inputs: &[Vec<Value>],
+        memory_export: &str,
+        input_offset: usize,
+        memory_inputs: &[Vec<u8>],
+        output_range: Range<usize>,
+    ) -> Result<(Vec<Vec<Value>>, Vec<Vec<u8>>), Error> {
+        let owner = *self.memory_exports.get(memory_export).ok_or_else(|| {
+            Error::Unsupported(format!("export {memory_export:?} is not a memory"))
+        })?;
+        if output_range.start > output_range.end {
+            return Err(Error::Unsupported("invalid memory range".into()));
+        }
+        if memory_inputs.len() != inputs.len() {
+            return Err(Error::Unsupported(
+                "memory input count does not match invocation count".into(),
+            ));
+        }
+        let width = memory_inputs.first().map_or(0, Vec::len);
+        if memory_inputs.iter().any(|row| row.len() != width) {
+            return Err(Error::Unsupported(
+                "memory inputs must have equal lengths".into(),
+            ));
+        }
+        let initial_size = self.instances[owner]
+            .template
+            .memory_template
+            .as_ref()
+            .unwrap()
+            .len();
+        if input_offset
+            .checked_add(width)
+            .is_none_or(|end| end > initial_size)
+        {
+            return Err(Error::Unsupported(
+                "memory input range exceeds initial memory size".into(),
+            ));
+        }
+        self.run_values_impl(
+            inputs,
+            Some((owner, output_range)),
+            Some(MemoryInput {
+                offset: input_offset,
+                width,
+                rows: memory_inputs,
+            }),
+        )
     }
 
     fn run_values_impl(
         &self,
         inputs: &[Vec<Value>],
         capture: Option<(usize, Range<usize>)>,
+        memory_input: Option<MemoryInput<'_>>,
     ) -> Result<(Vec<Vec<Value>>, Vec<Vec<u8>>), Error> {
         for row in inputs {
             if row.len() != self.params.len()
@@ -311,7 +373,11 @@ impl Kernel {
         if inputs.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
-        if capture.is_none() && self.params == [ValType::I32] && self.results == [ValType::I32] {
+        if capture.is_none()
+            && memory_input.is_none()
+            && self.params == [ValType::I32]
+            && self.results == [ValType::I32]
+        {
             let flat: Vec<_> = inputs
                 .iter()
                 .map(|row| match row[0] {
@@ -333,10 +399,13 @@ impl Kernel {
         } else {
             size_of::<u64>()
         };
-        let input_stride = self
+        let argument_stride = self
             .params
             .len()
             .checked_mul(word_size)
+            .ok_or_else(|| Error::Unsupported("input buffer size overflow".into()))?;
+        let input_stride = argument_stride
+            .checked_add(memory_input.as_ref().map_or(0, |input| input.width))
             .ok_or_else(|| Error::Unsupported("input buffer size overflow".into()))?;
         let output_stride = self
             .results
@@ -372,13 +441,25 @@ impl Kernel {
                 input_bytes = size_of_val(encoded64.as_slice());
                 encoded64.as_ptr().cast::<u8>()
             };
-            let input = unsafe { std::slice::from_raw_parts(input, input_bytes) };
+            let arguments = unsafe { std::slice::from_raw_parts(input, input_bytes) };
+            let packed = memory_input.as_ref().map(|memory_input| {
+                let mut packed = Vec::with_capacity((end - start) * input_stride);
+                packed.extend_from_slice(arguments);
+                for row in &memory_input.rows[start..end] {
+                    packed.extend_from_slice(row);
+                }
+                packed
+            });
+            let input = packed.as_deref().unwrap_or(arguments);
             let (output, _) = self
                 .dispatch(
                     input,
                     (end - start) * output_stride,
                     (end - start) as u32,
                     &instance_buffers,
+                    memory_input
+                        .as_ref()
+                        .map(|input| (input.offset, input.width)),
                 )
                 .map_err(|error| shift_trap(error, start))?;
             if fast_i32 {
@@ -504,6 +585,7 @@ impl Kernel {
         output_bytes: usize,
         count: u32,
         instance_buffers: &[Vec<(u64, metal::Buffer)>],
+        memory_input: Option<(usize, usize)>,
     ) -> Result<(metal::Buffer, Option<Duration>), Error> {
         let input_bytes = u64::try_from(input_data.len().max(4))
             .map_err(|_| Error::Unsupported("input buffer size overflow".into()))?;
@@ -538,7 +620,9 @@ impl Kernel {
         encoder.set_compute_pipeline_state(&self.pipeline);
         encoder.set_buffer(0, Some(&input), 0);
         encoder.set_buffer(1, Some(&output), 0);
-        encoder.set_bytes(2, size_of::<u32>() as u64, (&count as *const u32).cast());
+        let (offset, width) = memory_input.unwrap_or((0, 0));
+        let config = [count as u64, offset as u64, width as u64];
+        encoder.set_bytes(2, size_of_val(&config) as u64, config.as_ptr().cast());
         if let Some(traps) = &traps {
             encoder.set_buffer(3, Some(traps), 0);
         }
@@ -1656,7 +1740,7 @@ fn translate_with_limits(
     }
     let fast_i32 = ty.params() == [ValType::I32] && ty.results() == [ValType::I32];
     let input_ty = if fast_i32 { "uint" } else { "ulong" };
-    source.push_str(&format!("kernel void run_wasm(device const {input_ty}* input [[buffer(0)]], device {input_ty}* output [[buffer(1)]], constant uint& count [[buffer(2)]]"));
+    source.push_str(&format!("kernel void run_wasm(device const {input_ty}* input [[buffer(0)]], device {input_ty}* output [[buffer(1)]], constant ulong* config [[buffer(2)]]"));
     if can_trap {
         source.push_str(", device uint* traps [[buffer(3)]]");
     }
@@ -1676,7 +1760,7 @@ fn translate_with_limits(
         }
     }
     source.push_str(
-        ", uint id [[thread_position_in_grid]]) {\nif (id >= count) return;\nuint trap = 0u;\n",
+        ", uint id [[thread_position_in_grid]]) {\nulong count = config[0];\nif (id >= count) return;\nuint trap = 0u;\n",
     );
     source.push_str(&format!("ModuleState states[{}] = {{}};\n", modules.len()));
     for (module_index, module) in modules.iter().enumerate() {
@@ -1758,6 +1842,12 @@ fn translate_with_limits(
             let start = module.resolved_functions[local];
             source.push_str(&format!("if (trap == 0u) f{start}({context});\n"));
         }
+    }
+    if let Some(owner) = modules[0].memory_owner {
+        let argument_bytes = ty.params().len() * if fast_i32 { 4 } else { 8 };
+        source.push_str(&format!(
+            "if (config[2] != 0ul && trap == 0u) {{\n    device const uchar* memory_input = reinterpret_cast<device const uchar*>(input) + count * {argument_bytes}ul + ulong(id) * config[2];\n    for (ulong j = 0ul; j < config[2]; ++j) states[{owner}].memory[config[1] + j] = memory_input[j];\n}}\n"
+        ));
     }
     args.push(context.into());
     source.push_str(&format!("if (trap == 0u) f{index}({});\n", args.join(", ")));
@@ -4618,6 +4708,108 @@ mod tests {
             matches!(kernel.run_values_with_memory(&inputs[..1], "mem", 65536..65537),
             Err(Error::Unsupported(reason)) if reason.contains("memory range exceeds"))
         );
+    }
+
+    #[test]
+    fn per_lane_memory_input_follows_start_and_resets_across_batches() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory (export "mem") 1)
+                (data (i32.const 0) "\05\06\07\08")
+                (func $start i32.const 0 i32.const 9 i32.store8)
+                (start $start)
+                (func (export "f") (param i32) (result i32) (local i32)
+                    local.get 0
+                    i32.const 0 i32.load8_u i32.add
+                    i32.const 1 i32.load8_u i32.add
+                    local.set 1
+                    i32.const 3 local.get 1 i32.store8
+                    local.get 1))"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        let limit = kernel.batch_limit(8, 4).unwrap();
+        let inputs: Vec<_> = (0..limit + 3)
+            .map(|index| vec![Value::I32(index as u32)])
+            .collect();
+        let memory_inputs: Vec<_> = (0..inputs.len())
+            .map(|index| vec![index as u8, 2, 3, 4])
+            .collect();
+        for _ in 0..2 {
+            let (values, memories) = kernel
+                .run_values_with_memory_io(&inputs, "mem", 0, &memory_inputs, 0..4)
+                .unwrap();
+            for index in [0, limit - 1, limit, limit + 2] {
+                let expected = index as u32 + index as u8 as u32 + 2;
+                assert_eq!(values[index], [Value::I32(expected)]);
+                assert_eq!(memories[index], [index as u8, 2, 3, expected as u8]);
+            }
+        }
+        assert!(matches!(
+            kernel.run_values_with_memory_io(&inputs[..1], "mem", 0, &[], 0..4),
+            Err(Error::Unsupported(reason)) if reason.contains("count")));
+        assert!(matches!(
+            kernel.run_values_with_memory_io(&inputs[..2], "mem", 0, &[vec![1], vec![1, 2]], 0..4),
+            Err(Error::Unsupported(reason)) if reason.contains("equal lengths")));
+        assert!(matches!(
+            kernel.run_values_with_memory_io(&inputs[..1], "mem", 65535, &[vec![1, 2]], 0..4),
+            Err(Error::Unsupported(reason)) if reason.contains("initial memory size")));
+    }
+
+    #[test]
+    fn per_lane_memory_input_reaches_imported_memory() {
+        let provider = wat::parse_str(r#"(module (memory (export "mem") 1))"#).unwrap();
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "p" "mem" (memory 1))
+                (export "mem" (memory 0))
+                (func (export "f") (result i32)
+                    i32.const 3 i32.load8_u))"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new_with_imports(&wasm, "f", &[("p", &provider)]).unwrap();
+        let (values, memories) = kernel
+            .run_values_with_memory_io(
+                &[vec![], vec![]],
+                "mem",
+                2,
+                &[vec![10, 11], vec![20, 21]],
+                2..4,
+            )
+            .unwrap();
+        assert_eq!(values, [vec![Value::I32(11)], vec![Value::I32(21)]]);
+        assert_eq!(memories, [vec![10, 11], vec![20, 21]]);
+    }
+
+    #[test]
+    fn per_lane_memory_input_preserves_general_numeric_arguments() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory (export "mem") 1)
+                (func (export "f") (param i32 i64) (result i64)
+                    local.get 1
+                    local.get 0
+                    i32.const 0 i32.load8_u
+                    i32.add
+                    i64.extend_i32_u
+                    i64.add))"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        let (values, memories) = kernel
+            .run_values_with_memory_io(
+                &[
+                    vec![Value::I32(3), Value::I64(100)],
+                    vec![Value::I32(7), Value::I64(200)],
+                ],
+                "mem",
+                0,
+                &[vec![5], vec![9]],
+                0..0,
+            )
+            .unwrap();
+        assert_eq!(values, [vec![Value::I64(108)], vec![Value::I64(216)]]);
+        assert_eq!(memories, [vec![], vec![]]);
     }
 
     #[test]

@@ -12,6 +12,8 @@ Each module can own or import one unshared 32-bit `funcref` table with at most 6
 
 `Kernel::run_values_with_memory(inputs, memory_export, range)` returns function results and the requested byte range from an exported memory for each lane. The range must fit every lane's memory after execution. It can read a memory owned by the module or imported from a provider. Copying large ranges adds host transfer time.
 
+`Kernel::run_values_with_memory_io(inputs, memory_export, input_offset, memory_inputs, output_range)` also copies a distinct byte slice into each lane's exported memory after data segments and start functions run, immediately before the exported call. Supply one equally sized byte slice per invocation. The input range must fit the memory's initial size. Use `0..0` as the output range when no memory readback is needed.
+
 Metal has no native `f64`, and this Mac flushes native `f32` subnormals. Both types use GPU software arithmetic on raw bits. The `f64` primitives come from the vendored [metal-softfloat](https://github.com/guyfischman/metal-softfloat) source under the licenses in `licenses/`. Floating-point operations cost substantially more GPU work than native `i32` operations.
 
 Public reference-typed parameters and results, shared memory, SIMD, and host interfaces such as WASI remain unsupported.
