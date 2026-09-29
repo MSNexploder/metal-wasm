@@ -9,6 +9,8 @@ fn arg(value: WastArg<'_>) -> Value {
     match value {
         WastArg::Core(WastArgCore::I32(value)) => Value::I32(value as u32),
         WastArg::Core(WastArgCore::I64(value)) => Value::I64(value as u64),
+        WastArg::Core(WastArgCore::F32(value)) => Value::F32(value.bits),
+        WastArg::Core(WastArgCore::F64(value)) => Value::F64(value.bits),
         other => panic!("unexpected spec argument: {other:?}"),
     }
 }
@@ -90,4 +92,14 @@ fn spec_i32_runtime() {
 #[test]
 fn spec_i64_runtime() {
     check_script(include_str!("spec/i64.wast"), 200);
+}
+
+#[test]
+fn spec_f32_comparisons() {
+    check_script(include_str!("spec/f32_cmp.wast"), 2000);
+}
+
+#[test]
+fn spec_f64_comparisons() {
+    check_script(include_str!("spec/f64_cmp.wast"), 2000);
 }
