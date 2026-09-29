@@ -31,7 +31,7 @@ struct SuiteWorkload {
     counts: &'static [usize],
 }
 
-const SUITE_WORKLOADS: [SuiteWorkload; 7] = [
+const SUITE_WORKLOADS: [SuiteWorkload; 8] = [
     SuiteWorkload {
         name: "dispatch_i64",
         wat: include_str!("workloads/dispatch_i64.wat"),
@@ -80,6 +80,13 @@ const SUITE_WORKLOADS: [SuiteWorkload; 7] = [
         provider: Some(("math", include_str!("workloads/import_provider.wat"))),
         native: imported_calls_native,
         counts: &[1, 1_000, 100_000, 1_000_000],
+    },
+    SuiteWorkload {
+        name: "linked_resources",
+        wat: include_str!("workloads/linked_resources.wat"),
+        provider: Some(("state", include_str!("workloads/resource_provider.wat"))),
+        native: linked_resources_native,
+        counts: &[1, 1_000, 4_096, 10_000],
     },
 ];
 
@@ -582,6 +589,26 @@ fn imported_calls_native(input: u32) -> u32 {
         };
     }
     value
+}
+
+#[inline(always)]
+fn linked_resources_native(input: u32) -> u32 {
+    let mut global = input ^ 0x3723_1105;
+    let mut cells = [0u32; 4];
+    let mut value = input;
+    for round in 0..24u32 {
+        let slot = (round & 3) as usize;
+        let argument = value ^ global;
+        let step = if round & 1 == 0 {
+            argument.rotate_left(5) ^ round
+        } else {
+            argument.wrapping_mul(OTHER_MULTIPLIER).wrapping_add(round)
+        };
+        value = step.wrapping_add(cells[slot]).wrapping_mul(MIX_MULTIPLIER);
+        cells[slot] = value;
+        global = value.rotate_left(13);
+    }
+    value ^ global
 }
 
 fn measure_metal(
