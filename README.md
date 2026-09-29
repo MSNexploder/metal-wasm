@@ -1,8 +1,12 @@
 # metal-wasm
 
-Run many independent invocations of one WebAssembly function on a Metal GPU. Each input value gets its own Metal thread and produces one output value.
+Run many independent invocations of one WebAssembly function on a Metal GPU. Each invocation gets its own Metal thread, linear memory, and globals.
 
-This version accepts a `.wasm` module with an exported `(param i32) (result i32)` function. It supports all self-contained scalar `i32` instructions: constants, locals, drop, select, comparisons, arithmetic, division, remainder, bit counts, bitwise operations, shifts, rotations, and sign extension. It supports `block`, `if`/`else`, `loop`, `br`, `br_if`, `br_table`, `return`, `nop`, and `unreachable`. Blocks can use type-index signatures with multiple `i32` parameters and results. If an invocation traps, `run` returns `Error::Trap` with the first input index and the reason; results for that batch are discarded. Other instructions and module sections return an `Unsupported` error. There is no linear memory, imports, calls, or shared state yet. Values use `u32` in Rust to preserve the raw WebAssembly `i32` bits.
+This version accepts exported functions with any number of `i32` parameters and results. `Kernel::run` retains the fast `(i32) -> i32` interface; `Kernel::run_values` accepts a row of raw `Value` bit patterns per invocation. It supports scalar `i32` operations, structured control flow, and non-recursive direct calls. Type-index blocks and calls can pass multiple `i32` values.
+
+Modules can define one unshared 32-bit linear memory, active data segments, and `i32` globals. Each invocation starts with its own initialized memory and globals. Supported memory instructions are `i32` loads and stores at 8, 16, and 32 bits, plus `memory.size` and `memory.grow`. The initial memory limit is 16 MiB per invocation. Growth can add at most four pages per invocation, subject to the declared maximum and the 16 MiB limit; excess growth returns `-1`. A batch that exceeds the Metal buffer limit returns `Unsupported`. If an invocation traps, the batch returns `Error::Trap` with the first input index and reason; results for that batch are discarded.
+
+Recursive calls, passive data segments, imports, tables, indirect calls, and non-`i32` operations remain unsupported.
 
 ```rust
 use metal_wasm::Kernel;
