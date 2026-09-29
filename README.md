@@ -2,13 +2,15 @@
 
 Run many independent invocations of one WebAssembly function on a Metal GPU. Each invocation gets its own Metal thread, linear memory, and globals.
 
-This version accepts exported functions with any number of `i32`, `i64`, `f32`, and `f64` parameters and results. `Kernel::run` retains the fast `(i32) -> i32` interface; `Kernel::run_values` accepts a row of raw `Value` bit patterns per invocation. It supports scalar numeric operations, conversions, structured control flow, and non-recursive direct calls. Type-index blocks and calls can pass multiple numeric values.
+This version accepts exported functions with any number of `i32`, `i64`, `f32`, and `f64` parameters and results. `Kernel::run` retains the fast `(i32) -> i32` interface; `Kernel::run_values` accepts a row of raw `Value` bit patterns per invocation. It supports scalar numeric operations, conversions, structured control flow, and non-recursive direct and indirect calls. Type-index blocks and calls can pass multiple numeric values.
 
 Modules can define one unshared 32-bit linear memory, active data segments, and numeric globals. Each invocation starts with its own initialized memory and globals. Supported memory instructions include integer and float loads and stores, plus `memory.size` and `memory.grow`. The initial memory limit is 16 MiB per invocation. Growth can add at most four pages per invocation, subject to the declared maximum and the 16 MiB limit; excess growth returns `-1`. A batch that exceeds the Metal buffer limit returns `Unsupported`. If an invocation traps, the batch returns `Error::Trap` with the first input index and reason; results for that batch are discarded.
 
+Modules can define one unshared 32-bit `funcref` table with at most 65,536 initial entries. Active element segments initialize the table. `call_indirect` checks the slot and function signature at runtime. Table contents are immutable during execution, so the same initialized table is shared by all invocations. Recursion analysis treats a dynamic table index as able to reach any matching function in the initialized table.
+
 Metal has no native `f64`, and this Mac flushes native `f32` subnormals. Both types use GPU software arithmetic on raw bits. The `f64` primitives come from the vendored [metal-softfloat](https://github.com/guyfischman/metal-softfloat) source under the licenses in `licenses/`. Floating-point operations cost substantially more GPU work than native `i32` operations.
 
-Recursive calls, passive data segments, imports, tables, and indirect calls remain unsupported.
+Recursive calls, passive data and element segments, imports, table mutation instructions, and reference typed function signatures remain unsupported.
 
 ```rust
 use metal_wasm::Kernel;

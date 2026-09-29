@@ -10,12 +10,13 @@ use metal::{
     MTLSize,
 };
 use wasmparser::{
-    BlockType, ConstExpr, DataKind, ExternalKind, FuncType, FunctionBody, Operator, Parser,
-    Payload, ValType, Validator,
+    BlockType, ConstExpr, DataKind, ElementItems, ElementKind, ExternalKind, FuncType,
+    FunctionBody, Operator, Parser, Payload, RefType, TableInit, ValType, Validator,
 };
 
 const MAX_MEMORY_BYTES_PER_INSTANCE: usize = 16 * 1024 * 1024;
 const MAX_GROWTH_PAGES: usize = 4;
+const MAX_TABLE_ELEMENTS: usize = 65536;
 
 /// One raw WebAssembly numeric value. Floating-point variants hold their bit patterns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +56,7 @@ pub struct Kernel {
     memory_template: Option<Vec<u8>>,
     memory_capacity: Option<usize>,
     globals_template: Vec<u64>,
+    table: Option<metal::Buffer>,
 }
 
 struct Translation {
@@ -65,6 +67,7 @@ struct Translation {
     memory_template: Option<Vec<u8>>,
     memory_capacity: Option<usize>,
     globals_template: Vec<u64>,
+    table_template: Option<Vec<u32>>,
 }
 
 /// An error while validating, compiling, or running a WebAssembly export.
@@ -97,6 +100,18 @@ impl Kernel {
             .new_compute_pipeline_state_with_function(&function)
             .map_err(|error| Error::Metal(error.to_string()))?;
         let queue = device.new_command_queue();
+        let table = translation.table_template.as_ref().map(|data| {
+            let empty = [0u32];
+            device.new_buffer_with_data(
+                if data.is_empty() {
+                    empty.as_ptr().cast()
+                } else {
+                    data.as_ptr().cast()
+                },
+                (data.len() * size_of::<u32>()).max(4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
         Ok(Self {
             device,
             queue,
@@ -107,6 +122,7 @@ impl Kernel {
             memory_template: translation.memory_template,
             memory_capacity: translation.memory_capacity,
             globals_template: translation.globals_template,
+            table,
         })
     }
 
@@ -241,7 +257,8 @@ impl Kernel {
             .max(output_bytes)
             .max(trap_bytes)
             .max(memory_bytes as u64)
-            .max(globals_bytes as u64);
+            .max(globals_bytes as u64)
+            .max(self.table.as_ref().map_or(0, |table| table.length()));
         if largest > self.device.max_buffer_length() {
             return Err(Error::Unsupported(
                 "batch exceeds the Metal buffer limit".into(),
@@ -330,6 +347,9 @@ impl Kernel {
         if let Some(globals) = &globals {
             encoder.set_buffer(5, Some(globals), 0);
         }
+        if let Some(table) = &self.table {
+            encoder.set_buffer(7, Some(table), 0);
+        }
         let width = self
             .pipeline
             .thread_execution_width()
@@ -358,6 +378,8 @@ impl Kernel {
                     3 => "unreachable executed",
                     4 => "out of bounds memory access",
                     5 => "invalid conversion to integer",
+                    6 => "undefined or uninitialized table element",
+                    7 => "indirect call type mismatch",
                     _ => "unknown trap",
                 };
                 return Err(Error::Trap {
@@ -419,6 +441,7 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
     let mut memory_max_pages = None;
     let mut globals_template = Vec::new();
     let mut globals_mutable = Vec::new();
+    let mut table_template: Option<Vec<u32>> = None;
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
             Payload::Version { .. } | Payload::CustomSection(_) | Payload::End(_) => {}
@@ -429,6 +452,32 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
             }
             Payload::FunctionSection(section) => {
                 function_types = section.into_iter().collect::<Result<_, _>>()?;
+            }
+            Payload::TableSection(section) => {
+                for table in section {
+                    let table = table?;
+                    if table_template.is_some()
+                        || table.ty.element_type != RefType::FUNCREF
+                        || table.ty.table64
+                        || table.ty.shared
+                    {
+                        return Err(Error::Unsupported(
+                            "only one unshared 32-bit funcref table is supported".into(),
+                        ));
+                    }
+                    let size = usize::try_from(table.ty.initial)
+                        .map_err(|_| Error::Unsupported("table size overflow".into()))?;
+                    if size > MAX_TABLE_ELEMENTS {
+                        return Err(Error::Unsupported(
+                            "initial table exceeds 65536 elements".into(),
+                        ));
+                    }
+                    let value = match table.init {
+                        TableInit::RefNull => 0,
+                        TableInit::Expr(expr) => eval_ref_const(&expr)?,
+                    };
+                    table_template = Some(vec![value; size]);
+                }
             }
             Payload::MemorySection(section) => {
                 for memory in section {
@@ -466,6 +515,52 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
                     }
                     globals_template.push(eval_const(&global.init_expr, &globals_template)?);
                     globals_mutable.push(global.ty.mutable);
+                }
+            }
+            Payload::ElementSection(section) => {
+                for element in section {
+                    let element = element?;
+                    let ElementKind::Active {
+                        table_index: None | Some(0),
+                        offset_expr,
+                    } = element.kind
+                    else {
+                        return Err(Error::Unsupported(
+                            "only active elements for table 0 are supported".into(),
+                        ));
+                    };
+                    let offset = eval_const(&offset_expr, &globals_template)? as u32 as usize;
+                    let values: Vec<u32> = match element.items {
+                        ElementItems::Functions(indices) => indices
+                            .into_iter()
+                            .map(|index| {
+                                index?.checked_add(1).ok_or_else(|| {
+                                    Error::Unsupported("function index overflow".into())
+                                })
+                            })
+                            .collect::<Result<_, Error>>()?,
+                        ElementItems::Expressions(RefType::FUNCREF, expressions) => expressions
+                            .into_iter()
+                            .map(|expr| eval_ref_const(&expr?))
+                            .collect::<Result<_, Error>>()?,
+                        _ => {
+                            return Err(Error::Unsupported(
+                                "only funcref elements are supported".into(),
+                            ));
+                        }
+                    };
+                    let table = table_template
+                        .as_mut()
+                        .ok_or_else(|| Error::Unsupported("elements without a table".into()))?;
+                    let end = offset.checked_add(values.len()).ok_or_else(|| {
+                        Error::Unsupported("element segment offset overflow".into())
+                    })?;
+                    if end > table.len() {
+                        return Err(Error::Unsupported(
+                            "element segment exceeds initial table".into(),
+                        ));
+                    }
+                    table[offset..end].copy_from_slice(&values);
                 }
             }
             Payload::DataSection(section) => {
@@ -530,15 +625,29 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
         ty,
         memory_template.is_some(),
         !globals_template.is_empty(),
+        table_template.is_some(),
     )?;
     let fast_i32 = ty.params() == [ValType::I32] && ty.results() == [ValType::I32];
     let mut visit_state = vec![0u8; bodies.len()];
     let mut order = Vec::new();
     let mut can_trap = memory_template.is_some();
     let mut uses_growth = false;
+    let mut table_targets: Vec<usize> = table_template
+        .as_ref()
+        .into_iter()
+        .flat_map(|table| table.iter().copied())
+        .filter(|&value| value != 0)
+        .map(|value| (value - 1) as usize)
+        .collect();
+    table_targets.sort_unstable();
+    table_targets.dedup();
     visit_function(
         index,
         &bodies,
+        &types,
+        &function_types,
+        &table_targets,
+        table_template.as_deref().unwrap_or(&[]),
         &mut visit_state,
         &mut order,
         &mut can_trap,
@@ -564,6 +673,7 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
             ty,
             memory_template.is_some(),
             !globals_template.is_empty(),
+            table_template.is_some(),
         )?);
         source.push_str(";\n");
     }
@@ -578,6 +688,8 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
             memory_template.as_ref().map(Vec::len),
             memory_capacity,
             &globals_mutable,
+            table_template.as_deref(),
+            &table_targets,
         )?);
     }
     let input_ty = if fast_i32 { "uint" } else { "ulong" };
@@ -591,6 +703,9 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
     }
     if !globals_template.is_empty() {
         source.push_str(", device ulong* globals [[buffer(5)]]");
+    }
+    if table_template.is_some() {
+        source.push_str(", device const uint* table [[buffer(7)]]");
     }
     source.push_str(", uint id [[thread_position_in_grid]]) {\n");
     source.push_str("if (id >= count) return;\nuint trap = 0u;\n");
@@ -620,6 +735,9 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
             globals_template.len()
         ));
     }
+    if table_template.is_some() {
+        args.push("table".into());
+    }
     args.push("trap".into());
     source.push_str(&format!("f{index}({});\n", args.join(", ")));
     if can_trap {
@@ -642,6 +760,7 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
         memory_template,
         memory_capacity,
         globals_template,
+        table_template,
     })
 }
 
@@ -670,9 +789,28 @@ fn eval_const(expr: &ConstExpr<'_>, globals: &[u64]) -> Result<u64, Error> {
     Ok(value)
 }
 
+fn eval_ref_const(expr: &ConstExpr<'_>) -> Result<u32, Error> {
+    let mut operators = expr.get_operators_reader().into_iter();
+    let value = match operators.next().transpose()? {
+        Some(Operator::RefNull { .. }) => 0,
+        Some(Operator::RefFunc { function_index }) => function_index
+            .checked_add(1)
+            .ok_or_else(|| Error::Unsupported("function index overflow".into()))?,
+        _ => return Err(Error::Unsupported("unsupported funcref initializer".into())),
+    };
+    if !matches!(operators.next().transpose()?, Some(Operator::End)) || operators.next().is_some() {
+        return Err(Error::Unsupported("unsupported funcref initializer".into()));
+    }
+    Ok(value)
+}
+
 fn visit_function(
     index: usize,
     bodies: &[FunctionBody<'_>],
+    types: &[FuncType],
+    function_types: &[u32],
+    table_targets: &[usize],
+    table_values: &[u32],
     state: &mut [u8],
     order: &mut Vec<usize>,
     can_trap: &mut bool,
@@ -689,17 +827,60 @@ fn visit_function(
         _ => return Err(Error::Unsupported("function index is out of range".into())),
     }
     state[index] = 1;
+    let mut previous_constant = None;
     for operator in bodies[index].get_operators_reader()? {
-        match operator? {
+        let operator = operator?;
+        let current_constant = match &operator {
+            Operator::I32Const { value } => Some(*value as u32),
+            _ => None,
+        };
+        match operator {
             Operator::Call { function_index } => {
                 visit_function(
                     function_index as usize,
                     bodies,
+                    types,
+                    function_types,
+                    table_targets,
+                    table_values,
                     state,
                     order,
                     can_trap,
                     uses_growth,
                 )?;
+            }
+            Operator::CallIndirect { type_index, .. } => {
+                *can_trap = true;
+                let expected = types.get(type_index as usize).ok_or_else(|| {
+                    Error::Unsupported("indirect type index is out of range".into())
+                })?;
+                for &target in table_targets {
+                    if let Some(slot) = previous_constant {
+                        if table_values.get(slot as usize).copied() != Some(target as u32 + 1) {
+                            continue;
+                        }
+                    }
+                    let target_type = function_types
+                        .get(target)
+                        .and_then(|index| types.get(*index as usize))
+                        .ok_or_else(|| {
+                            Error::Unsupported("table function type is out of range".into())
+                        })?;
+                    if target_type == expected {
+                        visit_function(
+                            target,
+                            bodies,
+                            types,
+                            function_types,
+                            table_targets,
+                            table_values,
+                            state,
+                            order,
+                            can_trap,
+                            uses_growth,
+                        )?;
+                    }
+                }
             }
             Operator::MemoryGrow { .. } => *uses_growth = true,
             Operator::I32DivS
@@ -721,6 +902,7 @@ fn visit_function(
             | Operator::Unreachable => *can_trap = true,
             _ => {}
         }
+        previous_constant = current_constant;
     }
     state[index] = 2;
     order.push(index);
@@ -732,6 +914,7 @@ fn function_signature(
     ty: &FuncType,
     has_memory: bool,
     has_globals: bool,
+    has_table: bool,
 ) -> Result<String, Error> {
     if ty
         .params()
@@ -762,6 +945,9 @@ fn function_signature(
     if has_globals {
         args.push("device ulong* globals".into());
     }
+    if has_table {
+        args.push("device const uint* table".into());
+    }
     args.push("thread uint& trap".into());
     Ok(format!("void f{index}({})", args.join(", ")))
 }
@@ -775,12 +961,15 @@ fn translate_body(
     memory_bytes: Option<usize>,
     memory_capacity: Option<usize>,
     globals_mutable: &[bool],
+    table_values: Option<&[u32]>,
+    table_targets: &[usize],
 ) -> Result<String, Error> {
     let mut source = function_signature(
         function_index,
         ty,
         memory_bytes.is_some(),
         !globals_mutable.is_empty(),
+        table_values.is_some(),
     )?;
     source.push_str(" {\n");
     for index in 0..ty.params().len() {
@@ -821,6 +1010,9 @@ fn translate_body(
         memory_bytes,
         memory_capacity,
         globals_mutable,
+        table_len: table_values.map(<[u32]>::len),
+        table_values,
+        table_targets,
         frames: vec![Frame {
             id: 1,
             params: Vec::new(),
@@ -914,6 +1106,9 @@ struct Compiler<'a> {
     memory_bytes: Option<usize>,
     memory_capacity: Option<usize>,
     globals_mutable: &'a [bool],
+    table_len: Option<usize>,
+    table_values: Option<&'a [u32]>,
+    table_targets: &'a [usize],
     frames: Vec<Frame>,
 }
 
@@ -1377,11 +1572,96 @@ impl Compiler<'_> {
                 if !self.globals_mutable.is_empty() {
                     call_args.push("globals".into());
                 }
+                if self.table_len.is_some() {
+                    call_args.push("table".into());
+                }
                 call_args.push("trap".into());
                 self.source.push_str(&format!(
                     "f{index}({});\nif (trap != 0u) return;\n",
                     call_args.join(", ")
                 ));
+                stack.extend(results);
+            }
+            Operator::CallIndirect {
+                type_index,
+                table_index: 0,
+            } => {
+                let table_len = self
+                    .table_len
+                    .ok_or_else(|| Error::Unsupported("table is missing".into()))?;
+                let ty = self.types.get(*type_index as usize).ok_or_else(|| {
+                    Error::Unsupported("indirect type index is out of range".into())
+                })?;
+                if ty
+                    .params()
+                    .iter()
+                    .chain(ty.results())
+                    .any(|ty| !is_numeric(*ty))
+                {
+                    return Err(Error::Unsupported(
+                        "only numeric indirect signatures are supported".into(),
+                    ));
+                }
+                let element = pop(stack)?;
+                if stack.len() < ty.params().len() {
+                    return Err(Error::Unsupported(
+                        "indirect call argument is missing".into(),
+                    ));
+                }
+                let args = stack.split_off(stack.len() - ty.params().len());
+                let results: Vec<_> = (0..ty.results().len())
+                    .map(|_| self.fresh_value())
+                    .collect();
+                self.source.push_str(&format!(
+                    "if ({element} >= {table_len}ul) {{ trap = 6u; return; }}\n"
+                ));
+                let target = self.fresh_value();
+                self.source
+                    .push_str(&format!("{target} = table[uint({element})];\n"));
+                self.source.push_str(&format!(
+                    "if ({target} == 0ul) {{ trap = 6u; return; }}\nswitch ({target}) {{\n"
+                ));
+                let constant_slot = element
+                    .strip_suffix("ul")
+                    .and_then(|digits| digits.parse::<usize>().ok());
+                let constant_target = constant_slot.and_then(|slot| {
+                    self.table_values
+                        .and_then(|values| values.get(slot))
+                        .copied()
+                });
+                for &index in self.table_targets {
+                    if constant_slot.is_some() && constant_target != Some(index as u32 + 1) {
+                        continue;
+                    }
+                    let target_ty = self
+                        .function_types
+                        .get(index)
+                        .and_then(|type_index| self.types.get(*type_index as usize))
+                        .ok_or_else(|| {
+                            Error::Unsupported("table function type is out of range".into())
+                        })?;
+                    if target_ty != ty {
+                        continue;
+                    }
+                    let mut call_args = args.clone();
+                    call_args.extend(results.iter().cloned());
+                    if self.memory_bytes.is_some() {
+                        call_args.push("memory".into());
+                        call_args.push("pages".into());
+                    }
+                    if !self.globals_mutable.is_empty() {
+                        call_args.push("globals".into());
+                    }
+                    call_args.push("table".into());
+                    call_args.push("trap".into());
+                    self.source.push_str(&format!(
+                        "case {}u: f{index}({}); break;\n",
+                        index + 1,
+                        call_args.join(", ")
+                    ));
+                }
+                self.source
+                    .push_str("default: trap = 7u; return;\n}\nif (trap != 0u) return;\n");
                 stack.extend(results);
             }
             Operator::LocalGet { local_index } => {
@@ -2755,5 +3035,113 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn indirect_calls_use_initialized_table_slots() {
+        let wat = r#"(module
+            (type $t (func (param i32) (result i32)))
+            (table 3 funcref)
+            (func $add (type $t) local.get 0 i32.const 3 i32.add)
+            (func $mul (type $t) local.get 0 i32.const 7 i32.mul)
+            (elem (i32.const 0) $add $mul)
+            (func (export "f") (param i32 i32) (result i32)
+                local.get 0 local.get 1 call_indirect (type $t)))"#;
+        compare_values_to_wasmtime(
+            wat,
+            &[
+                vec![Value::I32(11), Value::I32(0)],
+                vec![Value::I32(11), Value::I32(1)],
+                vec![Value::I32(u32::MAX), Value::I32(0)],
+            ],
+        );
+        let wasm = wat::parse_str(wat).unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        for index in [2, 3] {
+            assert!(matches!(
+                kernel.run_values(&[vec![Value::I32(11), Value::I32(index)]]),
+                Err(Error::Trap {
+                    reason: "undefined or uninitialized table element",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn indirect_calls_check_type_and_reject_recursion() {
+        let wat = r#"(module
+            (type $t (func (param i32) (result i32)))
+            (table 1 funcref)
+            (func $other (param i64) (result i64) local.get 0)
+            (elem (i32.const 0) $other)
+            (func (export "f") (param i32) (result i32)
+                local.get 0 i32.const 0 call_indirect (type $t)))"#;
+        let kernel = Kernel::new(&wat::parse_str(wat).unwrap(), "f").unwrap();
+        assert!(matches!(
+            kernel.run(&[1]),
+            Err(Error::Trap {
+                reason: "indirect call type mismatch",
+                ..
+            })
+        ));
+
+        let recursive = r#"(module
+            (type $t (func (param i32) (result i32)))
+            (table 1 funcref)
+            (func $f (export "f") (type $t)
+                local.get 0 i32.const 0 call_indirect (type $t))
+            (elem (i32.const 0) $f))"#;
+        assert!(matches!(
+            Kernel::new(&wat::parse_str(recursive).unwrap(), "f"),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn expression_elements_call_mixed_numeric_function() {
+        let wat = r#"(module
+            (type $t (func (param f64 i64) (result f64)))
+            (table 2 funcref)
+            (func $mul (type $t)
+                local.get 0 local.get 1 f64.convert_i64_s f64.mul)
+            (elem (i32.const 0) funcref (ref.func $mul) (ref.null func))
+            (func (export "f") (param f64 i64 i32) (result f64)
+                local.get 0 local.get 1 local.get 2 call_indirect (type $t)))"#;
+        compare_values_to_wasmtime(
+            wat,
+            &[
+                vec![Value::F64(1.25f64.to_bits()), Value::I64(3), Value::I32(0)],
+                vec![
+                    Value::F64((-0.5f64).to_bits()),
+                    Value::I64(u64::MAX),
+                    Value::I32(0),
+                ],
+            ],
+        );
+        let kernel = Kernel::new(&wat::parse_str(wat).unwrap(), "f").unwrap();
+        assert!(matches!(
+            kernel.run_values(&[vec![
+                Value::F64(1.0f64.to_bits()),
+                Value::I64(3),
+                Value::I32(1)
+            ]]),
+            Err(Error::Trap {
+                reason: "undefined or uninitialized table element",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn constant_indirect_slot_excludes_unused_recursive_target() {
+        let wat = r#"(module
+            (type $t (func (param i32) (result i32)))
+            (table 2 funcref)
+            (func $f (export "f") (type $t)
+                local.get 0 i32.const 1 call_indirect (type $t))
+            (func $g (type $t) local.get 0 i32.const 4 i32.add)
+            (elem (i32.const 0) $f $g))"#;
+        compare_values_to_wasmtime(wat, &[vec![Value::I32(0)], vec![Value::I32(7)]]);
     }
 }
