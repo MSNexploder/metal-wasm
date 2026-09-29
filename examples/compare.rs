@@ -51,14 +51,14 @@ const SUITE_WORKLOADS: [SuiteWorkload; 7] = [
         wat: include_str!("workloads/stateful_memory.wat"),
         provider: None,
         native: memory_native,
-        counts: &[1, 1_000, 4_096],
+        counts: &[1, 1_000, 4_096, 10_000],
     },
     SuiteWorkload {
         name: "bulk_start",
         wat: include_str!("workloads/bulk_start.wat"),
         provider: None,
         native: bulk_start_native,
-        counts: &[1, 1_000, 4_096],
+        counts: &[1, 1_000, 4_096, 10_000],
     },
     SuiteWorkload {
         name: "recursive_calls",

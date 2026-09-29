@@ -20,6 +20,7 @@ const MAX_GROWTH_PAGES: usize = 4;
 const MAX_TABLE_ELEMENTS: usize = 65536;
 const MAX_TABLE_GROWTH: usize = 256;
 const MAX_CALL_DEPTH: usize = 32;
+const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 /// One raw WebAssembly numeric value. Floating-point variants hold their bit patterns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,8 +186,9 @@ impl Kernel {
         self.run_timed(inputs).map(|(output, _)| output)
     }
 
-    /// Run the batch and return Metal's GPU execution time when available.
-    /// This excludes host-side buffer copies and command submission.
+    /// Run the batch and return summed GPU execution time when available.
+    /// Large batches use multiple dispatches. This excludes host-side buffer
+    /// copies and command submission.
     pub fn run_timed(&self, inputs: &[u32]) -> Result<(Vec<u32>, Option<Duration>), Error> {
         if self.params != [ValType::I32] || self.results != [ValType::I32] {
             return Err(Error::Unsupported(
@@ -196,24 +198,31 @@ impl Kernel {
         if inputs.is_empty() {
             return Ok((Vec::new(), None));
         }
-        let count = u32::try_from(inputs.len())
-            .map_err(|_| Error::Unsupported("more than u32::MAX invocations".into()))?;
-        let bytes = inputs
-            .len()
-            .checked_mul(size_of::<u32>())
-            .ok_or_else(|| Error::Unsupported("input buffer size overflow".into()))?;
-        let input = unsafe { std::slice::from_raw_parts(inputs.as_ptr().cast::<u8>(), bytes) };
-        let (output, gpu_time) = self.dispatch(input, bytes, count)?;
-        let values =
-            unsafe { std::slice::from_raw_parts(output.contents().cast::<u32>(), inputs.len()) };
-        Ok((values.to_vec(), gpu_time))
+        let batch_size = self
+            .batch_limit(size_of::<u32>(), size_of::<u32>())?
+            .min(inputs.len());
+        let instance_buffers = self.prepare_batch(batch_size as u32)?;
+        let mut values = Vec::with_capacity(inputs.len());
+        let mut gpu_time = Some(Duration::ZERO);
+        for chunk in inputs.chunks(batch_size) {
+            if !values.is_empty() {
+                self.reset_batch(&instance_buffers, chunk.len() as u32);
+            }
+            let bytes = size_of_val(chunk);
+            let input = unsafe { std::slice::from_raw_parts(chunk.as_ptr().cast::<u8>(), bytes) };
+            let (output, elapsed) = self
+                .dispatch(input, bytes, chunk.len() as u32, &instance_buffers)
+                .map_err(|error| shift_trap(error, values.len()))?;
+            let result =
+                unsafe { std::slice::from_raw_parts(output.contents().cast::<u32>(), chunk.len()) };
+            values.extend_from_slice(result);
+            gpu_time = gpu_time.and_then(|total| elapsed.and_then(|time| total.checked_add(time)));
+        }
+        Ok((values, gpu_time))
     }
 
     /// Run one independent invocation per row. Each row must match the export's parameters.
     pub fn run_values(&self, inputs: &[Vec<Value>]) -> Result<Vec<Vec<Value>>, Error> {
-        let count = u32::try_from(inputs.len())
-            .map_err(|_| Error::Unsupported("more than u32::MAX invocations".into()))?;
-        let mut encoded = Vec::new();
         for row in inputs {
             if row.len() != self.params.len()
                 || row
@@ -225,7 +234,6 @@ impl Kernel {
                     "input values do not match the export signature".into(),
                 ));
             }
-            encoded.extend(row.iter().map(|value| value.bits()));
         }
         if inputs.is_empty() {
             return Ok(Vec::new());
@@ -244,26 +252,48 @@ impl Kernel {
                 .map(|bits| vec![Value::I32(bits)])
                 .collect());
         }
-        let output_len = inputs
-            .len()
-            .checked_mul(self.results.len())
-            .and_then(|count| count.checked_mul(size_of::<u64>()))
-            .ok_or_else(|| Error::Unsupported("output buffer size overflow".into()))?;
-        let input_bytes = encoded
+        let input_stride = self
+            .params
             .len()
             .checked_mul(size_of::<u64>())
             .ok_or_else(|| Error::Unsupported("input buffer size overflow".into()))?;
-        let input =
-            unsafe { std::slice::from_raw_parts(encoded.as_ptr().cast::<u8>(), input_bytes) };
-        let (output, _) = self.dispatch(input, output_len, count)?;
-        let values = unsafe {
-            std::slice::from_raw_parts(
-                output.contents().cast::<u64>(),
-                inputs.len() * self.results.len(),
-            )
-        };
-        Ok((0..inputs.len())
-            .map(|index| {
+        let output_stride = self
+            .results
+            .len()
+            .checked_mul(size_of::<u64>())
+            .ok_or_else(|| Error::Unsupported("output buffer size overflow".into()))?;
+        let batch_size = self
+            .batch_limit(input_stride, output_stride)?
+            .min(inputs.len());
+        let instance_buffers = self.prepare_batch(batch_size as u32)?;
+        let mut rows = Vec::with_capacity(inputs.len());
+        for start in (0..inputs.len()).step_by(batch_size) {
+            let end = (start + batch_size).min(inputs.len());
+            if start != 0 {
+                self.reset_batch(&instance_buffers, (end - start) as u32);
+            }
+            let encoded: Vec<u64> = inputs[start..end]
+                .iter()
+                .flat_map(|row| row.iter().map(|value| value.bits()))
+                .collect();
+            let input_bytes = size_of_val(encoded.as_slice());
+            let input =
+                unsafe { std::slice::from_raw_parts(encoded.as_ptr().cast::<u8>(), input_bytes) };
+            let (output, _) = self
+                .dispatch(
+                    input,
+                    (end - start) * output_stride,
+                    (end - start) as u32,
+                    &instance_buffers,
+                )
+                .map_err(|error| shift_trap(error, start))?;
+            let values = unsafe {
+                std::slice::from_raw_parts(
+                    output.contents().cast::<u64>(),
+                    (end - start) * self.results.len(),
+                )
+            };
+            rows.extend((0..end - start).map(|index| {
                 self.results
                     .iter()
                     .enumerate()
@@ -279,8 +309,59 @@ impl Kernel {
                         _ => unreachable!(),
                     })
                     .collect()
-            })
-            .collect())
+            }));
+        }
+        Ok(rows)
+    }
+
+    fn batch_limit(&self, input_stride: usize, output_stride: usize) -> Result<usize, Error> {
+        let max_buffer = usize::try_from(self.device.max_buffer_length()).unwrap_or(usize::MAX);
+        let mut limit = u32::MAX as usize;
+        let mut per_lane = 0usize;
+        let mut include = |stride: usize| -> Result<(), Error> {
+            if stride > max_buffer {
+                return Err(Error::Unsupported(
+                    "single invocation exceeds the Metal buffer limit".into(),
+                ));
+            }
+            if stride != 0 {
+                limit = limit.min(max_buffer / stride);
+                per_lane = per_lane.saturating_add(stride);
+            }
+            Ok(())
+        };
+        include(input_stride.max(4))?;
+        include(output_stride.max(4))?;
+        if self.can_trap {
+            include(size_of::<u32>())?;
+        }
+        for instance in &self.instances {
+            let template = &instance.template;
+            if instance.slots.memory.is_some() {
+                include(template.memory_capacity.unwrap().max(1))?;
+                include(size_of::<u32>())?;
+            }
+            if instance.slots.globals.is_some() {
+                include(template.globals_template.len() * size_of::<u64>())?;
+            }
+            if instance.slots.table.is_some() && template.table_info.mutable {
+                include(template.table_info.capacity.max(1) * size_of::<u32>())?;
+            }
+        }
+        Ok(limit.min((MAX_BATCH_BYTES / per_lane).max(1)))
+    }
+
+    fn prepare_batch(&self, count: u32) -> Result<Vec<Vec<(u64, metal::Buffer)>>, Error> {
+        self.instances
+            .iter()
+            .map(|instance| instance.for_batch(&self.device, count))
+            .collect()
+    }
+
+    fn reset_batch(&self, buffers: &[Vec<(u64, metal::Buffer)>], count: u32) {
+        for (instance, buffers) in self.instances.iter().zip(buffers) {
+            instance.reset_batch(buffers, count);
+        }
     }
 
     fn dispatch(
@@ -288,6 +369,7 @@ impl Kernel {
         input_data: &[u8],
         output_bytes: usize,
         count: u32,
+        instance_buffers: &[Vec<(u64, metal::Buffer)>],
     ) -> Result<(metal::Buffer, Option<Duration>), Error> {
         let input_bytes = u64::try_from(input_data.len().max(4))
             .map_err(|_| Error::Unsupported("input buffer size overflow".into()))?;
@@ -298,10 +380,6 @@ impl Kernel {
             return Err(Error::Unsupported(
                 "batch exceeds the Metal buffer limit".into(),
             ));
-        }
-        let mut instance_buffers = Vec::new();
-        for instance in &self.instances {
-            instance_buffers.extend(instance.for_batch(&self.device, count)?);
         }
         let empty = [0u8; 4];
         let input_ptr = if input_data.is_empty() {
@@ -330,8 +408,10 @@ impl Kernel {
         if let Some(traps) = &traps {
             encoder.set_buffer(3, Some(traps), 0);
         }
-        for (slot, buffer) in &instance_buffers {
-            encoder.set_buffer(*slot, Some(buffer), 0);
+        for buffers in instance_buffers {
+            for (slot, buffer) in buffers {
+                encoder.set_buffer(*slot, Some(buffer), 0);
+            }
         }
         let width = self
             .pipeline
@@ -387,6 +467,19 @@ impl Kernel {
     }
 }
 
+fn shift_trap(error: Error, offset: usize) -> Error {
+    match error {
+        Error::Trap {
+            input_index,
+            reason,
+        } => Error::Trap {
+            input_index: offset + input_index,
+            reason,
+        },
+        error => error,
+    }
+}
+
 fn make_buffer<T>(device: &Device, data: &[T]) -> Result<metal::Buffer, Error> {
     let bytes = size_of_val(data).max(4) as u64;
     if bytes > device.max_buffer_length() {
@@ -419,19 +512,32 @@ fn lane_buffer<T: Copy + Default>(
     let bytes = len
         .checked_mul(size_of::<T>())
         .ok_or_else(|| Error::Unsupported("instance buffer size overflow".into()))?;
-    if bytes as u64 > device.max_buffer_length() {
+    let bytes = bytes.max(4) as u64;
+    if bytes > device.max_buffer_length() {
         return Err(Error::Unsupported(
             "batch exceeds the Metal buffer limit".into(),
         ));
     }
-    let mut data = Vec::new();
-    data.try_reserve_exact(len)
-        .map_err(|_| Error::Unsupported("cannot allocate per-lane state".into()))?;
-    data.resize(len, T::default());
+    let buffer = device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+    reset_lane_buffer(&buffer, template, capacity, count);
+    Ok(buffer)
+}
+
+fn reset_lane_buffer<T: Copy + Default>(
+    buffer: &metal::Buffer,
+    template: &[T],
+    capacity: usize,
+    count: u32,
+) {
+    let stride = capacity.max(1);
+    // The buffer was allocated for at least `count` lanes with this stride.
+    let data = unsafe {
+        std::slice::from_raw_parts_mut(buffer.contents().cast::<T>(), stride * count as usize)
+    };
     for lane in data.chunks_mut(stride) {
+        lane.fill(T::default());
         lane[..template.len()].copy_from_slice(template);
     }
-    make_buffer(device, &data)
 }
 
 impl InstanceBuffers {
@@ -477,6 +583,42 @@ impl InstanceBuffers {
             buffers.push((slot, self.passive_data.as_ref().unwrap().clone()));
         }
         Ok(buffers)
+    }
+
+    fn reset_batch(&self, buffers: &[(u64, metal::Buffer)], count: u32) {
+        let buffer = |slot| &buffers.iter().find(|(index, _)| *index == slot).unwrap().1;
+        let template = &self.template;
+        if let Some(slot) = self.slots.memory {
+            let initial = template.memory_template.as_ref().unwrap();
+            reset_lane_buffer(
+                buffer(slot),
+                initial,
+                template.memory_capacity.unwrap(),
+                count,
+            );
+            reset_lane_buffer(
+                buffer(self.slots.pages.unwrap()),
+                &[initial.len() as u32 / 65536],
+                1,
+                count,
+            );
+        }
+        if let Some(slot) = self.slots.globals {
+            reset_lane_buffer(
+                buffer(slot),
+                &template.globals_template,
+                template.globals_template.len(),
+                count,
+            );
+        }
+        if let Some(slot) = self.slots.table.filter(|_| template.table_info.mutable) {
+            reset_lane_buffer(
+                buffer(slot),
+                template.table_template.as_ref().unwrap(),
+                template.table_info.capacity,
+                count,
+            );
+        }
     }
 }
 
@@ -2954,6 +3096,35 @@ mod tests {
     }
 
     #[test]
+    fn linked_module_memory_is_counted_and_reset_across_batches() {
+        let provider = wat::parse_str(
+            r#"(module (memory 1)
+                (global $g (mut i32) (i32.const 7))
+                (func (export "add") (param i32) (result i32)
+                    global.get $g local.get 0 i32.add
+                    global.get $g i32.const 1 i32.add global.set $g))"#,
+        )
+        .unwrap();
+        let root = wat::parse_str(
+            r#"(module
+                (import "p" "add" (func $add (param i32) (result i32)))
+                (memory 1)
+                (func (export "f") (param i32) (result i32)
+                    local.get 0 call $add))"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new_with_imports(&root, "f", &[("p", &provider)]).unwrap();
+        let limit = kernel.batch_limit(4, 4).unwrap();
+        assert!(
+            limit < 600,
+            "both module memories must count toward the budget"
+        );
+        let inputs: Vec<u32> = (0..limit as u32 + 5).collect();
+        let expected: Vec<u32> = inputs.iter().map(|value| value + 7).collect();
+        assert_eq!(kernel.run(&inputs).unwrap(), expected);
+    }
+
+    #[test]
     fn wasm_imports_preserve_references_and_module_type_indices() {
         let provider = r#"(module
             (type $result (func (result i32)))
@@ -3581,6 +3752,68 @@ mod tests {
                 input_index: 1,
                 reason: "out of bounds memory access"
             })
+        ));
+    }
+
+    #[test]
+    fn memory_batches_preserve_results_and_global_trap_indices() {
+        let wasm = wat::parse_str(
+            r#"(module (memory 1)
+                (global $g (mut i32) (i32.const 7))
+                (func (export "f") (param i32) (result i32)
+                    local.get 0 i32.load drop
+                    global.get $g local.get 0 i32.add
+                    global.get $g i32.const 1 i32.add global.set $g))"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        let limit = kernel.batch_limit(4, 4).unwrap();
+        assert!(limit < 65_000);
+        let mut inputs: Vec<u32> = (0..limit as u32 + 9).collect();
+        let expected: Vec<u32> = inputs.iter().map(|value| value + 7).collect();
+        assert_eq!(kernel.run(&inputs).unwrap(), expected);
+        assert_eq!(kernel.run(&inputs).unwrap(), expected);
+        inputs[limit + 3] = 65_536;
+        assert!(matches!(
+            kernel.run(&inputs),
+            Err(Error::Trap {
+                input_index,
+                reason: "out of bounds memory access"
+            }) if input_index == limit + 3
+        ));
+    }
+
+    #[test]
+    fn value_batches_preserve_multiple_results_and_trap_indices() {
+        let wasm = wat::parse_str(
+            r#"(module (memory 1)
+                (func (export "f") (param i64 i32) (result i64 i32)
+                    local.get 1 local.get 1 i32.store
+                    local.get 0 i64.const 9 i64.add
+                    local.get 1 i32.load))"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        let limit = kernel.batch_limit(16, 16).unwrap();
+        assert!(limit < 65_000);
+        let mut inputs: Vec<_> = (0..limit as u32 + 7)
+            .map(|value| vec![Value::I64(value as u64), Value::I32(value)])
+            .collect();
+        let expected: Vec<_> = (0..inputs.len() as u64)
+            .map(|value| vec![Value::I64(value + 9), Value::I32(value as u32)])
+            .collect();
+        let actual = kernel.run_values(&inputs).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(actual, expected, "input index {index}");
+        }
+        inputs[limit + 2][1] = Value::I32(65_536);
+        assert!(matches!(
+            kernel.run_values(&inputs),
+            Err(Error::Trap {
+                input_index,
+                reason: "out of bounds memory access"
+            }) if input_index == limit + 2
         ));
     }
 
@@ -4335,6 +4568,21 @@ mod tests {
             kernel.run(&[0, 1, 256, 257, u32::MAX]).unwrap(),
             [0, 0, 0, u32::MAX, u32::MAX]
         );
+    }
+
+    #[test]
+    fn table_size_is_fresh_when_state_buffers_are_reused() {
+        let wasm = wat::parse_str(
+            r#"(module (memory 1) (table 1 2 funcref)
+                (func (export "f") (param i32) (result i32)
+                    ref.null func i32.const 1 table.grow drop
+                    table.size))"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        let limit = kernel.batch_limit(4, 4).unwrap();
+        assert!(limit < 65_000);
+        assert_eq!(kernel.run(&vec![0; limit + 3]).unwrap(), vec![2; limit + 3]);
     }
 
     #[test]
