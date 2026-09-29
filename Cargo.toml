@@ -6,7 +6,7 @@ description = "Run independent WebAssembly functions in parallel on Metal"
 
 [dependencies]
 metal = "0.33"
-wasmparser = { version = "0.259", default-features = false, features = ["std", "validate", "features"] }
+wasmparser = { version = "0.259", default-features = false, features = ["std", "validate", "features", "simd"] }
 
 [dev-dependencies]
 wasmi = { version = "2.0", default-features = false, features = ["stable", "std", "validate"] }

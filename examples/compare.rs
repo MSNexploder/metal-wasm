@@ -29,15 +29,25 @@ struct SuiteWorkload {
     provider: Option<(&'static str, &'static str)>,
     native: fn(u32) -> u32,
     counts: &'static [usize],
+    wasmi: bool,
 }
 
-const SUITE_WORKLOADS: [SuiteWorkload; 8] = [
+const SUITE_WORKLOADS: [SuiteWorkload; 9] = [
+    SuiteWorkload {
+        name: "simd_i32x4",
+        wat: include_str!("workloads/simd_i32x4.wat"),
+        provider: None,
+        native: simd_native,
+        counts: &[1, 1_000, 100_000, 1_000_000],
+        wasmi: false,
+    },
     SuiteWorkload {
         name: "dispatch_i64",
         wat: include_str!("workloads/dispatch_i64.wat"),
         provider: None,
         native: dispatch_native,
         counts: &[1, 1_000, 100_000, 1_000_000],
+        wasmi: true,
     },
     SuiteWorkload {
         name: "float_f64",
@@ -45,6 +55,7 @@ const SUITE_WORKLOADS: [SuiteWorkload; 8] = [
         provider: None,
         native: float_native,
         counts: &[1, 1_000, 100_000, 1_000_000],
+        wasmi: true,
     },
     SuiteWorkload {
         name: "stateful_memory",
@@ -52,6 +63,7 @@ const SUITE_WORKLOADS: [SuiteWorkload; 8] = [
         provider: None,
         native: memory_native,
         counts: &[1, 1_000, 4_096, 10_000],
+        wasmi: true,
     },
     SuiteWorkload {
         name: "bulk_start",
@@ -59,6 +71,7 @@ const SUITE_WORKLOADS: [SuiteWorkload; 8] = [
         provider: None,
         native: bulk_start_native,
         counts: &[1, 1_000, 4_096, 10_000],
+        wasmi: true,
     },
     SuiteWorkload {
         name: "recursive_calls",
@@ -66,6 +79,7 @@ const SUITE_WORKLOADS: [SuiteWorkload; 8] = [
         provider: None,
         native: recursive_native,
         counts: &[1, 1_000, 100_000, 1_000_000],
+        wasmi: true,
     },
     SuiteWorkload {
         name: "mutable_table",
@@ -73,6 +87,7 @@ const SUITE_WORKLOADS: [SuiteWorkload; 8] = [
         provider: None,
         native: mutable_table_native,
         counts: &[1, 1_000, 100_000, 1_000_000],
+        wasmi: true,
     },
     SuiteWorkload {
         name: "imported_calls",
@@ -80,6 +95,7 @@ const SUITE_WORKLOADS: [SuiteWorkload; 8] = [
         provider: Some(("math", include_str!("workloads/import_provider.wat"))),
         native: imported_calls_native,
         counts: &[1, 1_000, 100_000, 1_000_000],
+        wasmi: true,
     },
     SuiteWorkload {
         name: "linked_resources",
@@ -87,6 +103,7 @@ const SUITE_WORKLOADS: [SuiteWorkload; 8] = [
         provider: Some(("state", include_str!("workloads/resource_provider.wat"))),
         native: linked_resources_native,
         counts: &[1, 1_000, 4_096, 10_000],
+        wasmi: true,
     },
 ];
 
@@ -94,7 +111,8 @@ fn main() -> Result<()> {
     let large = match std::env::args().nth(1).as_deref() {
         Some("--mix") => return compare_compute(false),
         Some("--control") => return compare_compute(true),
-        Some("--suite") => return compare_suite(),
+        Some("--suite") => return compare_suite(false),
+        Some("--simd") => return compare_suite(true),
         Some("--metal-native-100m") => true,
         Some(argument) => return Err(format!("unknown argument: {argument}").into()),
         None => false,
@@ -273,9 +291,12 @@ fn compare_compute(control: bool) -> Result<()> {
     Ok(())
 }
 
-fn compare_suite() -> Result<()> {
+fn compare_suite(only_simd: bool) -> Result<()> {
     println!("workload,count,metal_total_us,metal_gpu_us,wasmtime_us,wasmi_us,native_us,samples");
     for workload in &SUITE_WORKLOADS {
+        if only_simd && workload.name != "simd_i32x4" {
+            continue;
+        }
         let wasm = wat::parse_str(workload.wat)?;
         let provider = workload
             .provider
@@ -299,18 +320,31 @@ fn compare_suite() -> Result<()> {
             wasmtime_linker.instantiate(&mut wasmtime_store, &wasmtime_module)?;
         let wasmtime_func =
             wasmtime_instance.get_typed_func::<i32, i32>(&mut wasmtime_store, "calculate")?;
-        let wasmi_engine = wasmi::Engine::default();
-        let wasmi_module = wasmi::Module::new(&wasmi_engine, &wasm)?;
-        let mut wasmi_store = wasmi::Store::new(&wasmi_engine, ());
-        let mut wasmi_linker = wasmi::Linker::new(&wasmi_engine);
-        if let Some((name, bytes)) = &provider {
-            let module = wasmi::Module::new(&wasmi_engine, bytes)?;
-            let instance = wasmi::Linker::new(&wasmi_engine)
-                .instantiate_and_start(&mut wasmi_store, &module)?;
-            wasmi_linker.instance(&mut wasmi_store, name, instance)?;
-        }
-        let wasmi_instance = wasmi_linker.instantiate_and_start(&mut wasmi_store, &wasmi_module)?;
-        let wasmi_func = wasmi_instance.get_typed_func::<i32, i32>(&wasmi_store, "calculate")?;
+        let mut run_wasmi = if workload.wasmi {
+            let wasmi_engine = wasmi::Engine::default();
+            let wasmi_module = wasmi::Module::new(&wasmi_engine, &wasm)?;
+            let mut wasmi_store = wasmi::Store::new(&wasmi_engine, ());
+            let mut wasmi_linker = wasmi::Linker::new(&wasmi_engine);
+            if let Some((name, bytes)) = &provider {
+                let module = wasmi::Module::new(&wasmi_engine, bytes)?;
+                let instance = wasmi::Linker::new(&wasmi_engine)
+                    .instantiate_and_start(&mut wasmi_store, &module)?;
+                wasmi_linker.instance(&mut wasmi_store, name, instance)?;
+            }
+            let wasmi_instance =
+                wasmi_linker.instantiate_and_start(&mut wasmi_store, &wasmi_module)?;
+            let wasmi_func =
+                wasmi_instance.get_typed_func::<i32, i32>(&wasmi_store, "calculate")?;
+            Some(move |inputs: &[u32]| -> Result<Vec<u32>> {
+                let mut output = Vec::with_capacity(inputs.len());
+                for &input in inputs {
+                    output.push(wasmi_func.call(&mut wasmi_store, input as i32)? as u32);
+                }
+                Ok(output)
+            })
+        } else {
+            None
+        };
         let mut run_wasmtime = |inputs: &[u32]| -> Result<Vec<u32>> {
             let mut output = Vec::with_capacity(inputs.len());
             for &input in inputs {
@@ -318,34 +352,34 @@ fn compare_suite() -> Result<()> {
             }
             Ok(output)
         };
-        let mut run_wasmi = |inputs: &[u32]| -> Result<Vec<u32>> {
-            let mut output = Vec::with_capacity(inputs.len());
-            for &input in inputs {
-                output.push(wasmi_func.call(&mut wasmi_store, input as i32)? as u32);
-            }
-            Ok(output)
-        };
         let warmup = [0u32, 1, 42, 43];
         verify_output(&warmup, &metal.run_timed(&warmup)?.0, workload.native)?;
         verify_output(&warmup, &run_wasmtime(&warmup)?, workload.native)?;
-        verify_output(&warmup, &run_wasmi(&warmup)?, workload.native)?;
+        if let Some(run_wasmi) = &mut run_wasmi {
+            verify_output(&warmup, &run_wasmi(&warmup)?, workload.native)?;
+        }
 
         for &count in workload.counts {
             eprintln!("measuring {} at {count} invocations...", workload.name);
             let inputs: Vec<u32> = (0..count).map(|value| value as u32).collect();
             let (metal_total, metal_gpu) = measure_metal(&metal, &inputs, workload.native)?;
             let wasmtime = measure(&inputs, 3, 1, workload.native, &mut run_wasmtime)?;
-            let wasmi = measure(&inputs, 3, 1, workload.native, &mut run_wasmi)?;
+            let wasmi = run_wasmi
+                .as_mut()
+                .map(|run| measure(&inputs, 3, 1, workload.native, run))
+                .transpose()?;
             let native = measure(&inputs, 3, 1, workload.native, |inputs| {
                 Ok(inputs.iter().copied().map(workload.native).collect())
             })?;
             println!(
-                "{},{count},{:.2},{:.2},{:.2},{:.2},{:.2},3",
+                "{},{count},{:.2},{:.2},{:.2},{},{:.2},3",
                 workload.name,
                 micros(metal_total),
                 micros(metal_gpu),
                 micros(wasmtime),
-                micros(wasmi),
+                wasmi
+                    .map(|time| format!("{:.2}", micros(time)))
+                    .unwrap_or_default(),
                 micros(native)
             );
         }
@@ -611,6 +645,23 @@ fn linked_resources_native(input: u32) -> u32 {
     value ^ global
 }
 
+#[inline(always)]
+fn simd_native(input: u32) -> u32 {
+    let mut lanes = [
+        input.wrapping_add(1),
+        input.wrapping_add(2),
+        input.wrapping_add(3),
+        input.wrapping_add(4),
+    ];
+    for _ in 0..32 {
+        for (lane, multiplier) in lanes.iter_mut().zip([7u32, 11, 13, 17]) {
+            *lane = lane.wrapping_mul(multiplier) ^ lane.wrapping_shl(5);
+            *lane = lane.wrapping_add(0x9e37_79b9);
+        }
+    }
+    lanes.into_iter().fold(0, |result, lane| result ^ lane)
+}
+
 fn measure_metal(
     metal: &Kernel,
     inputs: &[u32],
@@ -739,31 +790,41 @@ mod tests {
                         .unwrap() as u32
                 })
                 .collect();
-            let wasmi_engine = wasmi::Engine::default();
-            let wasmi_module = wasmi::Module::new(&wasmi_engine, &wasm).unwrap();
-            let mut wasmi_store = wasmi::Store::new(&wasmi_engine, ());
-            let mut wasmi_linker = wasmi::Linker::new(&wasmi_engine);
-            if let Some((name, bytes)) = &provider {
-                let module = wasmi::Module::new(&wasmi_engine, bytes).unwrap();
-                let instance = wasmi::Linker::new(&wasmi_engine)
-                    .instantiate_and_start(&mut wasmi_store, &module)
+            let wasmi_output = if workload.wasmi {
+                let wasmi_engine = wasmi::Engine::default();
+                let wasmi_module = wasmi::Module::new(&wasmi_engine, &wasm).unwrap();
+                let mut wasmi_store = wasmi::Store::new(&wasmi_engine, ());
+                let mut wasmi_linker = wasmi::Linker::new(&wasmi_engine);
+                if let Some((name, bytes)) = &provider {
+                    let module = wasmi::Module::new(&wasmi_engine, bytes).unwrap();
+                    let instance = wasmi::Linker::new(&wasmi_engine)
+                        .instantiate_and_start(&mut wasmi_store, &module)
+                        .unwrap();
+                    wasmi_linker
+                        .instance(&mut wasmi_store, name, instance)
+                        .unwrap();
+                }
+                let wasmi_instance = wasmi_linker
+                    .instantiate_and_start(&mut wasmi_store, &wasmi_module)
                     .unwrap();
-                wasmi_linker
-                    .instance(&mut wasmi_store, name, instance)
+                let wasmi_func = wasmi_instance
+                    .get_typed_func::<i32, i32>(&wasmi_store, "calculate")
                     .unwrap();
-            }
-            let wasmi_instance = wasmi_linker
-                .instantiate_and_start(&mut wasmi_store, &wasmi_module)
-                .unwrap();
-            let wasmi_func = wasmi_instance
-                .get_typed_func::<i32, i32>(&wasmi_store, "calculate")
-                .unwrap();
-            let wasmi_output: Vec<u32> = inputs
-                .iter()
-                .map(|input| wasmi_func.call(&mut wasmi_store, *input as i32).unwrap() as u32)
-                .collect();
+                Some(
+                    inputs
+                        .iter()
+                        .map(|input| {
+                            wasmi_func.call(&mut wasmi_store, *input as i32).unwrap() as u32
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            };
             assert_eq!(wasmtime_output, expected, "{}: Wasmtime", workload.name);
-            assert_eq!(wasmi_output, expected, "{}: Wasmi", workload.name);
+            if let Some(wasmi_output) = wasmi_output {
+                assert_eq!(wasmi_output, expected, "{}: Wasmi", workload.name);
+            }
             assert_eq!(metal_output, expected, "{}: Metal", workload.name);
         }
     }

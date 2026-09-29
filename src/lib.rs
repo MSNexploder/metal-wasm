@@ -1,12 +1,17 @@
 //! Execute a supported WebAssembly function once per Metal thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
+use std::ffi::CStr;
 use std::fmt;
 use std::ops::Range;
 use std::time::Duration;
 
-use metal::objc::{Message, runtime::Sel};
+use metal::objc::{
+    Message,
+    rc::autoreleasepool,
+    runtime::{Object, Sel},
+};
 use metal::{
     CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device,
     MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
@@ -51,6 +56,7 @@ pub enum Value {
     I64(u64),
     F32(u32),
     F64(u64),
+    V128([u8; 16]),
 }
 
 impl Value {
@@ -60,6 +66,7 @@ impl Value {
             Self::I64(_) => ValType::I64,
             Self::F32(_) => ValType::F32,
             Self::F64(_) => ValType::F64,
+            Self::V128(_) => ValType::V128,
         }
     }
 
@@ -67,7 +74,19 @@ impl Value {
         match self {
             Self::I32(bits) | Self::F32(bits) => bits as u64,
             Self::I64(bits) | Self::F64(bits) => bits,
+            Self::V128(_) => unreachable!("v128 has two words"),
         }
+    }
+
+    fn words(self) -> impl Iterator<Item = u64> {
+        let (low, high) = match self {
+            Self::V128(bytes) => (
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                Some(u64::from_le_bytes(bytes[8..].try_into().unwrap())),
+            ),
+            _ => (self.bits(), None),
+        };
+        std::iter::once(low).chain(high)
     }
 }
 
@@ -401,7 +420,9 @@ impl Kernel {
         };
         let argument_stride = self
             .params
-            .len()
+            .iter()
+            .map(|ty| value_words(*ty))
+            .sum::<usize>()
             .checked_mul(word_size)
             .ok_or_else(|| Error::Unsupported("input buffer size overflow".into()))?;
         let input_stride = argument_stride
@@ -409,7 +430,9 @@ impl Kernel {
             .ok_or_else(|| Error::Unsupported("input buffer size overflow".into()))?;
         let output_stride = self
             .results
-            .len()
+            .iter()
+            .map(|ty| value_words(*ty))
+            .sum::<usize>()
             .checked_mul(word_size)
             .ok_or_else(|| Error::Unsupported("output buffer size overflow".into()))?;
         let batch_size = self
@@ -436,7 +459,7 @@ impl Kernel {
             } else {
                 encoded64 = inputs[start..end]
                     .iter()
-                    .flat_map(|row| row.iter().map(|value| value.bits()))
+                    .flat_map(|row| row.iter().flat_map(|value| value.words()))
                     .collect::<Vec<_>>();
                 input_bytes = size_of_val(encoded64.as_slice());
                 encoded64.as_ptr().cast::<u8>()
@@ -471,23 +494,29 @@ impl Kernel {
                 let values = unsafe {
                     std::slice::from_raw_parts(
                         output.contents().cast::<u64>(),
-                        (end - start) * self.results.len(),
+                        (end - start) * (output_stride / size_of::<u64>()),
                     )
                 };
                 rows.extend((0..end - start).map(|index| {
+                    let mut offset = index * (output_stride / size_of::<u64>());
                     self.results
                         .iter()
-                        .enumerate()
-                        .map(|(result, ty)| match ty {
-                            ValType::I32 => {
-                                Value::I32(values[index * self.results.len() + result] as u32)
+                        .map(|ty| {
+                            let low = values[offset];
+                            offset += value_words(*ty);
+                            match ty {
+                                ValType::I32 => Value::I32(low as u32),
+                                ValType::I64 => Value::I64(low),
+                                ValType::F32 => Value::F32(low as u32),
+                                ValType::F64 => Value::F64(low),
+                                ValType::V128 => {
+                                    let mut bytes = [0; 16];
+                                    bytes[..8].copy_from_slice(&low.to_le_bytes());
+                                    bytes[8..].copy_from_slice(&values[offset - 1].to_le_bytes());
+                                    Value::V128(bytes)
+                                }
+                                _ => unreachable!(),
                             }
-                            ValType::I64 => Value::I64(values[index * self.results.len() + result]),
-                            ValType::F32 => {
-                                Value::F32(values[index * self.results.len() + result] as u32)
-                            }
-                            ValType::F64 => Value::F64(values[index * self.results.len() + result]),
-                            _ => unreachable!(),
                         })
                         .collect()
                 }));
@@ -587,101 +616,127 @@ impl Kernel {
         instance_buffers: &[Vec<(u64, metal::Buffer)>],
         memory_input: Option<(usize, usize)>,
     ) -> Result<(metal::Buffer, Option<Duration>), Error> {
-        let input_bytes = u64::try_from(input_data.len().max(4))
-            .map_err(|_| Error::Unsupported("input buffer size overflow".into()))?;
-        let output_bytes = u64::try_from(output_bytes.max(4))
-            .map_err(|_| Error::Unsupported("output buffer size overflow".into()))?;
-        let trap_bytes = u64::from(count) * size_of::<u32>() as u64;
-        if input_bytes.max(output_bytes).max(trap_bytes) > self.device.max_buffer_length() {
-            return Err(Error::Unsupported(
-                "batch exceeds the Metal buffer limit".into(),
-            ));
-        }
-        let empty = [0u8; 4];
-        let input_ptr = if input_data.is_empty() {
-            empty.as_ptr()
-        } else {
-            input_data.as_ptr()
-        };
-        let input = self.device.new_buffer_with_data(
-            input_ptr.cast(),
-            input_bytes,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let output = self
-            .device
-            .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
-        let traps = self.can_trap.then(|| {
-            self.device
-                .new_buffer(trap_bytes, MTLResourceOptions::StorageModeShared)
-        });
-        let command = self.queue.new_command_buffer();
-        let encoder = command.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&self.pipeline);
-        encoder.set_buffer(0, Some(&input), 0);
-        encoder.set_buffer(1, Some(&output), 0);
-        let (offset, width) = memory_input.unwrap_or((0, 0));
-        let config = [count as u64, offset as u64, width as u64];
-        encoder.set_bytes(2, size_of_val(&config) as u64, config.as_ptr().cast());
-        if let Some(traps) = &traps {
-            encoder.set_buffer(3, Some(traps), 0);
-        }
-        for buffers in instance_buffers {
-            for (slot, buffer) in buffers {
-                encoder.set_buffer(*slot, Some(buffer), 0);
+        autoreleasepool(|| {
+            let input_bytes = u64::try_from(input_data.len().max(4))
+                .map_err(|_| Error::Unsupported("input buffer size overflow".into()))?;
+            let output_bytes = u64::try_from(output_bytes.max(4))
+                .map_err(|_| Error::Unsupported("output buffer size overflow".into()))?;
+            let trap_bytes = u64::from(count) * size_of::<u32>() as u64;
+            if input_bytes.max(output_bytes).max(trap_bytes) > self.device.max_buffer_length() {
+                return Err(Error::Unsupported(
+                    "batch exceeds the Metal buffer limit".into(),
+                ));
             }
-        }
-        let width = self
-            .pipeline
-            .thread_execution_width()
-            .min(self.pipeline.max_total_threads_per_threadgroup());
-        let groups = (count as u64).div_ceil(width);
-        encoder.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(width, 1, 1));
-        encoder.end_encoding();
-        command.commit();
-        command.wait_until_completed();
-        if command.status() != MTLCommandBufferStatus::Completed {
-            return Err(Error::Metal(format!(
-                "Metal command failed: {:?}",
-                command.status()
-            )));
-        }
-        if let Some(traps) = &traps {
-            let codes = unsafe {
-                std::slice::from_raw_parts(traps.contents().cast::<u32>(), count as usize)
+            let empty = [0u8; 4];
+            let input_ptr = if input_data.is_empty() {
+                empty.as_ptr()
+            } else {
+                input_data.as_ptr()
             };
-            if let Some((input_index, code)) =
-                codes.iter().enumerate().find(|(_, code)| **code != 0)
-            {
-                let reason = match code {
-                    1 => "integer divide by zero",
-                    2 => "integer overflow",
-                    3 => "unreachable executed",
-                    4 => "out of bounds memory access",
-                    5 => "invalid conversion to integer",
-                    6 => "undefined or uninitialized table element",
-                    7 => "indirect call type mismatch",
-                    8 => "call depth limit exceeded",
-                    _ => "unknown trap",
-                };
-                return Err(Error::Trap {
-                    input_index,
-                    reason,
-                });
+            let input = self.device.new_buffer_with_data(
+                input_ptr.cast(),
+                input_bytes,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let output = self
+                .device
+                .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
+            let traps = self.can_trap.then(|| {
+                self.device
+                    .new_buffer(trap_bytes, MTLResourceOptions::StorageModeShared)
+            });
+            let command = self.queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.pipeline);
+            encoder.set_buffer(0, Some(&input), 0);
+            encoder.set_buffer(1, Some(&output), 0);
+            let (offset, width) = memory_input.unwrap_or((0, 0));
+            let config = [count as u64, offset as u64, width as u64];
+            encoder.set_bytes(2, size_of_val(&config) as u64, config.as_ptr().cast());
+            if let Some(traps) = &traps {
+                encoder.set_buffer(3, Some(traps), 0);
             }
-        }
+            for buffers in instance_buffers {
+                for (slot, buffer) in buffers {
+                    encoder.set_buffer(*slot, Some(buffer), 0);
+                }
+            }
+            let width = self
+                .pipeline
+                .thread_execution_width()
+                .min(self.pipeline.max_total_threads_per_threadgroup());
+            let groups = (count as u64).div_ceil(width);
+            encoder.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(width, 1, 1));
+            encoder.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+            if command.status() != MTLCommandBufferStatus::Completed {
+                let detail = unsafe {
+                    let error: *mut Object = command
+                        .send_message(Sel::register("error"), ())
+                        .unwrap_or(std::ptr::null_mut());
+                    if error.is_null() {
+                        String::new()
+                    } else {
+                        let description: *mut Object = (&*error)
+                            .send_message(Sel::register("localizedDescription"), ())
+                            .unwrap_or(std::ptr::null_mut());
+                        if description.is_null() {
+                            String::new()
+                        } else {
+                            let bytes: *const std::ffi::c_char = (&*description)
+                                .send_message(Sel::register("UTF8String"), ())
+                                .unwrap_or(std::ptr::null());
+                            if bytes.is_null() {
+                                String::new()
+                            } else {
+                                format!(": {}", CStr::from_ptr(bytes).to_string_lossy())
+                            }
+                        }
+                    }
+                };
+                return Err(Error::Metal(format!(
+                    "Metal command failed: {:?}{detail}",
+                    command.status(),
+                )));
+            }
+            if let Some(traps) = &traps {
+                let codes = unsafe {
+                    std::slice::from_raw_parts(traps.contents().cast::<u32>(), count as usize)
+                };
+                if let Some((input_index, code)) =
+                    codes.iter().enumerate().find(|(_, code)| **code != 0)
+                {
+                    let reason = match code {
+                        1 => "integer divide by zero",
+                        2 => "integer overflow",
+                        3 => "unreachable executed",
+                        4 => "out of bounds memory access",
+                        5 => "invalid conversion to integer",
+                        6 => "undefined or uninitialized table element",
+                        7 => "indirect call type mismatch",
+                        8 => "call depth limit exceeded",
+                        _ => "unknown trap",
+                    };
+                    return Err(Error::Trap {
+                        input_index,
+                        reason,
+                    });
+                }
+            }
 
-        // Metal-rs does not wrap these MTLCommandBuffer properties.
-        let gpu_start: Option<f64> =
-            unsafe { command.send_message(Sel::register("GPUStartTime"), ()) }.ok();
-        let gpu_end: Option<f64> =
-            unsafe { command.send_message(Sel::register("GPUEndTime"), ()) }.ok();
-        let gpu_time = gpu_start.zip(gpu_end).and_then(|(start, end)| {
-            (start > 0.0 && end.is_finite() && end >= start)
-                .then(|| Duration::from_secs_f64(end - start))
-        });
+            // Metal-rs does not wrap these MTLCommandBuffer properties.
+            let gpu_start: Option<f64> =
+                unsafe { command.send_message(Sel::register("GPUStartTime"), ()) }.ok();
+            let gpu_end: Option<f64> =
+                unsafe { command.send_message(Sel::register("GPUEndTime"), ()) }.ok();
+            let gpu_time = gpu_start.zip(gpu_end).and_then(|(start, end)| {
+                (start > 0.0 && end.is_finite() && end >= start)
+                    .then(|| Duration::from_secs_f64(end - start))
+            });
 
-        Ok((output, gpu_time))
+            Ok((output, gpu_time))
+        })
     }
 }
 
@@ -882,7 +937,8 @@ struct ParsedModule<'a> {
     table_owner: Option<usize>,
     global_types: Vec<GlobalType>,
     global_bindings: Vec<(usize, usize)>,
-    dynamic_globals: Vec<(usize, ConstExpr<'a>)>,
+    local_global_slots: Vec<usize>,
+    dynamic_globals: Vec<(usize, ValType, ConstExpr<'a>)>,
     active_elements: Vec<(usize, ConstExpr<'a>)>,
     active_data: Vec<(ConstExpr<'a>, usize, usize)>,
     table_init_expr: Option<ConstExpr<'a>>,
@@ -920,6 +976,7 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
     let mut globals_template = Vec::new();
     let mut globals_mutable = Vec::new();
     let mut global_types = Vec::new();
+    let mut local_global_slots = Vec::new();
     let mut imported_globals = 0;
     let mut dynamic_globals = Vec::new();
     let mut active_elements = Vec::new();
@@ -1067,18 +1124,34 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                         ));
                     }
                     let slot = globals_template.len();
+                    local_global_slots.push(slot);
                     if imported_globals == 0 {
-                        globals_template.push(eval_const(&global.init_expr, &globals_template)?);
+                        if global.ty.content_type == ValType::V128 {
+                            globals_template.extend(eval_v128_const(
+                                &global.init_expr,
+                                &globals_template,
+                                &local_global_slots,
+                            )?);
+                        } else {
+                            globals_template.push(eval_const(
+                                &global.init_expr,
+                                &globals_template,
+                                &local_global_slots,
+                            )?);
+                        }
                     } else {
                         globals_template.push(0);
-                        dynamic_globals.push((slot, global.init_expr));
+                        if global.ty.content_type == ValType::V128 {
+                            globals_template.push(0);
+                        }
+                        dynamic_globals.push((slot, global.ty.content_type, global.init_expr));
                     }
                     globals_mutable.push(global.ty.mutable);
                     global_types.push(global.ty);
                     if imported_globals == 0
                         && global.ty.content_type == ValType::Ref(RefType::FUNCREF)
                     {
-                        reference_globals.push(globals_template.len() - 1);
+                        reference_globals.push(slot);
                     }
                 }
             }
@@ -1116,8 +1189,11 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                             if let Some(table) =
                                 table_template.as_mut().filter(|_| imported_globals == 0)
                             {
-                                let offset =
-                                    eval_const(&offset_expr, &globals_template)? as u32 as usize;
+                                let offset = eval_const(
+                                    &offset_expr,
+                                    &globals_template,
+                                    &local_global_slots,
+                                )? as u32 as usize;
                                 if let Some(end) = offset
                                     .checked_add(values.len())
                                     .filter(|&end| end <= table.len())
@@ -1154,8 +1230,11 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                             if let Some(memory) =
                                 memory_template.as_mut().filter(|_| imported_globals == 0)
                             {
-                                let offset =
-                                    eval_const(&offset_expr, &globals_template)? as u32 as usize;
+                                let offset = eval_const(
+                                    &offset_expr,
+                                    &globals_template,
+                                    &local_global_slots,
+                                )? as u32 as usize;
                                 if let Some(end) = offset
                                     .checked_add(data.data.len())
                                     .filter(|&end| end <= memory.len())
@@ -1225,6 +1304,7 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
         globals_mutable,
         global_types,
         global_bindings: Vec::new(),
+        local_global_slots,
         dynamic_globals,
         active_elements,
         active_data,
@@ -1266,11 +1346,11 @@ fn load_dependencies<'a>(
         .iter()
         .filter(|(_, _, ty)| matches!(ty, TypeRef::Global(_)))
         .count();
-    let local_globals = modules[index].global_types.len() - imported_globals;
     modules[index].global_bindings = vec![(usize::MAX, usize::MAX); imported_globals];
+    let local_slots = modules[index].local_global_slots.clone();
     modules[index]
         .global_bindings
-        .extend((0..local_globals).map(|slot| (index, slot)));
+        .extend(local_slots.into_iter().map(|slot| (index, slot)));
     if modules[index].instance.memory_template.is_some() {
         modules[index].memory_owner = Some(index);
     }
@@ -1501,7 +1581,7 @@ fn translate_with_limits(
                 referenced.push((value - 1) as usize);
             }
         }
-        for (_, expr) in &module.dynamic_globals {
+        for (_, _, expr) in &module.dynamic_globals {
             for op in expr.get_operators_reader() {
                 if let Operator::RefFunc { function_index } = op? {
                     referenced.push(module.resolved_functions[function_index as usize]);
@@ -1700,6 +1780,7 @@ fn translate_with_limits(
     let mut source = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
     source.push_str(include_str!("softfloat64.metal"));
     source.push_str(include_str!("wasm_float.metal"));
+    source.push_str(include_str!("wasm_simd.metal"));
     source.push_str("struct ModuleState { device uchar* memory; device uint* pages; device ulong* globals; device uint* table; device const uchar* passive_data; uint table_size; thread uint* element_lengths; thread uint* data_lengths; };\n");
     for (module_index, module) in modules.iter().enumerate() {
         for (element, values) in module.instance.table_info.elements.iter().enumerate() {
@@ -1797,16 +1878,37 @@ fn translate_with_limits(
         }
     }
     let mut args = Vec::new();
-    for param in 0..ty.params().len() {
+    let param_words: usize = ty.params().iter().map(|ty| value_words(*ty)).sum();
+    let result_words: usize = ty.results().iter().map(|ty| value_words(*ty)).sum();
+    let mut param_word = 0;
+    for (param, param_ty) in ty.params().iter().enumerate() {
         let offset = if fast_i32 {
             "id".into()
         } else {
-            format!("id * {}u + {param}u", ty.params().len())
+            format!("id * {param_words}u + {param_word}u")
         };
-        args.push(format!("ulong(input[{offset}])"));
+        if *param_ty == ValType::V128 {
+            args.push(format!("ulong2(input[{offset}], input[({offset}) + 1u])"));
+        } else {
+            args.push(format!("ulong(input[{offset}])"));
+        }
+        let _ = param;
+        param_word += value_words(*param_ty);
     }
-    for result in 0..ty.results().len() {
-        source.push_str(&format!("ulong result{result} = 0ul;\n"));
+    for (result, result_ty) in ty.results().iter().enumerate() {
+        source.push_str(&format!(
+            "{} result{result} = {};\n",
+            if *result_ty == ValType::V128 {
+                "ulong2"
+            } else {
+                "ulong"
+            },
+            if *result_ty == ValType::V128 {
+                "ulong2(0ul)"
+            } else {
+                "0ul"
+            }
+        ));
         args.push(format!("result{result}"));
     }
     let context = if recursive {
@@ -1816,11 +1918,15 @@ fn translate_with_limits(
     };
     for &module_index in &postorder {
         let module = &modules[module_index];
-        for (slot, expr) in &module.dynamic_globals {
+        for (slot, ty, expr) in &module.dynamic_globals {
             let value = const_source(expr, module)?;
-            source.push_str(&format!(
-                "if (trap == 0u) states[{module_index}].globals[{slot}u] = {value};\n"
-            ));
+            if *ty == ValType::V128 {
+                source.push_str(&format!("if (trap == 0u) {{ ulong2 value = {value}; states[{module_index}].globals[{slot}u] = value.x; states[{module_index}].globals[{}u] = value.y; }}\n", slot + 1));
+            } else {
+                source.push_str(&format!(
+                    "if (trap == 0u) states[{module_index}].globals[{slot}u] = {value};\n"
+                ));
+            }
         }
         if let Some(expr) = &module.table_init_expr {
             let value = const_source(expr, module)?;
@@ -1844,7 +1950,7 @@ fn translate_with_limits(
         }
     }
     if let Some(owner) = modules[0].memory_owner {
-        let argument_bytes = ty.params().len() * if fast_i32 { 4 } else { 8 };
+        let argument_bytes = param_words * if fast_i32 { 4 } else { 8 };
         source.push_str(&format!(
             "if (config[2] != 0ul && trap == 0u) {{\n    device const uchar* memory_input = reinterpret_cast<device const uchar*>(input) + count * {argument_bytes}ul + ulong(id) * config[2];\n    for (ulong j = 0ul; j < config[2]; ++j) states[{owner}].memory[config[1] + j] = memory_input[j];\n}}\n"
         ));
@@ -1854,13 +1960,19 @@ fn translate_with_limits(
     if can_trap {
         source.push_str("traps[id] = trap;\n");
     }
-    for result in 0..ty.results().len() {
+    let mut result_word = 0;
+    for (result, result_ty) in ty.results().iter().enumerate() {
         let offset = if fast_i32 {
             "id".into()
         } else {
-            format!("id * {}u + {result}u", ty.results().len())
+            format!("id * {result_words}u + {result_word}u")
         };
-        source.push_str(&format!("output[{offset}] = {input_ty}(result{result});\n"));
+        if *result_ty == ValType::V128 {
+            source.push_str(&format!("output[{offset}] = result{result}.x;\noutput[({offset}) + 1u] = result{result}.y;\n"));
+        } else {
+            source.push_str(&format!("output[{offset}] = {input_ty}(result{result});\n"));
+        }
+        result_word += value_words(*result_ty);
     }
     source.push_str("}\n");
     let memory_exports = modules[0]
@@ -1886,8 +1998,12 @@ fn translate_with_limits(
 fn is_numeric(ty: ValType) -> bool {
     matches!(
         ty,
-        ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64
+        ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64 | ValType::V128
     )
+}
+
+fn value_words(ty: ValType) -> usize {
+    if ty == ValType::V128 { 2 } else { 1 }
 }
 
 fn is_supported_value(ty: ValType) -> bool {
@@ -1901,6 +2017,14 @@ fn const_source(expr: &ConstExpr<'_>, module: &ParsedModule<'_>) -> Result<Strin
         Some(Operator::I64Const { value }) => format!("{}ul", value as u64),
         Some(Operator::F32Const { value }) => format!("{}ul", value.bits()),
         Some(Operator::F64Const { value }) => format!("{}ul", value.bits()),
+        Some(Operator::V128Const { value }) => {
+            let bytes = value.bytes();
+            format!(
+                "ulong2({}ul, {}ul)",
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[8..].try_into().unwrap())
+            )
+        }
         Some(Operator::RefNull { .. }) => "0ul".into(),
         Some(Operator::RefFunc { function_index }) => {
             format!(
@@ -1915,7 +2039,14 @@ fn const_source(expr: &ConstExpr<'_>, module: &ParsedModule<'_>) -> Result<Strin
                 .ok_or_else(|| {
                     Error::Unsupported("constant global index is out of range".into())
                 })?;
-            format!("states[{owner}].globals[{slot}u]")
+            if module.global_types[global_index as usize].content_type == ValType::V128 {
+                format!(
+                    "ulong2(states[{owner}].globals[{slot}u], states[{owner}].globals[{}u])",
+                    slot + 1
+                )
+            } else {
+                format!("states[{owner}].globals[{slot}u]")
+            }
         }
         _ => return Err(Error::Unsupported("unsupported scalar initializer".into())),
     };
@@ -1925,7 +2056,7 @@ fn const_source(expr: &ConstExpr<'_>, module: &ParsedModule<'_>) -> Result<Strin
     Ok(source)
 }
 
-fn eval_const(expr: &ConstExpr<'_>, globals: &[u64]) -> Result<u64, Error> {
+fn eval_const(expr: &ConstExpr<'_>, globals: &[u64], slots: &[usize]) -> Result<u64, Error> {
     let mut operators = expr.get_operators_reader().into_iter();
     let value = match operators.next().transpose()? {
         Some(Operator::I32Const { value }) => value as u32 as u64,
@@ -1941,12 +2072,49 @@ fn eval_const(expr: &ConstExpr<'_>, globals: &[u64]) -> Result<u64, Error> {
         }) => 0,
         Some(Operator::RefFunc { function_index }) => u64::from(function_index) + 1,
         Some(Operator::GlobalGet { global_index }) => *globals
-            .get(global_index as usize)
+            .get(*slots.get(global_index as usize).ok_or_else(|| {
+                Error::Unsupported("constant global index is out of range".into())
+            })?)
             .ok_or_else(|| Error::Unsupported("constant global index is out of range".into()))?,
         _ => return Err(Error::Unsupported("unsupported scalar initializer".into())),
     };
     if !matches!(operators.next().transpose()?, Some(Operator::End)) || operators.next().is_some() {
         return Err(Error::Unsupported("unsupported scalar initializer".into()));
+    }
+    Ok(value)
+}
+
+fn eval_v128_const(
+    expr: &ConstExpr<'_>,
+    globals: &[u64],
+    slots: &[usize],
+) -> Result<[u64; 2], Error> {
+    let mut operators = expr.get_operators_reader().into_iter();
+    let value = match operators.next().transpose()? {
+        Some(Operator::V128Const { value }) => {
+            let bytes = value.bytes();
+            [
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            ]
+        }
+        Some(Operator::GlobalGet { global_index }) => {
+            let slot = *slots.get(global_index as usize).ok_or_else(|| {
+                Error::Unsupported("constant global index is out of range".into())
+            })?;
+            [
+                *globals.get(slot).ok_or_else(|| {
+                    Error::Unsupported("constant global index is out of range".into())
+                })?,
+                *globals.get(slot + 1).ok_or_else(|| {
+                    Error::Unsupported("constant global index is out of range".into())
+                })?,
+            ]
+        }
+        _ => return Err(Error::Unsupported("unsupported v128 initializer".into())),
+    };
+    if !matches!(operators.next().transpose()?, Some(Operator::End)) || operators.next().is_some() {
+        return Err(Error::Unsupported("unsupported v128 initializer".into()));
     }
     Ok(value)
 }
@@ -2095,14 +2263,27 @@ fn function_signature(index: usize, ty: &FuncType, recursive: bool) -> Result<St
         .params()
         .iter()
         .enumerate()
-        .map(|(index, _)| format!("ulong a{index}"))
+        .map(|(index, ty)| {
+            format!(
+                "{} a{index}",
+                if *ty == ValType::V128 {
+                    "ulong2"
+                } else {
+                    "ulong"
+                }
+            )
+        })
         .collect();
-    args.extend(
-        ty.results()
-            .iter()
-            .enumerate()
-            .map(|(index, _)| format!("thread ulong& r{index}")),
-    );
+    args.extend(ty.results().iter().enumerate().map(|(index, ty)| {
+        format!(
+            "thread {}& r{index}",
+            if *ty == ValType::V128 {
+                "ulong2"
+            } else {
+                "ulong"
+            }
+        )
+    }));
     args.push("thread ModuleState* states".into());
     args.push("thread uint& trap".into());
     if recursive {
@@ -2177,8 +2358,20 @@ fn translate_body(
             source.push_str(&format!("{ty} {field} = states[{owner}].{field};\n"));
         }
     }
-    for index in 0..ty.params().len() {
-        source.push_str(&format!("ulong l{index} = a{index};\n"));
+    let mut vector_names = HashSet::new();
+    let mut local_types = ty.params().to_vec();
+    for (index, ty) in ty.params().iter().enumerate() {
+        if *ty == ValType::V128 {
+            vector_names.insert(format!("l{index}"));
+        }
+        source.push_str(&format!(
+            "{} l{index} = a{index};\n",
+            if *ty == ValType::V128 {
+                "ulong2"
+            } else {
+                "ulong"
+            }
+        ));
     }
     let mut local_count = ty.params().len();
     for local in body.get_locals_reader()? {
@@ -2192,8 +2385,24 @@ fn translate_body(
             .checked_add(count as usize)
             .ok_or_else(|| Error::Unsupported("too many locals".into()))?;
         for index in local_count..end {
-            source.push_str(&format!("ulong l{index} = 0ul;\n"));
+            if ty == ValType::V128 {
+                vector_names.insert(format!("l{index}"));
+            }
+            source.push_str(&format!(
+                "{} l{index} = {};\n",
+                if ty == ValType::V128 {
+                    "ulong2"
+                } else {
+                    "ulong"
+                },
+                if ty == ValType::V128 {
+                    "ulong2(0ul)"
+                } else {
+                    "0ul"
+                }
+            ));
         }
+        local_types.extend(std::iter::repeat_n(ty, count as usize));
         local_count = end;
     }
 
@@ -2211,6 +2420,8 @@ fn translate_body(
         global_types,
         declarations: String::new(),
         local_count,
+        local_types,
+        vector_names,
         next_value: 0,
         next_frame: 1,
         types,
@@ -2218,6 +2429,7 @@ fn translate_body(
         memory_bytes,
         memory_capacity,
         globals_mutable,
+        global_value_types: &module.global_types,
         global_bindings: &module.global_bindings,
         table_len: table_values.map(<[u32]>::len),
         table_values,
@@ -2235,6 +2447,11 @@ fn translate_body(
             loop_label: false,
         }],
     };
+    for (index, ty) in ty.results().iter().enumerate() {
+        if *ty == ValType::V128 {
+            compiler.vector_names.insert(format!("r{index}"));
+        }
+    }
     let mut stack = Vec::new();
     let reachable = compiler.emit_instructions(&instructions, &mut stack)?;
     let results = compiler.frames[0].results.clone();
@@ -2315,6 +2532,8 @@ struct Compiler<'a> {
     source: String,
     declarations: String,
     local_count: usize,
+    local_types: Vec<ValType>,
+    vector_names: HashSet<String>,
     next_value: usize,
     next_frame: usize,
     types: &'a [FuncType],
@@ -2322,6 +2541,7 @@ struct Compiler<'a> {
     memory_bytes: Option<usize>,
     memory_capacity: Option<usize>,
     globals_mutable: &'a [bool],
+    global_value_types: &'a [GlobalType],
     global_bindings: &'a [(usize, usize)],
     table_len: Option<usize>,
     table_values: Option<&'a [u32]>,
@@ -2351,6 +2571,29 @@ impl Compiler<'_> {
         self.declarations
             .push_str(&format!("ulong {name} = 0ul;\n"));
         name
+    }
+
+    fn fresh_vector(&mut self) -> String {
+        let name = format!("v{}", self.next_value);
+        self.next_value += 1;
+        self.declarations
+            .push_str(&format!("ulong2 {name} = ulong2(0ul);\n"));
+        self.vector_names.insert(name.clone());
+        name
+    }
+
+    fn fresh_typed(&mut self, ty: ValType) -> String {
+        if ty == ValType::V128 {
+            self.fresh_vector()
+        } else {
+            self.fresh_value()
+        }
+    }
+
+    fn emit_vector(&mut self, stack: &mut Vec<String>, expression: String) {
+        let name = self.fresh_vector();
+        self.source.push_str(&format!("{name} = {expression};\n"));
+        stack.push(name);
     }
 
     fn emit_value(&mut self, stack: &mut Vec<String>, expression: String) {
@@ -2433,8 +2676,8 @@ impl Compiler<'_> {
 
     fn new_frame(&mut self, blockty: BlockType, loop_label: bool) -> Result<Frame, Error> {
         let (params, results) = match blockty {
-            BlockType::Empty => (0, 0),
-            BlockType::Type(ty) if is_supported_value(ty) => (0, 1),
+            BlockType::Empty => (Vec::new(), Vec::new()),
+            BlockType::Type(ty) if is_supported_value(ty) => (Vec::new(), vec![ty]),
             BlockType::FuncType(index) => {
                 let ty = self
                     .types
@@ -2450,7 +2693,7 @@ impl Compiler<'_> {
                         "only numeric and funcref block signatures are supported".into(),
                     ));
                 }
-                (ty.params().len(), ty.results().len())
+                (ty.params().to_vec(), ty.results().to_vec())
             }
             _ => {
                 return Err(Error::Unsupported(
@@ -2461,8 +2704,8 @@ impl Compiler<'_> {
         self.next_frame += 1;
         Ok(Frame {
             id: self.next_frame,
-            params: (0..params).map(|_| self.fresh_value()).collect(),
-            results: (0..results).map(|_| self.fresh_value()).collect(),
+            params: params.into_iter().map(|ty| self.fresh_typed(ty)).collect(),
+            results: results.into_iter().map(|ty| self.fresh_typed(ty)).collect(),
             loop_label,
         })
     }
@@ -2473,7 +2716,11 @@ impl Compiler<'_> {
             let snapshots: Vec<_> = values
                 .iter()
                 .map(|value| {
-                    let name = self.fresh_value();
+                    let name = if self.vector_names.contains(value) {
+                        self.fresh_vector()
+                    } else {
+                        self.fresh_value()
+                    };
                     self.source.push_str(&format!("{name} = {value};\n"));
                     name
                 })
@@ -2708,6 +2955,17 @@ impl Compiler<'_> {
             Operator::I64Const { value } => stack.push(format!("{}ul", *value as u64)),
             Operator::F32Const { value } => stack.push(format!("{}ul", value.bits())),
             Operator::F64Const { value } => stack.push(format!("{}ul", value.bits())),
+            Operator::V128Const { value } => {
+                let bytes = value.bytes();
+                self.emit_vector(
+                    stack,
+                    format!(
+                        "ulong2({}ul, {}ul)",
+                        u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                        u64::from_le_bytes(bytes[8..].try_into().unwrap())
+                    ),
+                );
+            }
             Operator::RefNull {
                 hty:
                     wasmparser::HeapType::Abstract {
@@ -2806,7 +3064,11 @@ impl Compiler<'_> {
                     return Err(Error::Unsupported("global index is out of range".into()));
                 }
                 let (owner, slot) = self.global_bindings[index];
-                self.emit_value(stack, format!("states[{owner}].globals[{slot}u]"));
+                if self.global_value_types[index].content_type == ValType::V128 {
+                    self.emit_vector(stack, format!("ulong2(states[{owner}].globals[{slot}u], states[{owner}].globals[{}u])", slot + 1));
+                } else {
+                    self.emit_value(stack, format!("states[{owner}].globals[{slot}u]"));
+                }
             }
             Operator::GlobalSet { global_index } => {
                 let index = *global_index as usize;
@@ -2815,8 +3077,12 @@ impl Compiler<'_> {
                 }
                 let value = pop(stack)?;
                 let (owner, slot) = self.global_bindings[index];
-                self.source
-                    .push_str(&format!("states[{owner}].globals[{slot}u] = {value};\n"));
+                if self.global_value_types[index].content_type == ValType::V128 {
+                    self.source.push_str(&format!("states[{owner}].globals[{slot}u] = {value}.x;\nstates[{owner}].globals[{}u] = {value}.y;\n", slot + 1));
+                } else {
+                    self.source
+                        .push_str(&format!("states[{owner}].globals[{slot}u] = {value};\n"));
+                }
             }
             Operator::I32Load { memarg } | Operator::F32Load { memarg } => {
                 self.emit_load(stack, memarg, 4, false, 32)?
@@ -2834,6 +3100,97 @@ impl Compiler<'_> {
             Operator::I64Load16S { memarg } => self.emit_load(stack, memarg, 2, true, 64)?,
             Operator::I64Load32U { memarg } => self.emit_load(stack, memarg, 4, false, 64)?,
             Operator::I64Load32S { memarg } => self.emit_load(stack, memarg, 4, true, 64)?,
+            Operator::V128Load { memarg } => {
+                let address = pop(stack)?;
+                let index = self.memory_address(&address, memarg, 16)?;
+                self.emit_vector(stack, format!("wasm_simd_load(memory, {index})"));
+            }
+            Operator::V128Load8x8S { memarg }
+            | Operator::V128Load8x8U { memarg }
+            | Operator::V128Load16x4S { memarg }
+            | Operator::V128Load16x4U { memarg }
+            | Operator::V128Load32x2S { memarg }
+            | Operator::V128Load32x2U { memarg } => {
+                let source_bits = match operator {
+                    Operator::V128Load8x8S { .. } | Operator::V128Load8x8U { .. } => 8,
+                    Operator::V128Load16x4S { .. } | Operator::V128Load16x4U { .. } => 16,
+                    _ => 32,
+                };
+                let signed = matches!(
+                    operator,
+                    Operator::V128Load8x8S { .. }
+                        | Operator::V128Load16x4S { .. }
+                        | Operator::V128Load32x2S { .. }
+                );
+                let address = pop(stack)?;
+                let index = self.memory_address(&address, memarg, 8)?;
+                self.emit_vector(
+                    stack,
+                    format!("wasm_simd_load_extend(memory, {index}, {source_bits}u, {signed})"),
+                );
+            }
+            Operator::V128Load8Splat { memarg }
+            | Operator::V128Load16Splat { memarg }
+            | Operator::V128Load32Splat { memarg }
+            | Operator::V128Load64Splat { memarg }
+            | Operator::V128Load32Zero { memarg }
+            | Operator::V128Load64Zero { memarg } => {
+                let bits = match operator {
+                    Operator::V128Load8Splat { .. } => 8,
+                    Operator::V128Load16Splat { .. } => 16,
+                    Operator::V128Load32Splat { .. } | Operator::V128Load32Zero { .. } => 32,
+                    _ => 64,
+                };
+                let address = pop(stack)?;
+                let index = self.memory_address(&address, memarg, bits / 8)?;
+                let part = format!("wasm_simd_read(memory, {index}, {}u)", bits / 8);
+                let expression = if matches!(
+                    operator,
+                    Operator::V128Load32Zero { .. } | Operator::V128Load64Zero { .. }
+                ) {
+                    format!("ulong2({part}, 0ul)")
+                } else {
+                    format!("wasm_simd_splat({part}, {bits}u)")
+                };
+                self.emit_vector(stack, expression);
+            }
+            Operator::V128Store { memarg } => {
+                let value = pop(stack)?;
+                let address = pop(stack)?;
+                let index = self.memory_address(&address, memarg, 16)?;
+                self.source
+                    .push_str(&format!("wasm_simd_store(memory, {index}, {value});\n"));
+            }
+            Operator::V128Load8Lane { memarg, lane }
+            | Operator::V128Load16Lane { memarg, lane }
+            | Operator::V128Load32Lane { memarg, lane }
+            | Operator::V128Load64Lane { memarg, lane } => {
+                let bits = match operator {
+                    Operator::V128Load8Lane { .. } => 8,
+                    Operator::V128Load16Lane { .. } => 16,
+                    Operator::V128Load32Lane { .. } => 32,
+                    _ => 64,
+                };
+                let value = pop(stack)?;
+                let address = pop(stack)?;
+                let index = self.memory_address(&address, memarg, bits / 8)?;
+                self.emit_vector(stack, format!("wasm_simd_replace({value}, {bits}u, {lane}u, wasm_simd_read(memory, {index}, {}u))", bits / 8));
+            }
+            Operator::V128Store8Lane { memarg, lane }
+            | Operator::V128Store16Lane { memarg, lane }
+            | Operator::V128Store32Lane { memarg, lane }
+            | Operator::V128Store64Lane { memarg, lane } => {
+                let bits = match operator {
+                    Operator::V128Store8Lane { .. } => 8,
+                    Operator::V128Store16Lane { .. } => 16,
+                    Operator::V128Store32Lane { .. } => 32,
+                    _ => 64,
+                };
+                let value = pop(stack)?;
+                let address = pop(stack)?;
+                let index = self.memory_address(&address, memarg, bits / 8)?;
+                self.source.push_str(&format!("wasm_simd_write(memory, {index}, {}u, wasm_simd_lane({value}, {bits}u, {lane}u));\n", bits / 8));
+            }
             Operator::I32Store { memarg }
             | Operator::F32Store { memarg }
             | Operator::I64Store32 { memarg } => self.emit_store(stack, memarg, 4)?,
@@ -2933,8 +3290,10 @@ impl Compiler<'_> {
                     return Err(Error::Unsupported("call argument is missing".into()));
                 }
                 let args = stack.split_off(stack.len() - ty.params().len());
-                let results: Vec<_> = (0..ty.results().len())
-                    .map(|_| self.fresh_value())
+                let result_types = ty.results().to_vec();
+                let results: Vec<_> = result_types
+                    .into_iter()
+                    .map(|ty| self.fresh_typed(ty))
                     .collect();
                 let mut call_args = args;
                 call_args.extend(results.iter().cloned());
@@ -2977,8 +3336,10 @@ impl Compiler<'_> {
                     ));
                 }
                 let args = stack.split_off(stack.len() - ty.params().len());
-                let results: Vec<_> = (0..ty.results().len())
-                    .map(|_| self.fresh_value())
+                let result_types = ty.results().to_vec();
+                let results: Vec<_> = result_types
+                    .into_iter()
+                    .map(|ty| self.fresh_typed(ty))
                     .collect();
                 let table_len = if self.table_info.mutable {
                     "table_size".into()
@@ -3032,7 +3393,11 @@ impl Compiler<'_> {
             }
             Operator::LocalGet { local_index } => {
                 check_local(*local_index, self.local_count)?;
-                self.emit_value(stack, format!("l{local_index}"));
+                if self.local_types[*local_index as usize] == ValType::V128 {
+                    self.emit_vector(stack, format!("l{local_index}"));
+                } else {
+                    self.emit_value(stack, format!("l{local_index}"));
+                }
             }
             Operator::LocalSet { local_index } | Operator::LocalTee { local_index } => {
                 check_local(*local_index, self.local_count)?;
@@ -3105,12 +3470,18 @@ impl Compiler<'_> {
                     | ValType::I64
                     | ValType::F32
                     | ValType::F64
+                    | ValType::V128
                     | ValType::Ref(RefType::FUNCREF),
             } => {
                 let condition = pop(stack)?;
                 let rhs = pop(stack)?;
                 let lhs = pop(stack)?;
-                self.emit_value(stack, format!("({condition} != 0u ? {lhs} : {rhs})"));
+                let expression = format!("({condition} != 0u ? {lhs} : {rhs})");
+                if self.vector_names.contains(&lhs) {
+                    self.emit_vector(stack, expression);
+                } else {
+                    self.emit_value(stack, expression);
+                }
             }
             Operator::I32Add
             | Operator::I32Sub
@@ -3519,10 +3890,625 @@ impl Compiler<'_> {
                     self.source.push_str("if (trap != 0u) return;\n");
                 }
             }
-            _ => return Err(Error::Unsupported(format!("instruction {operator:?}"))),
+            _ => {
+                if !self.emit_simd_operator(operator, stack)? {
+                    return Err(Error::Unsupported(format!("instruction {operator:?}")));
+                }
+            }
         }
         Ok(())
     }
+
+    fn emit_simd_operator(
+        &mut self,
+        operator: &Operator<'_>,
+        stack: &mut Vec<String>,
+    ) -> Result<bool, Error> {
+        if let Some((bits, op)) = simd_binary_op(operator) {
+            let rhs = pop(stack)?;
+            let lhs = pop(stack)?;
+            let expression = if bits == 32 && op <= 2 {
+                let symbol = ["+", "-", "*"][op as usize];
+                format!("as_type<ulong2>(as_type<uint4>({lhs}) {symbol} as_type<uint4>({rhs}))")
+            } else {
+                format!("wasm_simd_binary({lhs}, {rhs}, {bits}u, {op}u)")
+            };
+            self.emit_vector(stack, expression);
+            return Ok(true);
+        }
+        if let Some((bits, op)) = simd_shift_op(operator) {
+            let amount = pop(stack)?;
+            let vector = pop(stack)?;
+            self.emit_vector(
+                stack,
+                format!("wasm_simd_shift({vector}, {amount}, {bits}u, {op}u)"),
+            );
+            return Ok(true);
+        }
+        if let Some((bits, op)) = simd_unary_op(operator) {
+            let value = pop(stack)?;
+            self.emit_vector(stack, format!("wasm_simd_unary({value}, {bits}u, {op}u)"));
+            return Ok(true);
+        }
+        if let Some((bits, op)) = simd_float_unary_op(operator) {
+            let value = pop(stack)?;
+            self.emit_vector(
+                stack,
+                format!("wasm_simd_float_unary({value}, {bits}u, {op}u)"),
+            );
+            return Ok(true);
+        }
+        if let Some((bits, op)) = simd_float_binary_op(operator) {
+            let rhs = pop(stack)?;
+            let lhs = pop(stack)?;
+            self.emit_vector(
+                stack,
+                format!("wasm_simd_float_binary({lhs}, {rhs}, {bits}u, {op}u)"),
+            );
+            return Ok(true);
+        }
+        if let Some(op) = simd_convert_op(operator) {
+            let value = pop(stack)?;
+            self.emit_vector(stack, format!("wasm_simd_convert({value}, {op}u)"));
+            return Ok(true);
+        }
+        match operator {
+            Operator::I8x16RelaxedSwizzle => {
+                let indices = pop(stack)?;
+                let value = pop(stack)?;
+                self.emit_vector(stack, format!("wasm_simd_swizzle({value}, {indices})"));
+            }
+            Operator::I8x16RelaxedLaneselect
+            | Operator::I16x8RelaxedLaneselect
+            | Operator::I32x4RelaxedLaneselect
+            | Operator::I64x2RelaxedLaneselect => {
+                let mask = pop(stack)?;
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                self.emit_vector(stack, format!("({lhs} & {mask}) | ({rhs} & ~{mask})"));
+            }
+            Operator::F32x4RelaxedMadd
+            | Operator::F32x4RelaxedNmadd
+            | Operator::F64x2RelaxedMadd
+            | Operator::F64x2RelaxedNmadd => {
+                let c = pop(stack)?;
+                let b = pop(stack)?;
+                let a = pop(stack)?;
+                let bits = if matches!(
+                    operator,
+                    Operator::F32x4RelaxedMadd | Operator::F32x4RelaxedNmadd
+                ) {
+                    32
+                } else {
+                    64
+                };
+                let negate = matches!(
+                    operator,
+                    Operator::F32x4RelaxedNmadd | Operator::F64x2RelaxedNmadd
+                );
+                self.emit_vector(
+                    stack,
+                    format!("wasm_simd_relaxed_madd({a}, {b}, {c}, {bits}u, {negate})"),
+                );
+            }
+            Operator::I16x8RelaxedQ15mulrS => {
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                self.emit_vector(stack, format!("wasm_simd_q15mulr({lhs}, {rhs})"));
+            }
+            Operator::I16x8RelaxedDotI8x16I7x16S => {
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                self.emit_vector(stack, format!("wasm_simd_relaxed_dot16({lhs}, {rhs})"));
+            }
+            Operator::I32x4RelaxedDotI8x16I7x16AddS => {
+                let c = pop(stack)?;
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                self.emit_vector(
+                    stack,
+                    format!("wasm_simd_relaxed_dot_add({lhs}, {rhs}, {c})"),
+                );
+            }
+            Operator::V128Not => {
+                let value = pop(stack)?;
+                self.emit_vector(stack, format!("~{value}"));
+            }
+            Operator::V128And | Operator::V128AndNot | Operator::V128Or | Operator::V128Xor => {
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                let expression = match operator {
+                    Operator::V128And => format!("{lhs} & {rhs}"),
+                    Operator::V128AndNot => format!("{lhs} & ~{rhs}"),
+                    Operator::V128Or => format!("{lhs} | {rhs}"),
+                    _ => format!("{lhs} ^ {rhs}"),
+                };
+                self.emit_vector(stack, expression);
+            }
+            Operator::V128Bitselect => {
+                let mask = pop(stack)?;
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                self.emit_vector(stack, format!("({lhs} & {mask}) | ({rhs} & ~{mask})"));
+            }
+            Operator::V128AnyTrue => {
+                let value = pop(stack)?;
+                self.emit_value(
+                    stack,
+                    format!("ulong({value}.x != 0ul || {value}.y != 0ul)"),
+                );
+            }
+            Operator::I8x16AllTrue
+            | Operator::I16x8AllTrue
+            | Operator::I32x4AllTrue
+            | Operator::I64x2AllTrue => {
+                let value = pop(stack)?;
+                let bits = match operator {
+                    Operator::I8x16AllTrue => 8,
+                    Operator::I16x8AllTrue => 16,
+                    Operator::I32x4AllTrue => 32,
+                    _ => 64,
+                };
+                self.emit_value(stack, format!("wasm_simd_all_true({value}, {bits}u)"));
+            }
+            Operator::I8x16Bitmask
+            | Operator::I16x8Bitmask
+            | Operator::I32x4Bitmask
+            | Operator::I64x2Bitmask => {
+                let value = pop(stack)?;
+                let bits = match operator {
+                    Operator::I8x16Bitmask => 8,
+                    Operator::I16x8Bitmask => 16,
+                    Operator::I32x4Bitmask => 32,
+                    _ => 64,
+                };
+                self.emit_value(stack, format!("wasm_simd_bitmask({value}, {bits}u)"));
+            }
+            Operator::I8x16Popcnt => {
+                let value = pop(stack)?;
+                self.emit_vector(stack, format!("wasm_simd_popcnt({value})"));
+            }
+            Operator::I8x16Swizzle => {
+                let indices = pop(stack)?;
+                let value = pop(stack)?;
+                self.emit_vector(stack, format!("wasm_simd_swizzle({value}, {indices})"));
+            }
+            Operator::I8x16Shuffle { lanes } => {
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                let result = self.fresh_vector();
+                self.source.push_str(&format!("{result} = ulong2(0ul);\n"));
+                for (index, lane) in lanes.iter().enumerate() {
+                    let (value, lane) = if *lane < 16 {
+                        (&lhs, *lane)
+                    } else {
+                        (&rhs, *lane - 16)
+                    };
+                    self.source.push_str(&format!("{result} = wasm_simd_replace({result}, 8u, {index}u, wasm_simd_lane({value}, 8u, {lane}u));\n"));
+                }
+                stack.push(result);
+            }
+            Operator::I8x16NarrowI16x8S
+            | Operator::I8x16NarrowI16x8U
+            | Operator::I16x8NarrowI32x4S
+            | Operator::I16x8NarrowI32x4U => {
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                let bits = if matches!(
+                    operator,
+                    Operator::I8x16NarrowI16x8S | Operator::I8x16NarrowI16x8U
+                ) {
+                    16
+                } else {
+                    32
+                };
+                let signed = matches!(
+                    operator,
+                    Operator::I8x16NarrowI16x8S | Operator::I16x8NarrowI32x4S
+                );
+                self.emit_vector(
+                    stack,
+                    format!("wasm_simd_narrow({lhs}, {rhs}, {bits}u, {signed})"),
+                );
+            }
+            Operator::I16x8ExtAddPairwiseI8x16S
+            | Operator::I16x8ExtAddPairwiseI8x16U
+            | Operator::I32x4ExtAddPairwiseI16x8S
+            | Operator::I32x4ExtAddPairwiseI16x8U => {
+                let value = pop(stack)?;
+                let bits = if matches!(
+                    operator,
+                    Operator::I16x8ExtAddPairwiseI8x16S | Operator::I16x8ExtAddPairwiseI8x16U
+                ) {
+                    8
+                } else {
+                    16
+                };
+                let signed = matches!(
+                    operator,
+                    Operator::I16x8ExtAddPairwiseI8x16S | Operator::I32x4ExtAddPairwiseI16x8S
+                );
+                self.emit_vector(
+                    stack,
+                    format!("wasm_simd_pairwise({value}, {bits}u, {signed})"),
+                );
+            }
+            Operator::I16x8ExtendLowI8x16S
+            | Operator::I16x8ExtendHighI8x16S
+            | Operator::I16x8ExtendLowI8x16U
+            | Operator::I16x8ExtendHighI8x16U
+            | Operator::I32x4ExtendLowI16x8S
+            | Operator::I32x4ExtendHighI16x8S
+            | Operator::I32x4ExtendLowI16x8U
+            | Operator::I32x4ExtendHighI16x8U
+            | Operator::I64x2ExtendLowI32x4S
+            | Operator::I64x2ExtendHighI32x4S
+            | Operator::I64x2ExtendLowI32x4U
+            | Operator::I64x2ExtendHighI32x4U => {
+                let value = pop(stack)?;
+                let bits = if matches!(
+                    operator,
+                    Operator::I16x8ExtendLowI8x16S
+                        | Operator::I16x8ExtendHighI8x16S
+                        | Operator::I16x8ExtendLowI8x16U
+                        | Operator::I16x8ExtendHighI8x16U
+                ) {
+                    8
+                } else if matches!(
+                    operator,
+                    Operator::I32x4ExtendLowI16x8S
+                        | Operator::I32x4ExtendHighI16x8S
+                        | Operator::I32x4ExtendLowI16x8U
+                        | Operator::I32x4ExtendHighI16x8U
+                ) {
+                    16
+                } else {
+                    32
+                };
+                let high = matches!(
+                    operator,
+                    Operator::I16x8ExtendHighI8x16S
+                        | Operator::I16x8ExtendHighI8x16U
+                        | Operator::I32x4ExtendHighI16x8S
+                        | Operator::I32x4ExtendHighI16x8U
+                        | Operator::I64x2ExtendHighI32x4S
+                        | Operator::I64x2ExtendHighI32x4U
+                );
+                let signed = matches!(
+                    operator,
+                    Operator::I16x8ExtendLowI8x16S
+                        | Operator::I16x8ExtendHighI8x16S
+                        | Operator::I32x4ExtendLowI16x8S
+                        | Operator::I32x4ExtendHighI16x8S
+                        | Operator::I64x2ExtendLowI32x4S
+                        | Operator::I64x2ExtendHighI32x4S
+                );
+                self.emit_vector(
+                    stack,
+                    format!("wasm_simd_extend({value}, {bits}u, {high}, {signed})"),
+                );
+            }
+            Operator::I16x8ExtMulLowI8x16S
+            | Operator::I16x8ExtMulHighI8x16S
+            | Operator::I16x8ExtMulLowI8x16U
+            | Operator::I16x8ExtMulHighI8x16U
+            | Operator::I32x4ExtMulLowI16x8S
+            | Operator::I32x4ExtMulHighI16x8S
+            | Operator::I32x4ExtMulLowI16x8U
+            | Operator::I32x4ExtMulHighI16x8U
+            | Operator::I64x2ExtMulLowI32x4S
+            | Operator::I64x2ExtMulHighI32x4S
+            | Operator::I64x2ExtMulLowI32x4U
+            | Operator::I64x2ExtMulHighI32x4U => {
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                let bits = if matches!(
+                    operator,
+                    Operator::I16x8ExtMulLowI8x16S
+                        | Operator::I16x8ExtMulHighI8x16S
+                        | Operator::I16x8ExtMulLowI8x16U
+                        | Operator::I16x8ExtMulHighI8x16U
+                ) {
+                    8
+                } else if matches!(
+                    operator,
+                    Operator::I32x4ExtMulLowI16x8S
+                        | Operator::I32x4ExtMulHighI16x8S
+                        | Operator::I32x4ExtMulLowI16x8U
+                        | Operator::I32x4ExtMulHighI16x8U
+                ) {
+                    16
+                } else {
+                    32
+                };
+                let high = matches!(
+                    operator,
+                    Operator::I16x8ExtMulHighI8x16S
+                        | Operator::I16x8ExtMulHighI8x16U
+                        | Operator::I32x4ExtMulHighI16x8S
+                        | Operator::I32x4ExtMulHighI16x8U
+                        | Operator::I64x2ExtMulHighI32x4S
+                        | Operator::I64x2ExtMulHighI32x4U
+                );
+                let signed = matches!(
+                    operator,
+                    Operator::I16x8ExtMulLowI8x16S
+                        | Operator::I16x8ExtMulHighI8x16S
+                        | Operator::I32x4ExtMulLowI16x8S
+                        | Operator::I32x4ExtMulHighI16x8S
+                        | Operator::I64x2ExtMulLowI32x4S
+                        | Operator::I64x2ExtMulHighI32x4S
+                );
+                self.emit_vector(
+                    stack,
+                    format!("wasm_simd_extmul({lhs}, {rhs}, {bits}u, {high}, {signed})"),
+                );
+            }
+            Operator::I32x4DotI16x8S => {
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                self.emit_vector(stack, format!("wasm_simd_dot({lhs}, {rhs})"));
+            }
+            Operator::I16x8Q15MulrSatS => {
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                self.emit_vector(stack, format!("wasm_simd_q15mulr({lhs}, {rhs})"));
+            }
+            Operator::I8x16Splat
+            | Operator::I16x8Splat
+            | Operator::I32x4Splat
+            | Operator::I64x2Splat
+            | Operator::F32x4Splat
+            | Operator::F64x2Splat => {
+                let value = pop(stack)?;
+                let bits = match operator {
+                    Operator::I8x16Splat => 8,
+                    Operator::I16x8Splat => 16,
+                    Operator::I32x4Splat | Operator::F32x4Splat => 32,
+                    _ => 64,
+                };
+                self.emit_vector(stack, format!("wasm_simd_splat({value}, {bits}u)"));
+            }
+            Operator::I8x16ExtractLaneS { lane }
+            | Operator::I8x16ExtractLaneU { lane }
+            | Operator::I16x8ExtractLaneS { lane }
+            | Operator::I16x8ExtractLaneU { lane }
+            | Operator::I32x4ExtractLane { lane }
+            | Operator::I64x2ExtractLane { lane }
+            | Operator::F32x4ExtractLane { lane }
+            | Operator::F64x2ExtractLane { lane } => {
+                let value = pop(stack)?;
+                let bits = match operator {
+                    Operator::I8x16ExtractLaneS { .. } | Operator::I8x16ExtractLaneU { .. } => 8,
+                    Operator::I16x8ExtractLaneS { .. } | Operator::I16x8ExtractLaneU { .. } => 16,
+                    Operator::I32x4ExtractLane { .. } | Operator::F32x4ExtractLane { .. } => 32,
+                    _ => 64,
+                };
+                let lane_value = format!("wasm_simd_lane({value}, {bits}u, {lane}u)");
+                let expression = if matches!(
+                    operator,
+                    Operator::I8x16ExtractLaneS { .. } | Operator::I16x8ExtractLaneS { .. }
+                ) {
+                    format!("ulong(uint(wasm_simd_signed({lane_value}, {bits}u)))")
+                } else {
+                    lane_value
+                };
+                self.emit_value(stack, expression);
+            }
+            Operator::I8x16ReplaceLane { lane }
+            | Operator::I16x8ReplaceLane { lane }
+            | Operator::I32x4ReplaceLane { lane }
+            | Operator::I64x2ReplaceLane { lane }
+            | Operator::F32x4ReplaceLane { lane }
+            | Operator::F64x2ReplaceLane { lane } => {
+                let part = pop(stack)?;
+                let value = pop(stack)?;
+                let bits = match operator {
+                    Operator::I8x16ReplaceLane { .. } => 8,
+                    Operator::I16x8ReplaceLane { .. } => 16,
+                    Operator::I32x4ReplaceLane { .. } | Operator::F32x4ReplaceLane { .. } => 32,
+                    _ => 64,
+                };
+                self.emit_vector(
+                    stack,
+                    format!("wasm_simd_replace({value}, {bits}u, {lane}u, {part})"),
+                );
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+fn simd_binary_op(operator: &Operator<'_>) -> Option<(u32, u32)> {
+    use Operator::*;
+    Some(match operator {
+        I8x16Add => (8, 0),
+        I8x16Sub => (8, 1),
+        I8x16Eq => (8, 3),
+        I8x16Ne => (8, 4),
+        I8x16LtS => (8, 5),
+        I8x16LtU => (8, 6),
+        I8x16GtS => (8, 7),
+        I8x16GtU => (8, 8),
+        I8x16LeS => (8, 9),
+        I8x16LeU => (8, 10),
+        I8x16GeS => (8, 11),
+        I8x16GeU => (8, 12),
+        I8x16MinS => (8, 13),
+        I8x16MinU => (8, 14),
+        I8x16MaxS => (8, 15),
+        I8x16MaxU => (8, 16),
+        I8x16AvgrU => (8, 17),
+        I8x16AddSatS => (8, 18),
+        I8x16AddSatU => (8, 19),
+        I8x16SubSatS => (8, 20),
+        I8x16SubSatU => (8, 21),
+        I16x8Add => (16, 0),
+        I16x8Sub => (16, 1),
+        I16x8Mul => (16, 2),
+        I16x8Eq => (16, 3),
+        I16x8Ne => (16, 4),
+        I16x8LtS => (16, 5),
+        I16x8LtU => (16, 6),
+        I16x8GtS => (16, 7),
+        I16x8GtU => (16, 8),
+        I16x8LeS => (16, 9),
+        I16x8LeU => (16, 10),
+        I16x8GeS => (16, 11),
+        I16x8GeU => (16, 12),
+        I16x8MinS => (16, 13),
+        I16x8MinU => (16, 14),
+        I16x8MaxS => (16, 15),
+        I16x8MaxU => (16, 16),
+        I16x8AvgrU => (16, 17),
+        I16x8AddSatS => (16, 18),
+        I16x8AddSatU => (16, 19),
+        I16x8SubSatS => (16, 20),
+        I16x8SubSatU => (16, 21),
+        I32x4Add => (32, 0),
+        I32x4Sub => (32, 1),
+        I32x4Mul => (32, 2),
+        I32x4Eq => (32, 3),
+        I32x4Ne => (32, 4),
+        I32x4LtS => (32, 5),
+        I32x4LtU => (32, 6),
+        I32x4GtS => (32, 7),
+        I32x4GtU => (32, 8),
+        I32x4LeS => (32, 9),
+        I32x4LeU => (32, 10),
+        I32x4GeS => (32, 11),
+        I32x4GeU => (32, 12),
+        I32x4MinS => (32, 13),
+        I32x4MinU => (32, 14),
+        I32x4MaxS => (32, 15),
+        I32x4MaxU => (32, 16),
+        I64x2Add => (64, 0),
+        I64x2Sub => (64, 1),
+        I64x2Mul => (64, 2),
+        I64x2Eq => (64, 3),
+        I64x2Ne => (64, 4),
+        I64x2LtS => (64, 5),
+        I64x2GtS => (64, 7),
+        I64x2LeS => (64, 9),
+        I64x2GeS => (64, 11),
+        _ => return None,
+    })
+}
+
+fn simd_shift_op(operator: &Operator<'_>) -> Option<(u32, u32)> {
+    use Operator::*;
+    Some(match operator {
+        I8x16Shl => (8, 0),
+        I8x16ShrS => (8, 1),
+        I8x16ShrU => (8, 2),
+        I16x8Shl => (16, 0),
+        I16x8ShrS => (16, 1),
+        I16x8ShrU => (16, 2),
+        I32x4Shl => (32, 0),
+        I32x4ShrS => (32, 1),
+        I32x4ShrU => (32, 2),
+        I64x2Shl => (64, 0),
+        I64x2ShrS => (64, 1),
+        I64x2ShrU => (64, 2),
+        _ => return None,
+    })
+}
+
+fn simd_unary_op(operator: &Operator<'_>) -> Option<(u32, u32)> {
+    use Operator::*;
+    Some(match operator {
+        I8x16Abs => (8, 0),
+        I8x16Neg => (8, 1),
+        I16x8Abs => (16, 0),
+        I16x8Neg => (16, 1),
+        I32x4Abs => (32, 0),
+        I32x4Neg => (32, 1),
+        I64x2Abs => (64, 0),
+        I64x2Neg => (64, 1),
+        _ => return None,
+    })
+}
+
+fn simd_float_unary_op(operator: &Operator<'_>) -> Option<(u32, u32)> {
+    use Operator::*;
+    Some(match operator {
+        F32x4Abs => (32, 0),
+        F32x4Neg => (32, 1),
+        F32x4Sqrt => (32, 2),
+        F32x4Ceil => (32, 3),
+        F32x4Floor => (32, 4),
+        F32x4Trunc => (32, 5),
+        F32x4Nearest => (32, 6),
+        F64x2Abs => (64, 0),
+        F64x2Neg => (64, 1),
+        F64x2Sqrt => (64, 2),
+        F64x2Ceil => (64, 3),
+        F64x2Floor => (64, 4),
+        F64x2Trunc => (64, 5),
+        F64x2Nearest => (64, 6),
+        _ => return None,
+    })
+}
+
+fn simd_float_binary_op(operator: &Operator<'_>) -> Option<(u32, u32)> {
+    use Operator::*;
+    Some(match operator {
+        F32x4Add => (32, 0),
+        F32x4Sub => (32, 1),
+        F32x4Mul => (32, 2),
+        F32x4Div => (32, 3),
+        F32x4Min => (32, 4),
+        F32x4Max => (32, 5),
+        F32x4Eq => (32, 6),
+        F32x4Ne => (32, 7),
+        F32x4Lt => (32, 8),
+        F32x4Gt => (32, 9),
+        F32x4Le => (32, 10),
+        F32x4Ge => (32, 11),
+        F32x4PMin => (32, 12),
+        F32x4PMax => (32, 13),
+        F32x4RelaxedMin => (32, 4),
+        F32x4RelaxedMax => (32, 5),
+        F64x2Add => (64, 0),
+        F64x2Sub => (64, 1),
+        F64x2Mul => (64, 2),
+        F64x2Div => (64, 3),
+        F64x2Min => (64, 4),
+        F64x2Max => (64, 5),
+        F64x2Eq => (64, 6),
+        F64x2Ne => (64, 7),
+        F64x2Lt => (64, 8),
+        F64x2Gt => (64, 9),
+        F64x2Le => (64, 10),
+        F64x2Ge => (64, 11),
+        F64x2PMin => (64, 12),
+        F64x2PMax => (64, 13),
+        F64x2RelaxedMin => (64, 4),
+        F64x2RelaxedMax => (64, 5),
+        _ => return None,
+    })
+}
+
+fn simd_convert_op(operator: &Operator<'_>) -> Option<u32> {
+    use Operator::*;
+    Some(match operator {
+        I32x4TruncSatF32x4S => 0,
+        I32x4TruncSatF32x4U => 1,
+        I32x4RelaxedTruncF32x4S => 0,
+        I32x4RelaxedTruncF32x4U => 1,
+        F32x4ConvertI32x4S => 2,
+        F32x4ConvertI32x4U => 3,
+        I32x4TruncSatF64x2SZero => 4,
+        I32x4TruncSatF64x2UZero => 5,
+        I32x4RelaxedTruncF64x2SZero => 4,
+        I32x4RelaxedTruncF64x2UZero => 5,
+        F64x2ConvertLowI32x4S => 6,
+        F64x2ConvertLowI32x4U => 7,
+        F32x4DemoteF64x2Zero => 8,
+        F64x2PromoteLowF32x4 => 9,
+        _ => return None,
+    })
 }
 
 fn check_local(index: u32, count: usize) -> Result<(), Error> {
@@ -4902,6 +5888,7 @@ mod tests {
                     Value::I64(bits) => wasmtime::Val::I64(*bits as i64),
                     Value::F32(bits) => wasmtime::Val::F32(*bits),
                     Value::F64(bits) => wasmtime::Val::F64(*bits),
+                    Value::V128(bits) => wasmtime::Val::V128(u128::from_le_bytes(*bits).into()),
                 })
                 .collect();
             let mut results: Vec<_> = kernel
@@ -4912,6 +5899,7 @@ mod tests {
                     ValType::I64 => wasmtime::Val::I64(0),
                     ValType::F32 => wasmtime::Val::F32(0),
                     ValType::F64 => wasmtime::Val::F64(0),
+                    ValType::V128 => wasmtime::Val::V128(0u128.into()),
                     _ => unreachable!(),
                 })
                 .collect();
@@ -4925,6 +5913,9 @@ mod tests {
                     }
                     (Value::F64(a), wasmtime::Val::F64(b)) => {
                         a == b || (f64::from_bits(a).is_nan() && f64::from_bits(b).is_nan())
+                    }
+                    (Value::V128(a), wasmtime::Val::V128(b)) => {
+                        u128::from_le_bytes(a) == b.as_u128()
                     }
                     _ => false,
                 };
@@ -5739,6 +6730,46 @@ mod tests {
         compare_values_to_wasmtime(
             "(module (func (export \"f\") (param f64) (result f32) local.get 0 f32.demote_f64))",
             &near_f32_zero,
+        );
+    }
+
+    #[test]
+    fn simd_values_calls_globals_and_memory_match_wasmtime() {
+        let a = Value::V128([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let b = Value::V128([255, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]);
+        compare_values_to_wasmtime(
+            "(module (func (export \"f\") (param v128 v128) (result v128) local.get 0 local.get 1 i32x4.add))",
+            &[vec![a, b]],
+        );
+        compare_values_to_wasmtime(
+            "(module (func (export \"f\") (param i32 v128) (result v128 i32)
+                local.get 1 local.get 0 i32x4.splat i32x4.add local.get 0))",
+            &[vec![Value::I32(19), a], vec![Value::I32(u32::MAX), b]],
+        );
+        compare_values_to_wasmtime(
+            "(module (global $g (mut v128) (v128.const i32x4 1 2 3 4))
+                (func $add (param v128) (result v128) local.get 0 global.get $g i32x4.add)
+                (func (export \"f\") (param v128) (result v128)
+                  (local v128) local.get 0 call $add local.tee 1 global.set $g local.get 1))",
+            &[vec![a], vec![b]],
+        );
+        compare_values_to_wasmtime(
+            "(module (memory 1) (func (export \"f\") (param v128) (result v128)
+                i32.const 1 local.get 0 v128.store
+                i32.const 1 v128.load))",
+            &[vec![a], vec![b]],
+        );
+        compare_values_to_wasmtime(
+            "(module (memory 1) (global $zero (mut v128) (v128.const i32x4 0 0 0 0))
+                (func (export \"f\") (param i32 v128) (result i64) (local i64)
+                    local.get 0 local.get 1 v128.store16_lane 6
+                    local.get 0 i64.load local.set 2
+                    local.get 0 global.get $zero v128.store
+                    local.get 2))",
+            &[vec![
+                Value::I32(6),
+                Value::V128([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 7, 0, 0]),
+            ]],
         );
     }
 }
