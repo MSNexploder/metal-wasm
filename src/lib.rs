@@ -5,6 +5,7 @@ use std::error::Error as StdError;
 use std::ffi::CStr;
 use std::fmt;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use metal::objc::{
@@ -16,11 +17,15 @@ use metal::{
     CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device,
     MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
 };
+use wasmparser::types::CoreTypeId;
 use wasmparser::{
-    BlockType, ConstExpr, DataKind, ElementItems, ElementKind, ExternalKind, FuncType,
-    FunctionBody, GlobalType, MemoryType, Operator, Parser, Payload, RefType, TableInit, TableType,
-    TypeRef, ValType, Validator,
+    AbstractHeapType, BlockType, Catch, CompositeInnerType, ConstExpr, DataKind, ElementItems,
+    ElementKind, ExternalKind, FuncType, FunctionBody, GlobalType, HeapType, MemoryType, Operator,
+    Parser, Payload, RefType, TableInit, TableType, TryTable, TypeRef, UnpackedIndex, ValType,
+    Validator,
 };
+
+static NEXT_KERNEL_ID: AtomicU64 = AtomicU64::new(1);
 
 const MAX_MEMORY_BYTES_PER_INSTANCE: usize = 16 * 1024 * 1024;
 const MAX_GROWTH_PAGES: usize = 4;
@@ -36,6 +41,8 @@ pub struct KernelLimits {
     pub memory_growth_pages: usize,
     pub table_growth_elements: usize,
     pub call_depth: usize,
+    /// Maximum immutable exception records allocated during one lane invocation.
+    pub exception_records: usize,
 }
 
 impl Default for KernelLimits {
@@ -45,11 +52,21 @@ impl Default for KernelLimits {
             memory_growth_pages: MAX_GROWTH_PAGES,
             table_growth_elements: MAX_TABLE_GROWTH,
             call_depth: MAX_CALL_DEPTH,
+            exception_records: 64,
         }
     }
 }
 
-/// One raw WebAssembly numeric value. Floating-point variants hold their bit patterns.
+/// An opaque function identity owned by one compiled kernel.
+/// Handles can be passed back to that kernel, but cannot cross kernel boundaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FunctionRef {
+    kernel: u64,
+    index: u32,
+    ty: RefType,
+}
+
+/// One WebAssembly value. Floating-point variants hold their bit patterns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Value {
     I32(u32),
@@ -57,6 +74,8 @@ pub enum Value {
     F32(u32),
     F64(u64),
     V128([u8; 16]),
+    /// A nullable function reference obtained from this kernel.
+    FuncRef(Option<FunctionRef>),
 }
 
 impl Value {
@@ -67,6 +86,7 @@ impl Value {
             Self::F32(_) => ValType::F32,
             Self::F64(_) => ValType::F64,
             Self::V128(_) => ValType::V128,
+            Self::FuncRef(value) => ValType::Ref(value.map_or(RefType::FUNCREF, |f| f.ty)),
         }
     }
 
@@ -75,6 +95,7 @@ impl Value {
             Self::I32(bits) | Self::F32(bits) => bits as u64,
             Self::I64(bits) | Self::F64(bits) => bits,
             Self::V128(_) => unreachable!("v128 has two words"),
+            Self::FuncRef(value) => value.map_or(0, |f| u64::from(f.index)),
         }
     }
 
@@ -92,6 +113,10 @@ impl Value {
 
 /// A compiled WebAssembly export, run once per Metal thread.
 pub struct Kernel {
+    id: u64,
+    function_reference_types: Vec<RefType>,
+    exported_functions: HashMap<String, u32>,
+    reference_supertypes: HashMap<CoreTypeId, Option<CoreTypeId>>,
     device: Device,
     queue: metal::CommandQueue,
     pipeline: ComputePipelineState,
@@ -103,6 +128,9 @@ pub struct Kernel {
 }
 
 struct Translation {
+    function_reference_types: Vec<RefType>,
+    exported_functions: HashMap<String, u32>,
+    reference_supertypes: HashMap<CoreTypeId, Option<CoreTypeId>>,
     source: String,
     can_trap: bool,
     params: Vec<ValType>,
@@ -169,6 +197,9 @@ pub enum Error {
     InvalidWasm(wasmparser::BinaryReaderError),
     Unsupported(String),
     Metal(String),
+    UncaughtException {
+        input_index: usize,
+    },
     Trap {
         input_index: usize,
         reason: &'static str,
@@ -207,6 +238,8 @@ impl Kernel {
     ) -> Result<Self, Error> {
         if !limits.memory_bytes.is_multiple_of(65536)
             || limits.memory_bytes / 65536 > 65536
+            || limits.exception_records == 0
+            || limits.exception_records > u32::MAX as usize
             || limits.call_depth == 0
             || limits.call_depth > u32::MAX as usize
         {
@@ -255,6 +288,10 @@ impl Kernel {
             });
         }
         Ok(Self {
+            id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed),
+            function_reference_types: translation.function_reference_types,
+            exported_functions: translation.exported_functions,
+            reference_supertypes: translation.reference_supertypes,
             device,
             queue,
             pipeline,
@@ -264,6 +301,30 @@ impl Kernel {
             instances,
             memory_exports: translation.memory_exports,
         })
+    }
+
+    /// Obtain a function handle for an export of the root module.
+    pub fn function_reference(&self, export: &str) -> Result<FunctionRef, Error> {
+        let index = *self
+            .exported_functions
+            .get(export)
+            .ok_or_else(|| Error::Unsupported(format!("export {export:?} is not a function")))?;
+        Ok(FunctionRef {
+            kernel: self.id,
+            index,
+            ty: self.function_reference_types[index as usize - 1],
+        })
+    }
+
+    fn accepts_value(&self, value: Value, expected: ValType) -> bool {
+        match (value, expected) {
+            (Value::FuncRef(None), ValType::Ref(ty)) => ty.is_nullable() && is_function_ref(ty),
+            (Value::FuncRef(Some(reference)), ValType::Ref(ty)) => {
+                reference.kernel == self.id
+                    && ref_subtype(reference.ty, ty, &self.reference_supertypes)
+            }
+            _ => value.ty() == expected,
+        }
     }
 
     /// Run one independent invocation for each input. Values are raw i32 bit patterns.
@@ -392,7 +453,7 @@ impl Kernel {
                 || row
                     .iter()
                     .zip(&self.params)
-                    .any(|(value, ty)| value.ty() != *ty)
+                    .any(|(value, ty)| !self.accepts_value(*value, *ty))
             {
                 return Err(Error::Unsupported(
                     "input values do not match the export signature".into(),
@@ -525,7 +586,13 @@ impl Kernel {
                                     bytes[8..].copy_from_slice(&values[offset - 1].to_le_bytes());
                                     Value::V128(bytes)
                                 }
-                                _ => unreachable!(),
+                                ValType::Ref(_) => {
+                                    Value::FuncRef((low != 0).then(|| FunctionRef {
+                                        kernel: self.id,
+                                        index: low as u32,
+                                        ty: self.function_reference_types[low as usize - 1],
+                                    }))
+                                }
                             }
                         })
                         .collect()
@@ -725,6 +792,9 @@ impl Kernel {
                 if let Some((input_index, code)) =
                     codes.iter().enumerate().find(|(_, code)| **code != 0)
                 {
+                    if *code == 11 {
+                        return Err(Error::UncaughtException { input_index });
+                    }
                     let reason = match code {
                         1 => "integer divide by zero",
                         2 => "integer overflow",
@@ -734,6 +804,9 @@ impl Kernel {
                         6 => "undefined or uninitialized table element",
                         7 => "indirect call type mismatch",
                         8 => "call depth limit exceeded",
+                        9 => "null reference",
+                        10 => "exception record limit exceeded",
+                        12 => "null function reference",
                         _ => "unknown trap",
                     };
                     return Err(Error::Trap {
@@ -760,6 +833,9 @@ impl Kernel {
 
 fn shift_trap(error: Error, offset: usize) -> Error {
     match error {
+        Error::UncaughtException { input_index } => Error::UncaughtException {
+            input_index: offset + input_index,
+        },
         Error::Trap {
             input_index,
             reason,
@@ -898,6 +974,10 @@ impl fmt::Display for Error {
             Self::InvalidWasm(error) => write!(formatter, "invalid WebAssembly: {error}"),
             Self::Unsupported(reason) => write!(formatter, "unsupported WebAssembly: {reason}"),
             Self::Metal(reason) => write!(formatter, "Metal error: {reason}"),
+            Self::UncaughtException { input_index } => write!(
+                formatter,
+                "uncaught WebAssembly exception at input {input_index}"
+            ),
             Self::Trap {
                 input_index,
                 reason,
@@ -919,8 +999,112 @@ impl From<wasmparser::BinaryReaderError> for Error {
     }
 }
 
+// Reuse the validator's canonical interner across providers. Recursive group
+// identity and declared function subtyping must survive module-local indices.
+#[derive(Default)]
+struct TypeContext {
+    validator: Validator,
+    next_tag: u32,
+}
+
+fn normalize_ref(ty: RefType, ids: &[CoreTypeId]) -> RefType {
+    match ty.heap_type() {
+        HeapType::Concrete(UnpackedIndex::Module(index)) => RefType::new(
+            ty.is_nullable(),
+            HeapType::Concrete(UnpackedIndex::Id(ids[index as usize])),
+        )
+        .unwrap(),
+        _ => ty,
+    }
+}
+
+fn normalize_value(ty: ValType, ids: &[CoreTypeId]) -> ValType {
+    match ty {
+        ValType::Ref(ty) => ValType::Ref(normalize_ref(ty, ids)),
+        _ => ty,
+    }
+}
+
+fn ref_subtype(
+    actual: RefType,
+    expected: RefType,
+    parents: &HashMap<CoreTypeId, Option<CoreTypeId>>,
+) -> bool {
+    if actual.is_nullable() && !expected.is_nullable() {
+        return false;
+    }
+    if actual.heap_type() == expected.heap_type() {
+        return true;
+    }
+    match (actual.heap_type(), expected.heap_type()) {
+        (
+            HeapType::Concrete(UnpackedIndex::Id(mut id)),
+            HeapType::Concrete(UnpackedIndex::Id(target)),
+        ) => {
+            while let Some(Some(parent)) = parents.get(&id) {
+                if *parent == target {
+                    return true;
+                }
+                id = *parent;
+            }
+            false
+        }
+        (
+            _,
+            HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::Func,
+            },
+        ) => is_function_ref(actual),
+        (
+            HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::NoFunc,
+            },
+            _,
+        ) => is_function_ref(expected),
+        (
+            HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::NoExtern,
+            },
+            HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::Extern,
+            },
+        ) => true,
+        (
+            HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::NoExn,
+            },
+            HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::Exn,
+            },
+        ) => true,
+        _ => false,
+    }
+}
+
+fn is_function_ref(ty: RefType) -> bool {
+    matches!(
+        ty.heap_type(),
+        HeapType::Concrete(_)
+            | HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::Func | AbstractHeapType::NoFunc
+            }
+    )
+}
+
 struct ParsedModule<'a> {
+    uses_exceptions: bool,
     types: Vec<FuncType>,
+    type_ids: Vec<CoreTypeId>,
+    supertypes: HashMap<CoreTypeId, Option<CoreTypeId>>,
+    tag_types: Vec<u32>,
+    tag_bindings: Vec<u32>,
     function_types: Vec<u32>,
     bodies: Vec<FunctionBody<'a>>,
     exports: HashMap<String, (ExternalKind, usize)>,
@@ -948,6 +1132,19 @@ struct ParsedModule<'a> {
 }
 
 impl ParsedModule<'_> {
+    fn accepts_function(&self, expected: usize, actual: &Self, function: usize) -> bool {
+        let mut id = actual.type_ids[actual.function_types[function] as usize];
+        loop {
+            if id == self.type_ids[expected] {
+                return true;
+            }
+            match actual.supertypes.get(&id).copied().flatten() {
+                Some(parent) => id = parent,
+                None => return false,
+            }
+        }
+    }
+
     fn function_type(&self, index: usize) -> Result<&FuncType, Error> {
         self.function_types
             .get(index)
@@ -956,10 +1153,36 @@ impl ParsedModule<'_> {
     }
 }
 
-fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, Error> {
-    Validator::new().validate_all(wasm)?;
-
+fn parse_module<'a>(
+    wasm: &'a [u8],
+    limits: KernelLimits,
+    context: &mut TypeContext,
+) -> Result<ParsedModule<'a>, Error> {
+    context.validator.reset();
+    let validated = context.validator.validate_all(wasm)?;
+    let validated = validated.as_ref();
+    let type_ids: Vec<_> = (0..validated.core_type_count_in_module())
+        .map(|i| validated.core_type_at_in_module(i))
+        .collect();
+    let mut supertypes = HashMap::new();
     let mut types = Vec::new();
+    for &id in &type_ids {
+        let subtype = &validated[id];
+        if subtype.composite_type.shared {
+            return Err(Error::Unsupported("shared types are unsupported".into()));
+        }
+        match &subtype.composite_type.inner {
+            CompositeInnerType::Func(ty) => types.push(ty.clone()),
+            _ => {
+                return Err(Error::Unsupported(
+                    "GC and continuation types are unsupported".into(),
+                ));
+            }
+        }
+        supertypes.insert(id, validated.supertype_of(id));
+    }
+    let mut tag_types = Vec::new();
+    let mut tag_bindings = Vec::new();
     let mut function_types = Vec::new();
     let mut bodies = Vec::new();
     let mut exports = HashMap::new();
@@ -990,14 +1213,21 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
             Payload::Version { .. } | Payload::CustomSection(_) | Payload::End(_) => {}
-            Payload::TypeSection(section) => {
-                types = section
-                    .into_iter_err_on_gc_types()
-                    .collect::<Result<_, _>>()?;
-            }
+            Payload::TypeSection(_) => {}
             Payload::ImportSection(section) => {
                 for import in section.into_imports() {
-                    let import = import?;
+                    let mut import = import?;
+                    import.ty = match import.ty {
+                        TypeRef::Global(mut ty) => {
+                            ty.content_type = normalize_value(ty.content_type, &type_ids);
+                            TypeRef::Global(ty)
+                        }
+                        TypeRef::Table(mut ty) => {
+                            ty.element_type = normalize_ref(ty.element_type, &type_ids);
+                            TypeRef::Table(ty)
+                        }
+                        ty => ty,
+                    };
                     all_imports.push((import.module.to_owned(), import.name.to_owned(), import.ty));
                     match import.ty {
                         TypeRef::Func(ty) => {
@@ -1014,7 +1244,7 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                             memory_bindings.push(None);
                         }
                         TypeRef::Table(ty) => {
-                            if ty.element_type != RefType::FUNCREF || ty.shared {
+                            if !is_function_ref(ty.element_type) || ty.shared {
                                 return Err(Error::Unsupported(
                                     "only unshared funcref tables are supported".into(),
                                 ));
@@ -1022,10 +1252,14 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                             table_types.push(ty);
                             table_bindings.push(None);
                         }
+                        TypeRef::Tag(ty) => {
+                            tag_types.push(ty.func_type_idx);
+                            tag_bindings.push(0);
+                        }
                         TypeRef::Global(ty) => {
                             if !is_supported_value(ty.content_type) || ty.shared {
                                 return Err(Error::Unsupported(
-                                    "only unshared numeric and funcref globals are supported"
+                                    "only unshared numeric, function, external, and exception reference globals are supported"
                                         .into(),
                                 ));
                             }
@@ -1047,8 +1281,9 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
             }
             Payload::TableSection(section) => {
                 for table in section {
-                    let table = table?;
-                    if table.ty.element_type != RefType::FUNCREF || table.ty.shared {
+                    let mut table = table?;
+                    table.ty.element_type = normalize_ref(table.ty.element_type, &type_ids);
+                    if !is_function_ref(table.ty.element_type) || table.ty.shared {
                         return Err(Error::Unsupported(
                             "only unshared funcref tables are supported".into(),
                         ));
@@ -1125,10 +1360,11 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
             }
             Payload::GlobalSection(section) => {
                 for global in section {
-                    let global = global?;
+                    let mut global = global?;
+                    global.ty.content_type = normalize_value(global.ty.content_type, &type_ids);
                     if !is_supported_value(global.ty.content_type) || global.ty.shared {
                         return Err(Error::Unsupported(
-                            "only unshared numeric and funcref globals are supported".into(),
+                            "only unshared numeric, function, external, and exception reference globals are supported".into(),
                         ));
                     }
                     let slot = globals_template.len();
@@ -1157,7 +1393,7 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                     globals_mutable.push(global.ty.mutable);
                     global_types.push(global.ty);
                     if imported_globals == 0
-                        && global.ty.content_type == ValType::Ref(RefType::FUNCREF)
+                        && matches!(global.ty.content_type, ValType::Ref(ty) if is_function_ref(ty))
                     {
                         reference_globals.push(slot);
                     }
@@ -1176,7 +1412,7 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                                     })
                                 })
                                 .collect::<Result<_, Error>>()?,
-                            ElementItems::Expressions(RefType::FUNCREF, expressions) => {
+                            ElementItems::Expressions(ty, expressions) if is_function_ref(ty) => {
                                 let mut values = Vec::new();
                                 for expr in expressions {
                                     let expr = expr?;
@@ -1337,6 +1573,16 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                 }
             }
             Payload::DataCountSection { .. } => {}
+            Payload::TagSection(section) => {
+                for tag in section {
+                    tag_types.push(tag?.func_type_idx);
+                    context.next_tag = context
+                        .next_tag
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Unsupported("too many tags".into()))?;
+                    tag_bindings.push(context.next_tag);
+                }
+            }
             Payload::StartSection { func, .. } => start_index = Some(func as usize),
             Payload::ExportSection(section) => {
                 for item in section {
@@ -1355,8 +1601,20 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
         }
     }
 
+    let uses_exceptions = !tag_types.is_empty()
+        || bodies.iter().any(|b| {
+            b.get_operators_reader()
+                .unwrap()
+                .into_iter()
+                .any(|op| matches!(op, Ok(Operator::ThrowRef | Operator::TryTable { .. })))
+        });
     Ok(ParsedModule {
+        uses_exceptions,
         types,
+        type_ids,
+        supertypes,
+        tag_types,
+        tag_bindings,
         function_types,
         bodies,
         exports,
@@ -1399,6 +1657,7 @@ fn load_dependencies<'a>(
     visiting: &mut Vec<bool>,
     postorder: &mut Vec<usize>,
     limits: KernelLimits,
+    context: &mut TypeContext,
 ) -> Result<(), Error> {
     visiting[index] = true;
     let imported_globals = modules[index]
@@ -1425,6 +1684,7 @@ fn load_dependencies<'a>(
     let mut global_import = 0;
     let mut memory_import = 0;
     let mut table_import = 0;
+    let mut tag_import = 0;
     for (namespace, name, ty) in links {
         let provider = if let Some(&provider) = namespaces.get(&namespace) {
             if visiting[provider] {
@@ -1438,11 +1698,11 @@ fn load_dependencies<'a>(
                 Error::Unsupported(format!("missing Wasm provider {namespace:?}"))
             })?;
             let provider = modules.len();
-            modules.push(parse_module(bytes, limits)?);
+            modules.push(parse_module(bytes, limits, context)?);
             namespaces.insert(namespace.clone(), provider);
             visiting.push(false);
             load_dependencies(
-                provider, modules, providers, namespaces, visiting, postorder, limits,
+                provider, modules, providers, namespaces, visiting, postorder, limits, context,
             )?;
             provider
         };
@@ -1452,9 +1712,15 @@ fn load_dependencies<'a>(
         match ty {
             TypeRef::Func(_) if kind == ExternalKind::Func => {
                 let import_index = modules[index].resolved_imports.len();
-                if modules[index].function_type(import_index)?
-                    != modules[provider].function_type(exported)?
-                {
+                let (mut owner, mut function) = (provider, exported);
+                while function < modules[owner].imports.len() {
+                    (owner, function) = modules[owner].resolved_imports[function];
+                }
+                if !modules[index].accepts_function(
+                    modules[index].function_types[import_index] as usize,
+                    &modules[owner],
+                    function,
+                ) {
                     return Err(Error::Unsupported(format!(
                         "signature mismatch for import {namespace}.{name}"
                     )));
@@ -1507,14 +1773,42 @@ fn load_dependencies<'a>(
                 table_import += 1;
             }
             TypeRef::Global(expected) if kind == ExternalKind::Global => {
-                if modules[provider].global_types.get(exported) != Some(&expected) {
+                let binding = modules[provider].global_bindings[exported];
+                let owner = &modules[binding.0];
+                let definition = owner
+                    .global_bindings
+                    .iter()
+                    .position(|&candidate| candidate == binding)
+                    .expect("resolved global definition");
+                let actual = owner.global_types[definition];
+                let matches = actual.mutable == expected.mutable
+                    && actual.shared == expected.shared
+                    && (actual.content_type == expected.content_type
+                        || (!expected.mutable
+                            && match (actual.content_type, expected.content_type) {
+                                (ValType::Ref(actual), ValType::Ref(expected)) => {
+                                    ref_subtype(actual, expected, &owner.supertypes)
+                                }
+                                _ => false,
+                            }));
+                if !matches {
                     return Err(Error::Unsupported(format!(
                         "global type mismatch for import {namespace}.{name}"
                     )));
                 }
-                modules[index].global_bindings[global_import] =
-                    modules[provider].global_bindings[exported];
+                modules[index].global_bindings[global_import] = binding;
                 global_import += 1;
+            }
+            TypeRef::Tag(expected) if kind == ExternalKind::Tag => {
+                if modules[index].type_ids[expected.func_type_idx as usize]
+                    != modules[provider].type_ids[modules[provider].tag_types[exported] as usize]
+                {
+                    return Err(Error::Unsupported(format!(
+                        "tag type mismatch for import {namespace}.{name}"
+                    )));
+                }
+                modules[index].tag_bindings[tag_import] = modules[provider].tag_bindings[exported];
+                tag_import += 1;
             }
             TypeRef::Func(_) => {
                 return Err(Error::Unsupported(format!(
@@ -1571,7 +1865,8 @@ fn translate_with_limits(
             )));
         }
     }
-    let mut modules = vec![parse_module(wasm, limits)?];
+    let mut context = TypeContext::default();
+    let mut modules = vec![parse_module(wasm, limits, &mut context)?];
     let mut postorder = Vec::new();
     load_dependencies(
         0,
@@ -1581,6 +1876,7 @@ fn translate_with_limits(
         &mut vec![false],
         &mut postorder,
         limits,
+        &mut context,
     )?;
     let mut functions = Vec::new();
     let mut global_types = Vec::new();
@@ -1618,14 +1914,34 @@ fn translate_with_limits(
         .params()
         .iter()
         .chain(ty.results())
-        .any(|ty| !is_numeric(*ty))
+        .any(|ty| !is_numeric(*ty) && !matches!(ty, ValType::Ref(ty) if is_function_ref(*ty)))
     {
         return Err(Error::Unsupported(
-            "exported signatures must contain numeric values".into(),
+            "exported signatures must contain numeric values or function references".into(),
         ));
     }
     // Mutable tables can receive references returned by functions in other modules.
     let mut referenced = Vec::new();
+    // The host can inject exported handles into tables through reference arguments.
+    // Include only functions whose nominal type is accepted by an input parameter.
+    for &(kind, local) in modules[0].exports.values() {
+        if kind != ExternalKind::Func {
+            continue;
+        }
+        let function = modules[0].resolved_functions[local];
+        let (owner, local) = functions[function];
+        let actual = &modules[owner];
+        let reference = RefType::new(
+            false,
+            HeapType::Concrete(UnpackedIndex::Id(
+                actual.type_ids[actual.function_types[local] as usize],
+            )),
+        )
+        .unwrap();
+        if ty.params().iter().any(|ty| matches!(ty, ValType::Ref(expected) if ref_subtype(reference, *expected, &actual.supertypes))) {
+            referenced.push(function);
+        }
+    }
     for module in &mut modules {
         let instance = &mut module.instance;
         for table in &mut instance.tables {
@@ -1723,7 +2039,6 @@ fn translate_with_limits(
                 *function,
                 &modules,
                 &functions,
-                &global_types,
                 &mut reachable,
                 &mut ignored_order,
                 &mut ignored_traps,
@@ -1814,7 +2129,6 @@ fn translate_with_limits(
         index,
         &modules,
         &functions,
-        &global_types,
         &mut visit_state,
         &mut order,
         &mut can_trap,
@@ -1826,7 +2140,6 @@ fn translate_with_limits(
             start,
             &modules,
             &functions,
-            &global_types,
             &mut visit_state,
             &mut order,
             &mut can_trap,
@@ -1850,7 +2163,7 @@ fn translate_with_limits(
             })
     });
     recursive |= tail_calls;
-    can_trap |= recursive;
+    can_trap |= recursive || modules.iter().any(|m| m.uses_exceptions);
     let mut slots = Vec::new();
     let mut next_slot = 4u64;
     for (module_index, module) in modules.iter_mut().enumerate() {
@@ -1922,7 +2235,30 @@ fn translate_with_limits(
         .max()
         .unwrap_or(0)
         .max(1);
-    source.push_str(&format!("struct ModuleState {{ device uchar* memory[{max_memories}]; device uint* pages[{max_memories}]; device ulong* globals; device uint* table[{max_tables}]; device const uchar* passive_data; uint table_size[{max_tables}]; thread uint* element_lengths; thread uint* data_lengths; thread uint* element_values[{max_elements}]; }};\n"));
+    let exceptions = modules.iter().any(|m| m.uses_exceptions);
+    if exceptions {
+        let words = modules
+            .iter()
+            .flat_map(|m| {
+                m.tag_types.iter().map(|&t| {
+                    m.types[t as usize]
+                        .params()
+                        .iter()
+                        .map(|ty| value_words(*ty))
+                        .sum::<usize>()
+                })
+            })
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        source.push_str(&format!("constant uint EXCEPTION_RECORDS = {}u; constant uint EXCEPTION_WORDS = {words}u;\nstruct ExceptionState {{ uint pending; uint count; uint tags[{}]; ulong values[{}]; }};\n", limits.exception_records, limits.exception_records, limits.exception_records.checked_mul(words).ok_or_else(|| Error::Unsupported("exception arena size overflow".into()))?));
+    }
+    let exception_field = if exceptions {
+        "thread ExceptionState* exceptions;"
+    } else {
+        ""
+    };
+    source.push_str(&format!("struct ModuleState {{ {exception_field} device uchar* memory[{max_memories}]; device uint* pages[{max_memories}]; device ulong* globals; device uint* table[{max_tables}]; device const uchar* passive_data; uint table_size[{max_tables}]; thread uint* element_lengths; thread uint* data_lengths; thread uint* element_values[{max_elements}]; }};\n"));
     if tail_calls {
         let max_args = order
             .iter()
@@ -1979,10 +2315,16 @@ fn translate_with_limits(
             tail_calls,
             limits.call_depth,
             limits.memory_bytes,
+            &order,
         )?);
     }
     if tail_calls {
-        source.push_str(&tail_dispatcher(&order, &global_types, limits.call_depth));
+        source.push_str(&tail_dispatcher(
+            &order,
+            &global_types,
+            limits.call_depth,
+            exceptions,
+        ));
     }
     let fast_i32 = ty.params() == [ValType::I32] && ty.results() == [ValType::I32];
     let input_ty = if fast_i32 { "uint" } else { "ulong" };
@@ -2014,6 +2356,12 @@ fn translate_with_limits(
         ", uint id [[thread_position_in_grid]]) {\nulong count = config[0];\nif (id >= count) return;\nuint trap = 0u;\n",
     );
     source.push_str(&format!("ModuleState states[{}] = {{}};\n", modules.len()));
+    if exceptions {
+        source.push_str("ExceptionState exceptions = {};\n");
+        for module in 0..modules.len() {
+            source.push_str(&format!("states[{module}].exceptions = &exceptions;\n"));
+        }
+    }
     for (module_index, module) in modules.iter().enumerate() {
         let instance = &module.instance;
         for (index, memory) in instance.memories.iter().enumerate() {
@@ -2095,26 +2443,31 @@ fn translate_with_limits(
     } else {
         "states, trap"
     };
+    let ready = if exceptions {
+        "trap == 0u && exceptions.pending == 0u"
+    } else {
+        "trap == 0u"
+    };
     for &module_index in &postorder {
         let module = &modules[module_index];
         for (slot, ty, expr) in &module.dynamic_globals {
             let value = const_source(expr, module)?;
             if *ty == ValType::V128 {
-                source.push_str(&format!("if (trap == 0u) {{ ulong2 value = {value}; states[{module_index}].globals[{slot}u] = value.x; states[{module_index}].globals[{}u] = value.y; }}\n", slot + 1));
+                source.push_str(&format!("if ({ready}) {{ ulong2 value = {value}; states[{module_index}].globals[{slot}u] = value.x; states[{module_index}].globals[{}u] = value.y; }}\n", slot + 1));
             } else {
                 source.push_str(&format!(
-                    "if (trap == 0u) states[{module_index}].globals[{slot}u] = {value};\n"
+                    "if ({ready}) states[{module_index}].globals[{slot}u] = {value};\n"
                 ));
             }
         }
         for &(segment, item, ref expr) in &module.dynamic_elements {
             let value = const_source(expr, module)?;
-            source.push_str(&format!("if (trap == 0u) states[{module_index}].element_values[{segment}][{item}] = uint({value});\n"));
+            source.push_str(&format!("if ({ready}) states[{module_index}].element_values[{segment}][{item}] = uint({value});\n"));
         }
         for &(local, ref expr) in &module.table_init_exprs {
             let value = const_source(expr, module)?;
             let count = module.instance.tables[local].values.len();
-            source.push_str(&format!("if (trap == 0u) {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{module_index}].table[{local}][j] = uint({value}); }}\n"));
+            source.push_str(&format!("if ({ready}) {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{module_index}].table[{local}][j] = uint({value}); }}\n"));
         }
         for &(segment, table_index, ref expr) in &module.active_elements {
             let offset = const_source(expr, module)?;
@@ -2134,7 +2487,7 @@ fn translate_with_limits(
             } else {
                 format!("m{module_index}_element_{segment}")
             };
-            source.push_str(&format!("if (trap == 0u) {{ ulong offset = {offset}; if (offset > states[{owner}].table_size[{local}] || {count}ul > states[{owner}].table_size[{local}] - offset) trap = 6u; else {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{owner}].table[{local}][offset + j] = {values}[j]; }} }}\n"));
+            source.push_str(&format!("if ({ready}) {{ ulong offset = {offset}; if (offset > states[{owner}].table_size[{local}] || {count}ul > states[{owner}].table_size[{local}] - offset) trap = 6u; else {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{owner}].table[{local}][offset + j] = {values}[j]; }} }}\n"));
         }
         for (memory_index, expr, data_offset, count) in &module.active_data {
             let offset = const_source(expr, module)?;
@@ -2144,20 +2497,20 @@ fn translate_with_limits(
             } else {
                 format!("ulong(uint({offset}))")
             };
-            source.push_str(&format!("if (trap == 0u) {{ ulong offset = {offset}; ulong size = ulong(states[{owner}].pages[{local}][0]) * 65536ul; if (offset > size || {count}ul > size - offset) trap = 4u; else {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{owner}].memory[{local}][offset + j] = states[{module_index}].passive_data[{data_offset}ul + j]; }} }}\n"));
+            source.push_str(&format!("if ({ready}) {{ ulong offset = {offset}; ulong size = ulong(states[{owner}].pages[{local}][0]) * 65536ul; if (offset > size || {count}ul > size - offset) trap = 4u; else {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{owner}].memory[{local}][offset + j] = states[{module_index}].passive_data[{data_offset}ul + j]; }} }}\n"));
         }
         if let Some(local) = module.start_index {
             let start = module.resolved_functions[local];
             if tail_calls {
-                source.push_str(&format!("if (trap == 0u) {{ ulong start_args[1] = {{0ul}}; ulong start_results[1] = {{0ul}}; invoke({start}u, start_args, start_results, states, trap, 0u); }}\n"));
+                source.push_str(&format!("if ({ready}) {{ ulong start_args[1] = {{0ul}}; ulong start_results[1] = {{0ul}}; invoke({start}u, start_args, start_results, states, trap, 0u); }}\n"));
             } else {
-                source.push_str(&format!("if (trap == 0u) f{start}({context});\n"));
+                source.push_str(&format!("if ({ready}) f{start}({context});\n"));
             }
         }
     }
     if !modules[0].memory_bindings.is_empty() {
         let argument_bytes = param_words * if fast_i32 { 4 } else { 8 };
-        source.push_str(&format!("if (config[2] != 0ul && trap == 0u) {{\n device const uchar* memory_input = reinterpret_cast<device const uchar*>(input) + count * {argument_bytes}ul + ulong(id) * config[2];\n"));
+        source.push_str(&format!("if (config[2] != 0ul && {ready}) {{\n device const uchar* memory_input = reinterpret_cast<device const uchar*>(input) + count * {argument_bytes}ul + ulong(id) * config[2];\n"));
         for (owner, local) in modules[0].memory_bindings.iter().flatten() {
             source.push_str(&format!("if (config[3] == {owner}ul && config[4] == {local}ul) for (ulong j = 0ul; j < config[2]; ++j) states[{owner}].memory[{local}][config[1] + j] = memory_input[j];\n"));
         }
@@ -2182,7 +2535,7 @@ fn translate_with_limits(
             word += value_words(*ty);
         }
         source.push_str(&format!(
-            "if (trap == 0u) invoke({index}u, top_args, top_results, states, trap, 0u);\n"
+            "if ({ready}) invoke({index}u, top_args, top_results, states, trap, 0u);\n"
         ));
         let mut word = 0;
         for (result, ty) in ty.results().iter().enumerate() {
@@ -2198,7 +2551,10 @@ fn translate_with_limits(
         }
     } else {
         args.push(context.into());
-        source.push_str(&format!("if (trap == 0u) f{index}({});\n", args.join(", ")));
+        source.push_str(&format!("if ({ready}) f{index}({});\n", args.join(", ")));
+    }
+    if exceptions {
+        source.push_str("if (trap == 0u && exceptions.pending != 0u) trap = 11u;\n");
     }
     if can_trap {
         source.push_str("traps[id] = trap;\n");
@@ -2226,7 +2582,38 @@ fn translate_with_limits(
                 .then(|| (name.clone(), modules[0].memory_bindings[index].unwrap()))
         })
         .collect();
+    let function_reference_types = functions
+        .iter()
+        .map(|&(module, local)| {
+            RefType::new(
+                false,
+                HeapType::Concrete(UnpackedIndex::Id(
+                    modules[module].type_ids[modules[module].function_types[local] as usize],
+                )),
+            )
+            .unwrap()
+        })
+        .collect();
+    let exported_functions = modules[0]
+        .exports
+        .iter()
+        .filter_map(|(name, &(kind, local))| {
+            (kind == ExternalKind::Func).then(|| {
+                (
+                    name.clone(),
+                    modules[0].resolved_functions[local] as u32 + 1,
+                )
+            })
+        })
+        .collect();
+    let reference_supertypes = modules
+        .iter()
+        .flat_map(|m| m.supertypes.iter().map(|(&id, &parent)| (id, parent)))
+        .collect();
     Ok(Translation {
+        function_reference_types,
+        exported_functions,
+        reference_supertypes,
         source,
         can_trap,
         params: ty.params().to_vec(),
@@ -2249,7 +2636,12 @@ fn value_words(ty: ValType) -> usize {
     if ty == ValType::V128 { 2 } else { 1 }
 }
 
-fn tail_dispatcher(order: &[usize], types: &[FuncType], call_depth: usize) -> String {
+fn tail_dispatcher(
+    order: &[usize],
+    types: &[FuncType],
+    call_depth: usize,
+    exceptions: bool,
+) -> String {
     let mut source = format!(
         "void invoke(uint target, thread ulong* input_args, thread ulong* output_results, thread ModuleState* states, thread uint& trap, uint depth) {{\nif (depth >= {call_depth}u) {{ trap = 8u; return; }}\nTailFrame tail = {{}};\nswitch (target) {{\n"
     );
@@ -2303,7 +2695,7 @@ fn tail_dispatcher(order: &[usize], types: &[FuncType], call_depth: usize) -> St
             "depth".into(),
         ]);
         source.push_str(&format!("f{function}({});\n", args.join(", ")));
-        source.push_str("if (trap != 0u) return;\nif (tail.next == 0u) {\n");
+        source.push_str(if exceptions { "if (trap != 0u || states[0].exceptions->pending != 0u) return;\nif (tail.next == 0u) {\n" } else { "if (trap != 0u) return;\nif (tail.next == 0u) {\n" });
         let mut word = 0;
         for (result, result_ty) in ty.results().iter().enumerate() {
             if *result_ty == ValType::V128 {
@@ -2320,7 +2712,8 @@ fn tail_dispatcher(order: &[usize], types: &[FuncType], call_depth: usize) -> St
 }
 
 fn is_supported_value(ty: ValType) -> bool {
-    is_numeric(ty) || ty == ValType::Ref(RefType::FUNCREF)
+    is_numeric(ty)
+        || matches!(ty, ValType::Ref(ty) if is_function_ref(ty) || matches!(ty.heap_type(), HeapType::Abstract { shared: false, ty: AbstractHeapType::Exn | AbstractHeapType::NoExn | AbstractHeapType::Extern | AbstractHeapType::NoExtern }))
 }
 
 fn const_source(expr: &ConstExpr<'_>, module: &ParsedModule<'_>) -> Result<String, Error> {
@@ -2406,13 +2799,7 @@ fn eval_const(expr: &ConstExpr<'_>, globals: &[u64], slots: &[usize]) -> Result<
             Operator::I64Const { value } => value as u64,
             Operator::F32Const { value } => value.bits() as u64,
             Operator::F64Const { value } => value.bits(),
-            Operator::RefNull {
-                hty:
-                    wasmparser::HeapType::Abstract {
-                        ty: wasmparser::AbstractHeapType::Func,
-                        ..
-                    },
-            } => 0,
+            Operator::RefNull { .. } => 0,
             Operator::RefFunc { function_index } => u64::from(function_index) + 1,
             Operator::GlobalGet { global_index } => *globals
                 .get(*slots.get(global_index as usize).ok_or_else(|| {
@@ -2492,7 +2879,6 @@ fn visit_function(
     index: usize,
     modules: &[ParsedModule<'_>],
     functions: &[(usize, usize)],
-    global_types: &[FuncType],
     state: &mut [u8],
     order: &mut Vec<usize>,
     can_trap: &mut bool,
@@ -2512,8 +2898,29 @@ fn visit_function(
     let (module_index, local) = functions[index];
     let module = &modules[module_index];
     let mut previous_constant = None;
+    let mut previous_reference = None;
     for operator in module.bodies[local - module.imports.len()].get_operators_reader()? {
         let operator = operator?;
+        let current_reference = match operator {
+            Operator::RefFunc { function_index } => {
+                Some(module.resolved_functions[function_index as usize] as u32 + 1)
+            }
+            Operator::RefNull { .. } => Some(0),
+            Operator::GlobalGet { global_index }
+                if !module.global_types[global_index as usize].mutable =>
+            {
+                let (owner, slot) = module.global_bindings[global_index as usize];
+                let provider = &modules[owner];
+                if matches!(module.global_types[global_index as usize].content_type, ValType::Ref(ty) if is_function_ref(ty))
+                    && !provider.dynamic_globals.iter().any(|(s, _, _)| *s == slot)
+                {
+                    Some(provider.instance.globals_template[slot] as u32)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
         let current_constant = match &operator {
             Operator::I32Const { value } => Some(*value as u32),
             _ => None,
@@ -2524,7 +2931,6 @@ fn visit_function(
                     module.resolved_functions[function_index as usize],
                     modules,
                     functions,
-                    global_types,
                     state,
                     order,
                     can_trap,
@@ -2543,10 +2949,14 @@ fn visit_function(
             | Operator::CallRef { type_index }
             | Operator::ReturnCallRef { type_index } => {
                 *can_trap = true;
-                let expected = &module.types[type_index as usize];
+                let expected = type_index as usize;
                 let targets: Vec<usize> = match operator {
                     Operator::CallRef { .. } | Operator::ReturnCallRef { .. } => {
-                        (0..functions.len()).collect()
+                        match previous_reference {
+                            Some(0) => Vec::new(),
+                            Some(reference) => vec![reference as usize - 1],
+                            None => (0..functions.len()).collect(),
+                        }
                     }
                     Operator::CallIndirect { table_index, .. }
                     | Operator::ReturnCallIndirect { table_index, .. } => {
@@ -2581,12 +2991,15 @@ fn visit_function(
                             }
                         }
                     }
-                    if &global_types[target] == expected {
+                    if module.accepts_function(
+                        expected,
+                        &modules[functions[target].0],
+                        functions[target].1,
+                    ) {
                         visit_function(
                             target,
                             modules,
                             functions,
-                            global_types,
                             state,
                             order,
                             can_trap,
@@ -2621,10 +3034,15 @@ fn visit_function(
             | Operator::I64TruncF32U
             | Operator::I64TruncF64S
             | Operator::I64TruncF64U
+            | Operator::RefAsNonNull
+            | Operator::Throw { .. }
+            | Operator::ThrowRef
+            | Operator::TryTable { .. }
             | Operator::Unreachable => *can_trap = true,
             _ => {}
         }
         previous_constant = current_constant;
+        previous_reference = current_reference;
     }
     state[index] = 2;
     order.push(index);
@@ -2644,7 +3062,7 @@ fn function_signature(
         .any(|ty| !is_supported_value(*ty))
     {
         return Err(Error::Unsupported(
-            "only numeric and funcref function signatures are supported".into(),
+            "unsupported function signature value type".into(),
         ));
     }
     let mut args: Vec<_> = ty
@@ -2693,10 +3111,26 @@ fn translate_body(
     tail_calls: bool,
     call_depth: usize,
     memory_bytes: usize,
+    order: &[usize],
 ) -> Result<String, Error> {
     let module = &modules[module_index];
     let body = &module.bodies[local_function - module.imports.len()];
     let ty = module.function_type(local_function)?;
+    let type_targets: Vec<HashSet<usize>> = (0..module.types.len())
+        .map(|expected| {
+            modules
+                .iter()
+                .flat_map(|actual| {
+                    (actual.imports.len()..actual.function_types.len()).filter_map(move |local| {
+                        module
+                            .accepts_function(expected, actual, local)
+                            .then_some(actual.resolved_functions[local])
+                            .filter(|f| order.contains(f))
+                    })
+                })
+                .collect()
+        })
+        .collect();
     let types = module.types.as_slice();
     let function_types = module.function_types.as_slice();
     let memories: Vec<_> = module
@@ -2734,8 +3168,12 @@ fn translate_body(
         .collect();
     let globals_mutable = module.globals_mutable.as_slice();
     let data_offsets = module.data_offsets.as_slice();
+    let exceptions = modules.iter().any(|m| m.uses_exceptions);
     let mut source = function_signature(function_index, ty, recursive, tail_calls)?;
     source.push_str(" {\n");
+    if exceptions {
+        source.push_str("thread ExceptionState& exceptions = *states[0].exceptions;\n");
+    }
     if recursive && !tail_calls {
         source.push_str(&format!(
             "if (depth >= {call_depth}u) {{ trap = 8u; return; }}\n"
@@ -2784,7 +3222,8 @@ fn translate_body(
         let (count, ty) = local?;
         if !is_supported_value(ty) {
             return Err(Error::Unsupported(
-                "only numeric and funcref locals are supported".into(),
+                "only numeric, function, external, and exception reference locals are supported"
+                    .into(),
             ));
         }
         let end = local_count
@@ -2824,6 +3263,10 @@ fn translate_body(
         module_index,
         resolved_functions: &module.resolved_functions,
         global_types,
+        type_targets,
+        tag_bindings: &module.tag_bindings,
+        tag_types: &module.tag_types,
+        exceptions,
         declarations: String::new(),
         local_count,
         local_types,
@@ -2879,6 +3322,7 @@ enum Instruction<'a> {
     Block(BlockType, Vec<Instruction<'a>>),
     Loop(BlockType, Vec<Instruction<'a>>),
     If(BlockType, Vec<Instruction<'a>>, Vec<Instruction<'a>>),
+    TryTable(TryTable, Vec<Instruction<'a>>),
 }
 
 fn read_instructions<'a>(
@@ -2902,6 +3346,13 @@ fn read_instructions<'a>(
                     return Err(Error::Unsupported("else outside if".into()));
                 }
                 instructions.push(Instruction::Loop(blockty, body));
+            }
+            Operator::TryTable { try_table } => {
+                let (body, end) = read_instructions(operators)?;
+                if end != End::Block {
+                    return Err(Error::Unsupported("else outside if".into()));
+                }
+                instructions.push(Instruction::TryTable(try_table, body));
             }
             Operator::If { blockty } => {
                 let (then_body, end) = read_instructions(operators)?;
@@ -2951,6 +3402,10 @@ struct Compiler<'a> {
     module_index: usize,
     resolved_functions: &'a [usize],
     global_types: &'a [FuncType],
+    type_targets: Vec<HashSet<usize>>,
+    tag_bindings: &'a [u32],
+    tag_types: &'a [u32],
+    exceptions: bool,
     source: String,
     declarations: String,
     local_count: usize,
@@ -2975,6 +3430,87 @@ struct Compiler<'a> {
 }
 
 impl Compiler<'_> {
+    fn flow_guard(&self) -> &'static str {
+        if self.exceptions {
+            "if (flow == 0u && exceptions.pending == 0u) {\n"
+        } else {
+            "if (flow == 0u) {\n"
+        }
+    }
+
+    fn emit_throw(&mut self, tag: u32, stack: &mut Vec<String>) -> Result<(), Error> {
+        let params = self.types[self.tag_types[tag as usize] as usize]
+            .params()
+            .to_vec();
+        if stack.len() < params.len() {
+            return Err(Error::Unsupported("missing exception payload".into()));
+        }
+        let args = stack.split_off(stack.len() - params.len());
+        self.source.push_str(&format!("if (exceptions.count >= EXCEPTION_RECORDS) {{ trap = 10u; return; }}\nexceptions.pending = ++exceptions.count;\nexceptions.tags[exceptions.pending - 1u] = {}u;\n", self.tag_bindings[tag as usize]));
+        let mut word = 0;
+        for (arg, ty) in args.iter().zip(params) {
+            if ty == ValType::V128 {
+                self.source.push_str(&format!("exceptions.values[(exceptions.pending - 1u) * EXCEPTION_WORDS + {word}u] = ({arg}).x;\nexceptions.values[(exceptions.pending - 1u) * EXCEPTION_WORDS + {}u] = ({arg}).y;\n", word + 1));
+            } else {
+                self.source.push_str(&format!("exceptions.values[(exceptions.pending - 1u) * EXCEPTION_WORDS + {word}u] = {arg};\n"));
+            }
+            word += value_words(ty);
+        }
+        Ok(())
+    }
+
+    fn emit_try_table(
+        &mut self,
+        table: &TryTable,
+        body: &[Instruction<'_>],
+        stack: &mut Vec<String>,
+    ) -> Result<(), Error> {
+        self.emit_block(table.ty, body, stack, false)?;
+        if table.catches.is_empty() {
+            return Ok(());
+        }
+        self.source.push_str("if (exceptions.pending != 0u) {\n");
+        for (index, catch) in table.catches.iter().enumerate() {
+            let (tag, label, reference) = match *catch {
+                Catch::One { tag, label } => (Some(tag), label, false),
+                Catch::OneRef { tag, label } => (Some(tag), label, true),
+                Catch::All { label } => (None, label, false),
+                Catch::AllRef { label } => (None, label, true),
+            };
+            let condition = tag.map_or_else(
+                || "true".into(),
+                |tag| {
+                    format!(
+                        "exceptions.tags[exceptions.pending - 1u] == {}u",
+                        self.tag_bindings[tag as usize]
+                    )
+                },
+            );
+            self.source.push_str(&format!(
+                "{}if ({condition}) {{\n",
+                if index == 0 { "" } else { "else " }
+            ));
+            let mut args = Vec::new();
+            if let Some(tag) = tag {
+                let mut word = 0;
+                for ty in self.types[self.tag_types[tag as usize] as usize].params() {
+                    let value = format!(
+                        "exceptions.values[(exceptions.pending - 1u) * EXCEPTION_WORDS + {word}u]"
+                    );
+                    args.push(if *ty == ValType::V128 { format!("ulong2({value}, exceptions.values[(exceptions.pending - 1u) * EXCEPTION_WORDS + {}u])", word + 1) } else { value });
+                    word += value_words(*ty);
+                }
+            }
+            if reference {
+                args.push("ulong(exceptions.pending)".into());
+            }
+            self.emit_branch(label, &args, None)?;
+            self.source.push_str("exceptions.pending = 0u;\n}\n");
+        }
+        self.source.push_str("}\n");
+        Ok(())
+    }
+
     fn emit_dispatch_call(
         &mut self,
         target: &str,
@@ -3059,11 +3595,22 @@ impl Compiler<'_> {
         }
         let args = stack.split_off(stack.len() - ty.params().len());
         if !matches!(operator, Operator::ReturnCall { .. }) {
+            let null_trap = if matches!(operator, Operator::ReturnCallRef { .. }) {
+                12
+            } else {
+                6
+            };
             self.source.push_str(&format!(
-                "if ({target} == 0ul) {{ trap = 6u; return; }}\nswitch ({target}) {{\n"
+                "if ({target} == 0ul) {{ trap = {null_trap}u; return; }}\nswitch ({target}) {{\n"
             ));
-            for (index, candidate) in self.global_types.iter().enumerate() {
-                if candidate == &ty {
+            for index in 0..self.global_types.len() {
+                if self.type_targets[match operator {
+                    Operator::ReturnCallIndirect { type_index, .. }
+                    | Operator::ReturnCallRef { type_index } => *type_index as usize,
+                    _ => unreachable!(),
+                }]
+                .contains(&index)
+                {
                     self.source
                         .push_str(&format!("case {}u: break;\n", index + 1));
                 }
@@ -3243,14 +3790,14 @@ impl Compiler<'_> {
                     .any(|ty| !is_supported_value(*ty))
                 {
                     return Err(Error::Unsupported(
-                        "only numeric and funcref block signatures are supported".into(),
+                        "unsupported block signature value type".into(),
                     ));
                 }
                 (ty.params().to_vec(), ty.results().to_vec())
             }
             _ => {
                 return Err(Error::Unsupported(
-                    "only numeric and funcref block signatures are supported".into(),
+                    "unsupported block signature value type".into(),
                 ));
             }
         };
@@ -3314,7 +3861,7 @@ impl Compiler<'_> {
             ));
         }
         if !results.is_empty() {
-            self.source.push_str("if (flow == 0u) {\n");
+            self.source.push_str(self.flow_guard());
             self.assign_slots(results, &stack[base..]);
             self.source.push_str("}\n");
         }
@@ -3335,6 +3882,36 @@ impl Compiler<'_> {
                         self.emit_branch(*relative_depth, stack, None)?;
                         reachable = false;
                         break;
+                    }
+                    Operator::Throw { tag_index } => {
+                        self.emit_throw(*tag_index, stack)?;
+                        reachable = false;
+                        break;
+                    }
+                    Operator::ThrowRef => {
+                        let reference = pop(stack)?;
+                        self.source.push_str(&format!("if ({reference} == 0ul) {{ trap = 9u; return; }}\nexceptions.pending = uint({reference});\n"));
+                        reachable = false;
+                        break;
+                    }
+                    Operator::BrOnNull { relative_depth } => {
+                        let reference = pop(stack)?;
+                        self.emit_branch(
+                            *relative_depth,
+                            stack,
+                            Some(format!("({reference} == 0ul)")),
+                        )?;
+                        stack.push(reference);
+                        true
+                    }
+                    Operator::BrOnNonNull { relative_depth } => {
+                        let reference = stack
+                            .last()
+                            .cloned()
+                            .ok_or_else(|| Error::Unsupported("missing reference".into()))?;
+                        self.emit_branch(*relative_depth, stack, Some(reference))?;
+                        pop(stack)?;
+                        true
                     }
                     Operator::BrIf { relative_depth } => {
                         let condition = pop(stack)?;
@@ -3379,7 +3956,13 @@ impl Compiler<'_> {
                     }
                     _ => {
                         self.emit_basic(operator, stack)?;
-                        false
+                        self.exceptions
+                            && matches!(
+                                operator,
+                                Operator::Call { .. }
+                                    | Operator::CallIndirect { .. }
+                                    | Operator::CallRef { .. }
+                            )
                     }
                 },
                 Instruction::Block(blockty, body) => {
@@ -3390,13 +3973,17 @@ impl Compiler<'_> {
                     self.emit_block(*blockty, body, stack, true)?;
                     true
                 }
+                Instruction::TryTable(table, body) => {
+                    self.emit_try_table(table, body, stack)?;
+                    true
+                }
                 Instruction::If(blockty, then_body, else_body) => {
                     self.emit_if(*blockty, then_body, else_body, stack)?;
                     true
                 }
             };
             if guard {
-                self.source.push_str("if (flow == 0u) {\n");
+                self.source.push_str(self.flow_guard());
                 guards += 1;
             }
         }
@@ -3459,6 +4046,10 @@ impl Compiler<'_> {
         let reachable = self.emit_instructions(body, &mut inner_stack)?;
         self.finish_path(reachable, &mut inner_stack, base, &frame.results)?;
         if loop_label {
+            if self.exceptions {
+                self.source
+                    .push_str("if (exceptions.pending != 0u) break;\n");
+            }
             self.source.push_str(&format!(
                 "if (flow == {}u) {{ flow = 0u; continue; }}\nbreak;\n",
                 frame.id
@@ -3526,13 +4117,7 @@ impl Compiler<'_> {
                     ),
                 );
             }
-            Operator::RefNull {
-                hty:
-                    wasmparser::HeapType::Abstract {
-                        ty: wasmparser::AbstractHeapType::Func,
-                        ..
-                    },
-            } => {
+            Operator::RefNull { .. } => {
                 stack.push("0ul".into());
             }
             Operator::RefFunc { function_index } => {
@@ -3540,6 +4125,13 @@ impl Compiler<'_> {
                     "{}ul",
                     self.resolved_functions[*function_index as usize] + 1
                 ));
+            }
+            Operator::RefAsNonNull => {
+                let reference = pop(stack)?;
+                self.source.push_str(&format!(
+                    "if ({reference} == 0ul) {{ trap = 9u; return; }}\n"
+                ));
+                stack.push(reference);
             }
             Operator::RefIsNull => {
                 let value = pop(stack)?;
@@ -3878,7 +4470,7 @@ impl Compiler<'_> {
                     .any(|ty| !is_supported_value(*ty))
                 {
                     return Err(Error::Unsupported(
-                        "only numeric and funcref function signatures are supported".into(),
+                        "unsupported function signature value type".into(),
                     ));
                 }
                 if stack.len() < ty.params().len() {
@@ -3910,6 +4502,53 @@ impl Compiler<'_> {
                 ));
                 stack.extend(results);
             }
+            Operator::CallRef { type_index } => {
+                let ty = self.types[*type_index as usize].clone();
+                let target = pop(stack)?;
+                if stack.len() < ty.params().len() {
+                    return Err(Error::Unsupported("call_ref argument is missing".into()));
+                }
+                let args = stack.split_off(stack.len() - ty.params().len());
+                self.source.push_str(&format!(
+                    "if ({target} == 0ul) {{ trap = 12u; return; }}\nswitch ({target}) {{\n"
+                ));
+                let results: Vec<_> = ty
+                    .results()
+                    .iter()
+                    .map(|ty| self.fresh_typed(*ty))
+                    .collect();
+                let mut targets: Vec<_> = self.type_targets[*type_index as usize]
+                    .iter()
+                    .copied()
+                    .collect();
+                targets.sort_unstable();
+                for index in targets {
+                    self.source.push_str(&format!("case {}u: {{\n", index + 1));
+                    if self.tail_calls {
+                        let mut returned = Vec::new();
+                        self.emit_dispatch_call(
+                            &format!("{index}u"),
+                            &ty,
+                            args.clone(),
+                            &mut returned,
+                        );
+                        self.assign_slots(&results, &returned);
+                    } else {
+                        let mut call_args = args.clone();
+                        call_args.extend(results.iter().cloned());
+                        call_args.extend(["states".into(), "trap".into()]);
+                        if self.recursive {
+                            call_args.push("depth + 1u".into());
+                        }
+                        self.source
+                            .push_str(&format!("f{index}({});\n", call_args.join(", ")));
+                    }
+                    self.source.push_str("break;\n}\n");
+                }
+                self.source
+                    .push_str("default: trap = 7u; return;\n}\nif (trap != 0u) return;\n");
+                stack.extend(results);
+            }
             Operator::CallIndirect {
                 type_index,
                 table_index,
@@ -3930,7 +4569,7 @@ impl Compiler<'_> {
                     .any(|ty| !is_supported_value(*ty))
                 {
                     return Err(Error::Unsupported(
-                        "only numeric and funcref indirect signatures are supported".into(),
+                        "unsupported indirect signature value type".into(),
                     ));
                 }
                 let element = pop(stack)?;
@@ -3948,8 +4587,8 @@ impl Compiler<'_> {
                     ));
                     let target = self.fresh_value();
                     self.source.push_str(&format!("{target} = table[uint({element})];\nif ({target} == 0ul) {{ trap = 6u; return; }}\nswitch ({target}) {{\n"));
-                    for (index, candidate) in self.global_types.iter().enumerate() {
-                        if candidate == &ty {
+                    for index in 0..self.global_types.len() {
+                        if self.type_targets[*type_index as usize].contains(&index) {
                             self.source
                                 .push_str(&format!("case {}u: break;\n", index + 1));
                         }
@@ -3984,8 +4623,7 @@ impl Compiler<'_> {
                     {
                         continue;
                     }
-                    let target_ty = &self.global_types[index];
-                    if target_ty != ty {
+                    if !self.type_targets[*type_index as usize].contains(&index) {
                         continue;
                     }
                     let mut call_args = args.clone();
@@ -4077,16 +4715,12 @@ impl Compiler<'_> {
                 };
                 self.emit_value(stack, expression);
             }
-            Operator::Select
-            | Operator::TypedSelect {
-                ty:
-                    ValType::I32
-                    | ValType::I64
-                    | ValType::F32
-                    | ValType::F64
-                    | ValType::V128
-                    | ValType::Ref(RefType::FUNCREF),
-            } => {
+            Operator::Select | Operator::TypedSelect { .. } => {
+                if let Operator::TypedSelect { ty } = operator
+                    && !is_supported_value(*ty)
+                {
+                    return Err(Error::Unsupported("unsupported select value type".into()));
+                }
                 let condition = pop(stack)?;
                 let rhs = pop(stack)?;
                 let lhs = pop(stack)?;
@@ -6503,6 +7137,7 @@ mod tests {
                     Value::F32(bits) => wasmtime::Val::F32(*bits),
                     Value::F64(bits) => wasmtime::Val::F64(*bits),
                     Value::V128(bits) => wasmtime::Val::V128(u128::from_le_bytes(*bits).into()),
+                    Value::FuncRef(_) => panic!("numeric differential helper received a reference"),
                 })
                 .collect();
             let mut results: Vec<_> = kernel

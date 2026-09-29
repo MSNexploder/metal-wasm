@@ -32,7 +32,15 @@ struct SuiteWorkload {
     wasmi: bool,
 }
 
-const SUITE_WORKLOADS: [SuiteWorkload; 10] = [
+const SUITE_WORKLOADS: [SuiteWorkload; 11] = [
+    SuiteWorkload {
+        name: "typed_exceptions",
+        wat: include_str!("workloads/typed_exceptions.wat"),
+        provider: None,
+        native: typed_exceptions_native,
+        counts: &[1, 1_000, 100_000, 1_000_000],
+        wasmi: false,
+    },
     SuiteWorkload {
         name: "tail_multi_resource",
         wat: include_str!("workloads/tail_multi_resource.wat"),
@@ -120,6 +128,7 @@ fn main() -> Result<()> {
         Some("--mix") => return compare_compute(false),
         Some("--control") => return compare_compute(true),
         Some("--suite") => return compare_suite(None),
+        Some("--typed-exceptions") => return compare_suite(Some("typed_exceptions")),
         Some("--simd") => return compare_suite(Some("simd_i32x4")),
         Some("--tail-multi-resource") => return compare_suite(Some("tail_multi_resource")),
         Some("--metal-native-100m") => true,
@@ -662,6 +671,26 @@ fn linked_resources_native(input: u32) -> u32 {
         global = value.rotate_left(13);
     }
     value ^ global
+}
+
+#[inline(always)]
+fn typed_exceptions_native(input: u32) -> u32 {
+    let mut value = input;
+    for round in 0..32 {
+        let argument = value ^ round;
+        if (input ^ round) & 1 == 0 {
+            value = argument.wrapping_mul(MIX_MULTIPLIER).wrapping_add(17);
+            if value & 7 == 0 {
+                value ^= OTHER_MULTIPLIER;
+            }
+        } else {
+            value = argument.rotate_left(5) ^ OTHER_MULTIPLIER;
+            if value & 7 == 0 {
+                value = value.wrapping_add(MIX_MULTIPLIER);
+            }
+        }
+    }
+    value
 }
 
 #[inline(always)]
