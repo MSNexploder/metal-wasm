@@ -52,3 +52,16 @@ Run `cargo run --release --example compare -- --control` for the same counts wit
 Run `cargo run --release --example compare -- --suite` for eleven workloads. The original `dispatch_i64`, `float_f64`, and `stateful_memory` cases remain. `bulk_start` uses a start function and bulk memory operations; `recursive_calls` uses variable-depth recursion; `mutable_table` uses passive elements, table updates, and indirect calls; `imported_calls` links a separate Wasm provider module; `linked_resources` imports and mutates provider memory, a global, and a table. `simd_i32x4` runs 32 rounds of four-lane integer arithmetic and a lane reduction. `typed_exceptions` runs 32 rounds of typed function dispatch, divergent branches, and payload throws and catches. `tail_multi_resource` combines tail calls, extended constants, two memories, a 64-bit memory, and a 64-bit table. Run `cargo run --release --example compare -- --simd`, `--tail-multi-resource`, or `--typed-exceptions` to measure one workload. Their definitions are in `examples/workloads/`. Each workload is checked against optimized native Rust and Wasmtime; Wasmi is omitted for the SIMD and new feature workloads because this version does not support their Wasm features. This mode reports the median of three single-run samples at 1, 1,000, 100,000, and 1,000,000 invocations, except the four memory workloads, which use 1, 1,000, 4,096, and 10,000 to exercise bounded dispatches.
 
 The timed region includes result allocation and execution. Metal also includes per-lane state initialization, input transfer, command submission, and result transfer. Module compilation, CPU engine instantiation, warmup, input generation, and result verification are outside the timed region. Wasmtime and Wasmi reuse one instance per module and make one typed host call per input; the stateful and linked-resource workloads reset their touched state for each call. Metal batches one or more dispatches and runs each start function per lane. Thus `bulk_start` includes per-lane start work on Metal, while CPU start work occurs outside the timed region. These figures compare these APIs for these workloads, not peak engine or GPU throughput.
+
+## Recorded benchmark results
+
+The [full suite results](examples/benchmark-results.csv) were measured on 2026-09-29 with an Apple M1 Max, 64 GB RAM, macOS 27.0, and a release build. Each row reports the median of three samples. The new workload produced these times in milliseconds:
+
+| Invocations | Metal total | Metal GPU | Wasmtime | Native Rust |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.33546 | 0.06788 | 0.00221 | 0.00008 |
+| 1,000 | 0.36154 | 0.11171 | 2.37525 | 0.06308 |
+| 100,000 | 1.67938 | 1.01913 | 244.14717 | 6.22700 |
+| 1,000,000 | 10.11383 | 7.76488 | 2435.34258 | 62.58004 |
+
+Wasmtime 49.0.1 uses its `gc-null` collector in this build; the enabled `gc` feature permits typed references and exceptions. Wasmi is omitted for this workload because it does not support these features in this build. Native Rust uses equivalent arithmetic and recovery branches. At one million inputs, Metal total time is about 6.2× faster than native Rust. At 1 and 1,000 inputs, native Rust is faster. Metal GPU time includes kernel work and GPU memory access. The API and timing differences described above apply.
