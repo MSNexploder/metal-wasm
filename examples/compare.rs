@@ -32,7 +32,15 @@ struct SuiteWorkload {
     wasmi: bool,
 }
 
-const SUITE_WORKLOADS: [SuiteWorkload; 9] = [
+const SUITE_WORKLOADS: [SuiteWorkload; 10] = [
+    SuiteWorkload {
+        name: "tail_multi_resource",
+        wat: include_str!("workloads/tail_multi_resource.wat"),
+        provider: None,
+        native: tail_multi_resource_native,
+        counts: &[1, 1_000, 4_096, 10_000],
+        wasmi: false,
+    },
     SuiteWorkload {
         name: "simd_i32x4",
         wat: include_str!("workloads/simd_i32x4.wat"),
@@ -111,8 +119,9 @@ fn main() -> Result<()> {
     let large = match std::env::args().nth(1).as_deref() {
         Some("--mix") => return compare_compute(false),
         Some("--control") => return compare_compute(true),
-        Some("--suite") => return compare_suite(false),
-        Some("--simd") => return compare_suite(true),
+        Some("--suite") => return compare_suite(None),
+        Some("--simd") => return compare_suite(Some("simd_i32x4")),
+        Some("--tail-multi-resource") => return compare_suite(Some("tail_multi_resource")),
         Some("--metal-native-100m") => true,
         Some(argument) => return Err(format!("unknown argument: {argument}").into()),
         None => false,
@@ -291,10 +300,10 @@ fn compare_compute(control: bool) -> Result<()> {
     Ok(())
 }
 
-fn compare_suite(only_simd: bool) -> Result<()> {
+fn compare_suite(filter: Option<&str>) -> Result<()> {
     println!("workload,count,metal_total_us,metal_gpu_us,wasmtime_us,wasmi_us,native_us,samples");
     for workload in &SUITE_WORKLOADS {
-        if only_simd && workload.name != "simd_i32x4" {
+        if filter.is_some_and(|name| workload.name != name) {
             continue;
         }
         let wasm = wat::parse_str(workload.wat)?;
@@ -588,6 +597,16 @@ fn recursive_native(input: u32) -> u32 {
         }
     }
     step((input & 15) + 8, input)
+}
+
+#[inline(always)]
+fn tail_multi_resource_native(mut value: u32) -> u32 {
+    for _ in 0..16 {
+        let first = value as u8 as u32;
+        let second = value as u8 as u32;
+        value = ((value.rotate_left(5) ^ first).wrapping_add(second)).wrapping_mul(40);
+    }
+    value
 }
 
 #[inline(always)]
