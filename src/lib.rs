@@ -54,7 +54,7 @@ pub struct Kernel {
     results: Vec<ValType>,
     memory_template: Option<Vec<u8>>,
     memory_capacity: Option<usize>,
-    globals_template: Vec<u32>,
+    globals_template: Vec<u64>,
 }
 
 struct Translation {
@@ -64,7 +64,7 @@ struct Translation {
     results: Vec<ValType>,
     memory_template: Option<Vec<u8>>,
     memory_capacity: Option<usize>,
-    globals_template: Vec<u32>,
+    globals_template: Vec<u64>,
 }
 
 /// An error while validating, compiling, or running a WebAssembly export.
@@ -85,8 +85,10 @@ impl Kernel {
         let translation = translate(wasm, export)?;
         let device = Device::system_default()
             .ok_or_else(|| Error::Metal("no Metal device is available".into()))?;
+        let options = CompileOptions::new();
+        options.set_fast_math_enabled(false);
         let library = device
-            .new_library_with_source(&translation.source, &CompileOptions::new())
+            .new_library_with_source(&translation.source, &options)
             .map_err(Error::Metal)?;
         let function = library
             .get_function("run_wasm", None)
@@ -230,7 +232,7 @@ impl Kernel {
             .globals_template
             .len()
             .checked_mul(count as usize)
-            .and_then(|values| values.checked_mul(size_of::<u32>()))
+            .and_then(|values| values.checked_mul(size_of::<u64>()))
             .ok_or_else(|| Error::Unsupported("globals buffer size overflow".into()))?;
         if self.memory_template.is_some() && memory_bytes == 0 {
             return Err(Error::Unsupported("memory buffer size overflow".into()));
@@ -262,7 +264,7 @@ impl Kernel {
             None
         } else {
             let mut data = Vec::new();
-            data.try_reserve_exact(globals_bytes / size_of::<u32>())
+            data.try_reserve_exact(globals_bytes / size_of::<u64>())
                 .map_err(|_| Error::Unsupported("cannot allocate per-lane globals".into()))?;
             for _ in 0..count {
                 data.extend_from_slice(&self.globals_template);
@@ -355,6 +357,7 @@ impl Kernel {
                     2 => "integer overflow",
                     3 => "unreachable executed",
                     4 => "out of bounds memory access",
+                    5 => "invalid conversion to integer",
                     _ => "unknown trap",
                 };
                 return Err(Error::Trap {
@@ -456,12 +459,12 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
             Payload::GlobalSection(section) => {
                 for global in section {
                     let global = global?;
-                    if global.ty.content_type != ValType::I32 || global.ty.shared {
+                    if !is_numeric(global.ty.content_type) || global.ty.shared {
                         return Err(Error::Unsupported(
-                            "only unshared i32 globals are supported".into(),
+                            "only unshared numeric globals are supported".into(),
                         ));
                     }
-                    globals_template.push(eval_i32_const(&global.init_expr, &globals_template)?);
+                    globals_template.push(eval_const(&global.init_expr, &globals_template)?);
                     globals_mutable.push(global.ty.mutable);
                 }
             }
@@ -477,7 +480,7 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
                             "only active data for memory 0 is supported".into(),
                         ));
                     };
-                    let offset = eval_i32_const(&offset_expr, &globals_template)? as usize;
+                    let offset = eval_const(&offset_expr, &globals_template)? as u32 as usize;
                     let memory = memory_template
                         .as_mut()
                         .ok_or_else(|| Error::Unsupported("data without memory".into()))?;
@@ -552,6 +555,8 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
     });
 
     let mut source = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
+    source.push_str(include_str!("softfloat64.metal"));
+    source.push_str(include_str!("wasm_float.metal"));
     for &function_index in &order {
         let ty = &types[function_types[function_index] as usize];
         source.push_str(&function_signature(
@@ -585,7 +590,7 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
         source.push_str(", device uint* pages [[buffer(6)]]");
     }
     if !globals_template.is_empty() {
-        source.push_str(", device uint* globals [[buffer(5)]]");
+        source.push_str(", device ulong* globals [[buffer(5)]]");
     }
     source.push_str(", uint id [[thread_position_in_grid]]) {\n");
     source.push_str("if (id >= count) return;\nuint trap = 0u;\n");
@@ -596,10 +601,10 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
         } else {
             format!("id * {}u + {param}u", ty.params().len())
         };
-        args.push(format!("uint(input[{offset}])"));
+        args.push(format!("ulong(input[{offset}])"));
     }
     for result in 0..ty.results().len() {
-        source.push_str(&format!("uint result{result} = 0u;\n"));
+        source.push_str(&format!("ulong result{result} = 0ul;\n"));
         args.push(format!("result{result}"));
     }
     if memory_template.is_some() {
@@ -640,17 +645,27 @@ fn translate(wasm: &[u8], export_name: &str) -> Result<Translation, Error> {
     })
 }
 
-fn eval_i32_const(expr: &ConstExpr<'_>, globals: &[u32]) -> Result<u32, Error> {
+fn is_numeric(ty: ValType) -> bool {
+    matches!(
+        ty,
+        ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64
+    )
+}
+
+fn eval_const(expr: &ConstExpr<'_>, globals: &[u64]) -> Result<u64, Error> {
     let mut operators = expr.get_operators_reader().into_iter();
     let value = match operators.next().transpose()? {
-        Some(Operator::I32Const { value }) => value as u32,
+        Some(Operator::I32Const { value }) => value as u32 as u64,
+        Some(Operator::I64Const { value }) => value as u64,
+        Some(Operator::F32Const { value }) => value.bits() as u64,
+        Some(Operator::F64Const { value }) => value.bits(),
         Some(Operator::GlobalGet { global_index }) => *globals
             .get(global_index as usize)
             .ok_or_else(|| Error::Unsupported("constant global index is out of range".into()))?,
-        _ => return Err(Error::Unsupported("unsupported i32 initializer".into())),
+        _ => return Err(Error::Unsupported("unsupported numeric initializer".into())),
     };
     if !matches!(operators.next().transpose()?, Some(Operator::End)) || operators.next().is_some() {
-        return Err(Error::Unsupported("unsupported i32 initializer".into()));
+        return Err(Error::Unsupported("unsupported numeric initializer".into()));
     }
     Ok(value)
 }
@@ -691,6 +706,18 @@ fn visit_function(
             | Operator::I32DivU
             | Operator::I32RemS
             | Operator::I32RemU
+            | Operator::I64DivS
+            | Operator::I64DivU
+            | Operator::I64RemS
+            | Operator::I64RemU
+            | Operator::I32TruncF32S
+            | Operator::I32TruncF32U
+            | Operator::I32TruncF64S
+            | Operator::I32TruncF64U
+            | Operator::I64TruncF32S
+            | Operator::I64TruncF32U
+            | Operator::I64TruncF64S
+            | Operator::I64TruncF64U
             | Operator::Unreachable => *can_trap = true,
             _ => {}
         }
@@ -710,30 +737,30 @@ fn function_signature(
         .params()
         .iter()
         .chain(ty.results())
-        .any(|ty| *ty != ValType::I32)
+        .any(|ty| !is_numeric(*ty))
     {
         return Err(Error::Unsupported(
-            "only i32 function signatures are supported".into(),
+            "only numeric function signatures are supported".into(),
         ));
     }
     let mut args: Vec<_> = ty
         .params()
         .iter()
         .enumerate()
-        .map(|(index, _)| format!("uint a{index}"))
+        .map(|(index, _)| format!("ulong a{index}"))
         .collect();
     args.extend(
         ty.results()
             .iter()
             .enumerate()
-            .map(|(index, _)| format!("thread uint& r{index}")),
+            .map(|(index, _)| format!("thread ulong& r{index}")),
     );
     if has_memory {
         args.push("device uchar* memory".into());
         args.push("device uint* pages".into());
     }
     if has_globals {
-        args.push("device uint* globals".into());
+        args.push("device ulong* globals".into());
     }
     args.push("thread uint& trap".into());
     Ok(format!("void f{index}({})", args.join(", ")))
@@ -757,19 +784,21 @@ fn translate_body(
     )?;
     source.push_str(" {\n");
     for index in 0..ty.params().len() {
-        source.push_str(&format!("uint l{index} = a{index};\n"));
+        source.push_str(&format!("ulong l{index} = a{index};\n"));
     }
     let mut local_count = ty.params().len();
     for local in body.get_locals_reader()? {
         let (count, ty) = local?;
-        if ty != ValType::I32 {
-            return Err(Error::Unsupported("only i32 locals are supported".into()));
+        if !is_numeric(ty) {
+            return Err(Error::Unsupported(
+                "only numeric locals are supported".into(),
+            ));
         }
         let end = local_count
             .checked_add(count as usize)
             .ok_or_else(|| Error::Unsupported("too many locals".into()))?;
         for index in local_count..end {
-            source.push_str(&format!("uint l{index} = 0u;\n"));
+            source.push_str(&format!("ulong l{index} = 0ul;\n"));
         }
         local_count = end;
     }
@@ -892,7 +921,8 @@ impl Compiler<'_> {
     fn fresh_value(&mut self) -> String {
         let name = format!("v{}", self.next_value);
         self.next_value += 1;
-        self.declarations.push_str(&format!("uint {name} = 0u;\n"));
+        self.declarations
+            .push_str(&format!("ulong {name} = 0ul;\n"));
         name
     }
 
@@ -919,39 +949,43 @@ impl Compiler<'_> {
             memarg.offset
         ));
         self.source.push_str(&format!(
-            "{index} = uint(ulong({address}) + {}ul);\n",
+            "{index} = ulong({address}) + {}ul;\n",
             memarg.offset
         ));
         Ok(index)
     }
 
-    fn emit_i32_load(
+    fn emit_load(
         &mut self,
         stack: &mut Vec<String>,
         memarg: &wasmparser::MemArg,
         width: usize,
         signed: bool,
+        result_bits: usize,
     ) -> Result<(), Error> {
         let address = pop(stack)?;
         let index = self.memory_address(&address, memarg, width)?;
         let value = self.fresh_value();
         for byte in 0..width {
             self.source.push_str(&format!(
-                "{value} |= uint(memory[ulong({index}) + {byte}ul]) << {}u;\n",
+                "{value} |= ulong(memory[ulong({index}) + {byte}ul]) << {}u;\n",
                 byte * 8
             ));
         }
-        if signed && width < 4 {
-            let shift = (4 - width) * 8;
-            self.source.push_str(&format!(
-                "{value} = as_type<uint>(as_type<int>({value} << {shift}u) >> {shift}u);\n"
-            ));
+        if signed && width * 8 < result_bits {
+            let shift = result_bits - width * 8;
+            let expression = if result_bits == 32 {
+                format!("as_type<uint>(as_type<int>(uint({value}) << {shift}u) >> {shift}u)")
+            } else {
+                format!("as_type<ulong>(as_type<long>({value} << {shift}u) >> {shift}u)")
+            };
+            self.source.push_str(&format!("{value} = {expression};\n"));
         }
         stack.push(value);
         Ok(())
     }
 
-    fn emit_i32_store(
+    fn emit_store(
         &mut self,
         stack: &mut Vec<String>,
         memarg: &wasmparser::MemArg,
@@ -972,7 +1006,7 @@ impl Compiler<'_> {
     fn new_frame(&mut self, blockty: BlockType, loop_label: bool) -> Result<Frame, Error> {
         let (params, results) = match blockty {
             BlockType::Empty => (0, 0),
-            BlockType::Type(ValType::I32) => (0, 1),
+            BlockType::Type(ty) if is_numeric(ty) => (0, 1),
             BlockType::FuncType(index) => {
                 let ty = self
                     .types
@@ -982,17 +1016,17 @@ impl Compiler<'_> {
                     .params()
                     .iter()
                     .chain(ty.results())
-                    .any(|ty| *ty != ValType::I32)
+                    .any(|ty| !is_numeric(*ty))
                 {
                     return Err(Error::Unsupported(
-                        "only i32 block signatures are supported".into(),
+                        "only numeric block signatures are supported".into(),
                     ));
                 }
                 (ty.params().len(), ty.results().len())
             }
             _ => {
                 return Err(Error::Unsupported(
-                    "only i32 block signatures are supported".into(),
+                    "only numeric block signatures are supported".into(),
                 ));
             }
         };
@@ -1242,7 +1276,10 @@ impl Compiler<'_> {
     ) -> Result<(), Error> {
         match operator {
             Operator::Nop => {}
-            Operator::I32Const { value } => stack.push(format!("{}u", *value as u32)),
+            Operator::I32Const { value } => stack.push(format!("{}ul", *value as u32)),
+            Operator::I64Const { value } => stack.push(format!("{}ul", *value as u64)),
+            Operator::F32Const { value } => stack.push(format!("{}ul", value.bits())),
+            Operator::F64Const { value } => stack.push(format!("{}ul", value.bits())),
             Operator::GlobalGet { global_index } => {
                 let index = *global_index as usize;
                 if index >= self.globals_mutable.len() {
@@ -1259,14 +1296,34 @@ impl Compiler<'_> {
                 self.source
                     .push_str(&format!("globals[{index}u] = {value};\n"));
             }
-            Operator::I32Load { memarg } => self.emit_i32_load(stack, memarg, 4, false)?,
-            Operator::I32Load8U { memarg } => self.emit_i32_load(stack, memarg, 1, false)?,
-            Operator::I32Load8S { memarg } => self.emit_i32_load(stack, memarg, 1, true)?,
-            Operator::I32Load16U { memarg } => self.emit_i32_load(stack, memarg, 2, false)?,
-            Operator::I32Load16S { memarg } => self.emit_i32_load(stack, memarg, 2, true)?,
-            Operator::I32Store { memarg } => self.emit_i32_store(stack, memarg, 4)?,
-            Operator::I32Store8 { memarg } => self.emit_i32_store(stack, memarg, 1)?,
-            Operator::I32Store16 { memarg } => self.emit_i32_store(stack, memarg, 2)?,
+            Operator::I32Load { memarg } | Operator::F32Load { memarg } => {
+                self.emit_load(stack, memarg, 4, false, 32)?
+            }
+            Operator::I64Load { memarg } | Operator::F64Load { memarg } => {
+                self.emit_load(stack, memarg, 8, false, 64)?
+            }
+            Operator::I32Load8U { memarg } => self.emit_load(stack, memarg, 1, false, 32)?,
+            Operator::I32Load8S { memarg } => self.emit_load(stack, memarg, 1, true, 32)?,
+            Operator::I32Load16U { memarg } => self.emit_load(stack, memarg, 2, false, 32)?,
+            Operator::I32Load16S { memarg } => self.emit_load(stack, memarg, 2, true, 32)?,
+            Operator::I64Load8U { memarg } => self.emit_load(stack, memarg, 1, false, 64)?,
+            Operator::I64Load8S { memarg } => self.emit_load(stack, memarg, 1, true, 64)?,
+            Operator::I64Load16U { memarg } => self.emit_load(stack, memarg, 2, false, 64)?,
+            Operator::I64Load16S { memarg } => self.emit_load(stack, memarg, 2, true, 64)?,
+            Operator::I64Load32U { memarg } => self.emit_load(stack, memarg, 4, false, 64)?,
+            Operator::I64Load32S { memarg } => self.emit_load(stack, memarg, 4, true, 64)?,
+            Operator::I32Store { memarg }
+            | Operator::F32Store { memarg }
+            | Operator::I64Store32 { memarg } => self.emit_store(stack, memarg, 4)?,
+            Operator::I64Store { memarg } | Operator::F64Store { memarg } => {
+                self.emit_store(stack, memarg, 8)?
+            }
+            Operator::I32Store8 { memarg } | Operator::I64Store8 { memarg } => {
+                self.emit_store(stack, memarg, 1)?
+            }
+            Operator::I32Store16 { memarg } | Operator::I64Store16 { memarg } => {
+                self.emit_store(stack, memarg, 2)?
+            }
             Operator::MemorySize { mem: 0 } => {
                 self.memory_bytes
                     .ok_or_else(|| Error::Unsupported("memory is missing".into()))?;
@@ -1279,7 +1336,7 @@ impl Compiler<'_> {
                 let delta = pop(stack)?;
                 let prior = self.fresh_value();
                 self.source.push_str(&format!(
-                    "{prior} = pages[0];\nif ({delta} <= {}u - pages[0]) pages[0] += {delta}; else {prior} = 4294967295u;\n",
+                    "{prior} = pages[0];\nif ({delta} <= ulong({}u - pages[0])) pages[0] += uint({delta}); else {prior} = 4294967295ul;\n",
                     capacity / 65536
                 ));
                 stack.push(prior);
@@ -1298,10 +1355,10 @@ impl Compiler<'_> {
                     .params()
                     .iter()
                     .chain(ty.results())
-                    .any(|ty| *ty != ValType::I32)
+                    .any(|ty| !is_numeric(*ty))
                 {
                     return Err(Error::Unsupported(
-                        "only i32 function signatures are supported".into(),
+                        "only numeric function signatures are supported".into(),
                     ));
                 }
                 if stack.len() < ty.params().len() {
@@ -1347,6 +1404,10 @@ impl Compiler<'_> {
                 let value = pop(stack)?;
                 self.emit_value(stack, format!("uint({value} == 0u)"));
             }
+            Operator::I64Eqz => {
+                let value = pop(stack)?;
+                self.emit_value(stack, format!("uint({value} == 0ul)"));
+            }
             Operator::I32Clz
             | Operator::I32Ctz
             | Operator::I32Popcnt
@@ -1354,20 +1415,47 @@ impl Compiler<'_> {
             | Operator::I32Extend16S => {
                 let value = pop(stack)?;
                 let expression = match operator {
-                    Operator::I32Clz => format!("({value} == 0u ? 32u : clz({value}))"),
-                    Operator::I32Ctz => format!("({value} == 0u ? 32u : ctz({value}))"),
-                    Operator::I32Popcnt => format!("popcount({value})"),
+                    Operator::I32Clz => format!("({value} == 0u ? 32u : clz(uint({value})))"),
+                    Operator::I32Ctz => format!("({value} == 0u ? 32u : ctz(uint({value})))"),
+                    Operator::I32Popcnt => format!("popcount(uint({value}))"),
                     Operator::I32Extend8S => {
-                        format!("as_type<uint>(as_type<int>({value} << 24u) >> 24u)")
+                        format!("as_type<uint>(as_type<int>(uint({value}) << 24u) >> 24u)")
                     }
                     Operator::I32Extend16S => {
-                        format!("as_type<uint>(as_type<int>({value} << 16u) >> 16u)")
+                        format!("as_type<uint>(as_type<int>(uint({value}) << 16u) >> 16u)")
                     }
                     _ => unreachable!(),
                 };
                 self.emit_value(stack, expression);
             }
-            Operator::Select | Operator::TypedSelect { ty: ValType::I32 } => {
+            Operator::I64Clz
+            | Operator::I64Ctz
+            | Operator::I64Popcnt
+            | Operator::I64Extend8S
+            | Operator::I64Extend16S
+            | Operator::I64Extend32S => {
+                let value = pop(stack)?;
+                let expression = match operator {
+                    Operator::I64Clz => format!("({value} == 0ul ? 64ul : ulong(clz({value})))"),
+                    Operator::I64Ctz => format!("({value} == 0ul ? 64ul : ulong(ctz({value})))"),
+                    Operator::I64Popcnt => format!("ulong(popcount({value}))"),
+                    Operator::I64Extend8S => {
+                        format!("as_type<ulong>(as_type<long>({value} << 56u) >> 56u)")
+                    }
+                    Operator::I64Extend16S => {
+                        format!("as_type<ulong>(as_type<long>({value} << 48u) >> 48u)")
+                    }
+                    Operator::I64Extend32S => {
+                        format!("as_type<ulong>(as_type<long>({value} << 32u) >> 32u)")
+                    }
+                    _ => unreachable!(),
+                };
+                self.emit_value(stack, expression);
+            }
+            Operator::Select
+            | Operator::TypedSelect {
+                ty: ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64,
+            } => {
                 let condition = pop(stack)?;
                 let rhs = pop(stack)?;
                 let lhs = pop(stack)?;
@@ -1398,8 +1486,8 @@ impl Compiler<'_> {
             | Operator::I32LeU
             | Operator::I32GeS
             | Operator::I32GeU => {
-                let rhs = pop(stack)?;
-                let lhs = pop(stack)?;
+                let rhs = format!("uint({})", pop(stack)?);
+                let lhs = format!("uint({})", pop(stack)?);
                 if matches!(
                     operator,
                     Operator::I32DivS | Operator::I32DivU | Operator::I32RemS | Operator::I32RemU
@@ -1451,6 +1539,334 @@ impl Compiler<'_> {
                     _ => unreachable!(),
                 };
                 self.emit_value(stack, expression);
+            }
+            Operator::I64Add
+            | Operator::I64Sub
+            | Operator::I64Mul
+            | Operator::I64DivS
+            | Operator::I64DivU
+            | Operator::I64RemS
+            | Operator::I64RemU
+            | Operator::I64And
+            | Operator::I64Or
+            | Operator::I64Xor
+            | Operator::I64Shl
+            | Operator::I64ShrU
+            | Operator::I64ShrS
+            | Operator::I64Rotl
+            | Operator::I64Rotr
+            | Operator::I64Eq
+            | Operator::I64Ne
+            | Operator::I64LtS
+            | Operator::I64LtU
+            | Operator::I64GtS
+            | Operator::I64GtU
+            | Operator::I64LeS
+            | Operator::I64LeU
+            | Operator::I64GeS
+            | Operator::I64GeU => {
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                if matches!(
+                    operator,
+                    Operator::I64DivS | Operator::I64DivU | Operator::I64RemS | Operator::I64RemU
+                ) {
+                    self.source
+                        .push_str(&format!("if ({rhs} == 0ul) {{ trap = 1u; return; }}\n"));
+                }
+                if matches!(operator, Operator::I64DivS) {
+                    self.source.push_str(&format!("if ({lhs} == 9223372036854775808ul && {rhs} == 18446744073709551615ul) {{ trap = 2u; return; }}\n"));
+                }
+                let expression = match operator {
+                    Operator::I64Add => format!("{lhs} + {rhs}"),
+                    Operator::I64Sub => format!("{lhs} - {rhs}"),
+                    Operator::I64Mul => format!("{lhs} * {rhs}"),
+                    Operator::I64DivS => {
+                        format!("as_type<ulong>(as_type<long>({lhs}) / as_type<long>({rhs}))")
+                    }
+                    Operator::I64DivU => format!("{lhs} / {rhs}"),
+                    Operator::I64RemS => format!(
+                        "({lhs} == 9223372036854775808ul && {rhs} == 18446744073709551615ul ? 0ul : as_type<ulong>(as_type<long>({lhs}) % as_type<long>({rhs})))"
+                    ),
+                    Operator::I64RemU => format!("{lhs} % {rhs}"),
+                    Operator::I64And => format!("{lhs} & {rhs}"),
+                    Operator::I64Or => format!("{lhs} | {rhs}"),
+                    Operator::I64Xor => format!("{lhs} ^ {rhs}"),
+                    Operator::I64Shl => format!("{lhs} << ({rhs} & 63ul)"),
+                    Operator::I64ShrU => format!("{lhs} >> ({rhs} & 63ul)"),
+                    Operator::I64ShrS => {
+                        format!("as_type<ulong>(as_type<long>({lhs}) >> ({rhs} & 63ul))")
+                    }
+                    Operator::I64Rotl => format!(
+                        "({lhs} << ({rhs} & 63ul)) | ({lhs} >> ((64ul - ({rhs} & 63ul)) & 63ul))"
+                    ),
+                    Operator::I64Rotr => format!(
+                        "({lhs} >> ({rhs} & 63ul)) | ({lhs} << ((64ul - ({rhs} & 63ul)) & 63ul))"
+                    ),
+                    Operator::I64Eq => format!("uint({lhs} == {rhs})"),
+                    Operator::I64Ne => format!("uint({lhs} != {rhs})"),
+                    Operator::I64LtS => {
+                        format!("uint(as_type<long>({lhs}) < as_type<long>({rhs}))")
+                    }
+                    Operator::I64LtU => format!("uint({lhs} < {rhs})"),
+                    Operator::I64GtS => {
+                        format!("uint(as_type<long>({lhs}) > as_type<long>({rhs}))")
+                    }
+                    Operator::I64GtU => format!("uint({lhs} > {rhs})"),
+                    Operator::I64LeS => {
+                        format!("uint(as_type<long>({lhs}) <= as_type<long>({rhs}))")
+                    }
+                    Operator::I64LeU => format!("uint({lhs} <= {rhs})"),
+                    Operator::I64GeS => {
+                        format!("uint(as_type<long>({lhs}) >= as_type<long>({rhs}))")
+                    }
+                    Operator::I64GeU => format!("uint({lhs} >= {rhs})"),
+                    _ => unreachable!(),
+                };
+                self.emit_value(stack, expression);
+            }
+            Operator::F32Abs
+            | Operator::F32Neg
+            | Operator::F32Ceil
+            | Operator::F32Floor
+            | Operator::F32Trunc
+            | Operator::F32Nearest
+            | Operator::F32Sqrt
+            | Operator::F64Abs
+            | Operator::F64Neg
+            | Operator::F64Ceil
+            | Operator::F64Floor
+            | Operator::F64Trunc
+            | Operator::F64Nearest
+            | Operator::F64Sqrt => {
+                let value = pop(stack)?;
+                let expression = match operator {
+                    Operator::F32Abs => format!("uint({value}) & 0x7fffffffu"),
+                    Operator::F32Neg => format!("uint({value}) ^ 0x80000000u"),
+                    Operator::F32Ceil => format!(
+                        "__softfloat64_cvt_f64_to_f32(wasm_f64_ceil(__softfloat64_cvt_f32_to_f64(uint({value}))), 0u)"
+                    ),
+                    Operator::F32Floor => format!(
+                        "__softfloat64_cvt_f64_to_f32(wasm_f64_floor(__softfloat64_cvt_f32_to_f64(uint({value}))), 0u)"
+                    ),
+                    Operator::F32Trunc => format!(
+                        "__softfloat64_cvt_f64_to_f32(wasm_f64_trunc(__softfloat64_cvt_f32_to_f64(uint({value}))), 0u)"
+                    ),
+                    Operator::F32Nearest => format!(
+                        "__softfloat64_cvt_f64_to_f32(wasm_f64_nearest(__softfloat64_cvt_f32_to_f64(uint({value}))), 0u)"
+                    ),
+                    Operator::F32Sqrt => format!("wasm_f32_sqrt(uint({value}))"),
+                    Operator::F64Abs => format!("{value} & 0x7ffffffffffffffful"),
+                    Operator::F64Neg => format!("{value} ^ 0x8000000000000000ul"),
+                    Operator::F64Ceil => format!("wasm_f64_ceil({value})"),
+                    Operator::F64Floor => format!("wasm_f64_floor({value})"),
+                    Operator::F64Trunc => format!("wasm_f64_trunc({value})"),
+                    Operator::F64Nearest => format!("wasm_f64_nearest({value})"),
+                    Operator::F64Sqrt => format!("__softfloat64_fsqrt({value}, 0u)"),
+                    _ => unreachable!(),
+                };
+                self.emit_value(stack, expression);
+            }
+            Operator::F32Add
+            | Operator::F32Sub
+            | Operator::F32Mul
+            | Operator::F32Div
+            | Operator::F32Min
+            | Operator::F32Max
+            | Operator::F32Copysign
+            | Operator::F32Eq
+            | Operator::F32Ne
+            | Operator::F32Lt
+            | Operator::F32Gt
+            | Operator::F32Le
+            | Operator::F32Ge
+            | Operator::F64Add
+            | Operator::F64Sub
+            | Operator::F64Mul
+            | Operator::F64Div
+            | Operator::F64Min
+            | Operator::F64Max
+            | Operator::F64Copysign
+            | Operator::F64Eq
+            | Operator::F64Ne
+            | Operator::F64Lt
+            | Operator::F64Gt
+            | Operator::F64Le
+            | Operator::F64Ge => {
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                let a = format!("__softfloat64_cvt_f32_to_f64(uint({lhs}))");
+                let b = format!("__softfloat64_cvt_f32_to_f64(uint({rhs}))");
+                let expression = match operator {
+                    Operator::F32Add => format!("wasm_f32_add(uint({lhs}), uint({rhs}))"),
+                    Operator::F32Sub => format!("wasm_f32_sub(uint({lhs}), uint({rhs}))"),
+                    Operator::F32Mul => format!("wasm_f32_mul(uint({lhs}), uint({rhs}))"),
+                    Operator::F32Div => format!("wasm_f32_div(uint({lhs}), uint({rhs}))"),
+                    Operator::F32Min => format!("wasm_f32_min(uint({lhs}), uint({rhs}))"),
+                    Operator::F32Max => format!("wasm_f32_max(uint({lhs}), uint({rhs}))"),
+                    Operator::F32Copysign => {
+                        format!("(uint({lhs}) & 0x7fffffffu) | (uint({rhs}) & 0x80000000u)")
+                    }
+                    Operator::F32Eq => format!("uint(__softfloat64_feq({a}, {b}))"),
+                    Operator::F32Ne => format!("uint(!__softfloat64_feq({a}, {b}))"),
+                    Operator::F32Lt => format!("uint(__softfloat64_flt({a}, {b}))"),
+                    Operator::F32Gt => format!("uint(__softfloat64_fgt({a}, {b}))"),
+                    Operator::F32Le => format!("uint(__softfloat64_fle({a}, {b}))"),
+                    Operator::F32Ge => format!("uint(__softfloat64_fge({a}, {b}))"),
+                    Operator::F64Add => format!("__softfloat64_fadd({lhs}, {rhs}, 0u)"),
+                    Operator::F64Sub => format!("__softfloat64_fsub({lhs}, {rhs}, 0u)"),
+                    Operator::F64Mul => format!("__softfloat64_fmul({lhs}, {rhs}, 0u)"),
+                    Operator::F64Div => format!("__softfloat64_fdiv({lhs}, {rhs}, 0u)"),
+                    Operator::F64Min => format!("wasm_f64_min({lhs}, {rhs})"),
+                    Operator::F64Max => format!("wasm_f64_max({lhs}, {rhs})"),
+                    Operator::F64Copysign => {
+                        format!("({lhs} & 0x7ffffffffffffffful) | ({rhs} & 0x8000000000000000ul)")
+                    }
+                    Operator::F64Eq => format!("uint(__softfloat64_feq({lhs}, {rhs}))"),
+                    Operator::F64Ne => format!("uint(!__softfloat64_feq({lhs}, {rhs}))"),
+                    Operator::F64Lt => format!("uint(__softfloat64_flt({lhs}, {rhs}))"),
+                    Operator::F64Gt => format!("uint(__softfloat64_fgt({lhs}, {rhs}))"),
+                    Operator::F64Le => format!("uint(__softfloat64_fle({lhs}, {rhs}))"),
+                    Operator::F64Ge => format!("uint(__softfloat64_fge({lhs}, {rhs}))"),
+                    _ => unreachable!(),
+                };
+                self.emit_value(stack, expression);
+            }
+            Operator::I32WrapI64
+            | Operator::I64ExtendI32S
+            | Operator::I64ExtendI32U
+            | Operator::I32ReinterpretF32
+            | Operator::F32ReinterpretI32
+            | Operator::I64ReinterpretF64
+            | Operator::F64ReinterpretI64
+            | Operator::F32ConvertI32S
+            | Operator::F32ConvertI32U
+            | Operator::F32ConvertI64S
+            | Operator::F32ConvertI64U
+            | Operator::F64ConvertI32S
+            | Operator::F64ConvertI32U
+            | Operator::F64ConvertI64S
+            | Operator::F64ConvertI64U
+            | Operator::F32DemoteF64
+            | Operator::F64PromoteF32 => {
+                let value = pop(stack)?;
+                let expression = match operator {
+                    Operator::I32WrapI64 => format!("ulong(uint({value}))"),
+                    Operator::I64ExtendI32S => {
+                        format!("as_type<ulong>(long(as_type<int>(uint({value}))))")
+                    }
+                    Operator::I64ExtendI32U => format!("ulong(uint({value}))"),
+                    Operator::I32ReinterpretF32 | Operator::F32ReinterpretI32 => {
+                        format!("uint({value})")
+                    }
+                    Operator::I64ReinterpretF64 | Operator::F64ReinterpretI64 => value,
+                    Operator::F32ConvertI32S => {
+                        format!("as_type<uint>(float(as_type<int>(uint({value}))))")
+                    }
+                    Operator::F32ConvertI32U => format!("as_type<uint>(float(uint({value})))"),
+                    Operator::F32ConvertI64S => {
+                        format!("as_type<uint>(float(as_type<long>({value})))")
+                    }
+                    Operator::F32ConvertI64U => format!("as_type<uint>(float({value}))"),
+                    Operator::F64ConvertI32S => format!(
+                        "__softfloat64_cvt_i64_to_f64(long(as_type<int>(uint({value}))), 0u)"
+                    ),
+                    Operator::F64ConvertI32U => {
+                        format!("__softfloat64_cvt_u64_to_f64(ulong(uint({value})), 0u)")
+                    }
+                    Operator::F64ConvertI64S => {
+                        format!("__softfloat64_cvt_i64_to_f64(as_type<long>({value}), 0u)")
+                    }
+                    Operator::F64ConvertI64U => {
+                        format!("__softfloat64_cvt_u64_to_f64({value}, 0u)")
+                    }
+                    Operator::F32DemoteF64 => format!("__softfloat64_cvt_f64_to_f32({value}, 0u)"),
+                    Operator::F64PromoteF32 => {
+                        format!("__softfloat64_cvt_f32_to_f64(uint({value}))")
+                    }
+                    _ => unreachable!(),
+                };
+                self.emit_value(stack, expression);
+            }
+            Operator::I32TruncF32S
+            | Operator::I32TruncF32U
+            | Operator::I32TruncF64S
+            | Operator::I32TruncF64U
+            | Operator::I64TruncF32S
+            | Operator::I64TruncF32U
+            | Operator::I64TruncF64S
+            | Operator::I64TruncF64U
+            | Operator::I32TruncSatF32S
+            | Operator::I32TruncSatF32U
+            | Operator::I32TruncSatF64S
+            | Operator::I32TruncSatF64U
+            | Operator::I64TruncSatF32S
+            | Operator::I64TruncSatF32U
+            | Operator::I64TruncSatF64S
+            | Operator::I64TruncSatF64U => {
+                let value = pop(stack)?;
+                let f32_source = matches!(
+                    operator,
+                    Operator::I32TruncF32S
+                        | Operator::I32TruncF32U
+                        | Operator::I64TruncF32S
+                        | Operator::I64TruncF32U
+                        | Operator::I32TruncSatF32S
+                        | Operator::I32TruncSatF32U
+                        | Operator::I64TruncSatF32S
+                        | Operator::I64TruncSatF32U
+                );
+                let width = if matches!(
+                    operator,
+                    Operator::I32TruncF32S
+                        | Operator::I32TruncF32U
+                        | Operator::I32TruncF64S
+                        | Operator::I32TruncF64U
+                        | Operator::I32TruncSatF32S
+                        | Operator::I32TruncSatF32U
+                        | Operator::I32TruncSatF64S
+                        | Operator::I32TruncSatF64U
+                ) {
+                    32
+                } else {
+                    64
+                };
+                let signed = matches!(
+                    operator,
+                    Operator::I32TruncF32S
+                        | Operator::I32TruncF64S
+                        | Operator::I64TruncF32S
+                        | Operator::I64TruncF64S
+                        | Operator::I32TruncSatF32S
+                        | Operator::I32TruncSatF64S
+                        | Operator::I64TruncSatF32S
+                        | Operator::I64TruncSatF64S
+                );
+                let saturating = matches!(
+                    operator,
+                    Operator::I32TruncSatF32S
+                        | Operator::I32TruncSatF32U
+                        | Operator::I32TruncSatF64S
+                        | Operator::I32TruncSatF64U
+                        | Operator::I64TruncSatF32S
+                        | Operator::I64TruncSatF32U
+                        | Operator::I64TruncSatF64S
+                        | Operator::I64TruncSatF64U
+                );
+                let float_bits = if f32_source {
+                    format!("__softfloat64_cvt_f32_to_f64(uint({value}))")
+                } else {
+                    value
+                };
+                self.emit_value(
+                    stack,
+                    format!(
+                        "wasm_f64_to_int({float_bits}, {width}u, {signed}, {saturating}, trap)"
+                    ),
+                );
+                if !saturating {
+                    self.source.push_str("if (trap != 0u) return;\n");
+                }
             }
             _ => return Err(Error::Unsupported(format!("instruction {operator:?}"))),
         }
@@ -1899,5 +2315,445 @@ mod tests {
                 reason: "out of bounds memory access"
             })
         ));
+    }
+
+    #[test]
+    fn i64_arithmetic_calls_and_globals_match_wasmtime() {
+        let wasm = wat::parse_str(
+            r#"(module
+            (global $g (mut i64) (i64.const -9))
+            (func $rotate (param i64 i64) (result i64)
+                local.get 0 local.get 1 i64.rotl)
+            (func (export "f") (param i64 i64) (result i64 i64)
+                local.get 0 local.get 1 call $rotate
+                global.get $g local.get 0 i64.add
+                global.set $g
+                global.get $g))"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        let inputs = [
+            vec![Value::I64(0), Value::I64(0)],
+            vec![Value::I64(u64::MAX), Value::I64(65)],
+            vec![Value::I64(0x8000_0000_0000_0001), Value::I64(13)],
+        ];
+        let actual = kernel.run_values(&inputs).unwrap();
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+        for (row, result) in inputs.iter().zip(actual) {
+            let mut store = wasmtime::Store::new(&engine, ());
+            let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+            let function = instance
+                .get_typed_func::<(i64, i64), (i64, i64)>(&mut store, "f")
+                .unwrap();
+            let (a, b) = function
+                .call(&mut store, (row[0].bits() as i64, row[1].bits() as i64))
+                .unwrap();
+            assert_eq!(result, vec![Value::I64(a as u64), Value::I64(b as u64)]);
+        }
+    }
+
+    #[test]
+    fn i64_memory_and_division_traps() {
+        let wasm = wat::parse_str("(module (memory 1) (func (export \"f\") (param i64) (result i64) i32.const 0 local.get 0 i64.store i32.const 0 i64.load32_s i64.const 3 i64.div_s))").unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        let rows = [vec![Value::I64(u64::MAX)], vec![Value::I64(0x8000_0000)]];
+        assert_eq!(
+            kernel.run_values(&rows).unwrap(),
+            [
+                vec![Value::I64(0)],
+                vec![Value::I64((-715827882i64) as u64)]
+            ]
+        );
+        let wasm = wat::parse_str("(module (func (export \"f\") (param i64) (result i64) local.get 0 i64.const 0 i64.div_u))").unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        assert!(matches!(
+            kernel.run_values(&[vec![Value::I64(1)]]),
+            Err(Error::Trap {
+                reason: "integer divide by zero",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn f64_software_add_runs_on_metal() {
+        let wasm = wat::parse_str("(module (func (export \"f\") (param f64 f64) (result f64) local.get 0 local.get 1 f64.add))").unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        let rows = [vec![
+            Value::F64(1.25f64.to_bits()),
+            Value::F64(2.5f64.to_bits()),
+        ]];
+        assert_eq!(
+            kernel.run_values(&rows).unwrap(),
+            [vec![Value::F64(3.75f64.to_bits())]]
+        );
+    }
+
+    fn compare_values_to_wasmtime(wat: &str, rows: &[Vec<Value>]) {
+        let wasm = wat::parse_str(wat).unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        let actual = kernel.run_values(rows).unwrap();
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+        for (row, actual_row) in rows.iter().zip(actual) {
+            let mut store = wasmtime::Store::new(&engine, ());
+            let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+            let function = instance.get_func(&mut store, "f").unwrap();
+            let params: Vec<_> = row
+                .iter()
+                .map(|value| match value {
+                    Value::I32(bits) => wasmtime::Val::I32(*bits as i32),
+                    Value::I64(bits) => wasmtime::Val::I64(*bits as i64),
+                    Value::F32(bits) => wasmtime::Val::F32(*bits),
+                    Value::F64(bits) => wasmtime::Val::F64(*bits),
+                })
+                .collect();
+            let mut results: Vec<_> = kernel
+                .results
+                .iter()
+                .map(|ty| match ty {
+                    ValType::I32 => wasmtime::Val::I32(0),
+                    ValType::I64 => wasmtime::Val::I64(0),
+                    ValType::F32 => wasmtime::Val::F32(0),
+                    ValType::F64 => wasmtime::Val::F64(0),
+                    _ => unreachable!(),
+                })
+                .collect();
+            function.call(&mut store, &params, &mut results).unwrap();
+            for (got, expected) in actual_row.iter().zip(results) {
+                let equal = match (*got, expected) {
+                    (Value::I32(a), wasmtime::Val::I32(b)) => a == b as u32,
+                    (Value::I64(a), wasmtime::Val::I64(b)) => a == b as u64,
+                    (Value::F32(a), wasmtime::Val::F32(b)) => {
+                        a == b || (f32::from_bits(a).is_nan() && f32::from_bits(b).is_nan())
+                    }
+                    (Value::F64(a), wasmtime::Val::F64(b)) => {
+                        a == b || (f64::from_bits(a).is_nan() && f64::from_bits(b).is_nan())
+                    }
+                    _ => false,
+                };
+                assert!(
+                    equal,
+                    "{wat}: input {row:?}, got {got:?}, expected {expected:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f64_arithmetic_matches_wasmtime_at_boundaries() {
+        let values = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::from_bits(0x000f_ffff_ffff_ffff),
+            f64::MAX,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        let rows: Vec<_> = values
+            .iter()
+            .flat_map(|a| {
+                values
+                    .iter()
+                    .map(move |b| vec![Value::F64(a.to_bits()), Value::F64(b.to_bits())])
+            })
+            .collect();
+        for op in [
+            "add", "sub", "mul", "div", "min", "max", "copysign", "eq", "ne", "lt", "gt", "le",
+            "ge",
+        ] {
+            let result = if ["eq", "ne", "lt", "gt", "le", "ge"].contains(&op) {
+                "i32"
+            } else {
+                "f64"
+            };
+            compare_values_to_wasmtime(
+                &format!(
+                    "(module (func (export \"f\") (param f64 f64) (result {result}) local.get 0 local.get 1 f64.{op}))"
+                ),
+                &rows,
+            );
+        }
+        let rows: Vec<_> = values
+            .iter()
+            .map(|a| vec![Value::F64(a.to_bits())])
+            .collect();
+        for op in ["abs", "neg", "ceil", "floor", "trunc", "nearest", "sqrt"] {
+            compare_values_to_wasmtime(
+                &format!(
+                    "(module (func (export \"f\") (param f64) (result f64) local.get 0 f64.{op}))"
+                ),
+                &rows,
+            );
+        }
+    }
+
+    #[test]
+    fn f32_arithmetic_matches_wasmtime_at_boundaries() {
+        let values = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x007f_ffff),
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        let rows: Vec<_> = values
+            .iter()
+            .flat_map(|a| {
+                values
+                    .iter()
+                    .map(move |b| vec![Value::F32(a.to_bits()), Value::F32(b.to_bits())])
+            })
+            .collect();
+        for op in [
+            "add", "sub", "mul", "div", "min", "max", "copysign", "eq", "ne", "lt", "gt", "le",
+            "ge",
+        ] {
+            let result = if ["eq", "ne", "lt", "gt", "le", "ge"].contains(&op) {
+                "i32"
+            } else {
+                "f32"
+            };
+            compare_values_to_wasmtime(
+                &format!(
+                    "(module (func (export \"f\") (param f32 f32) (result {result}) local.get 0 local.get 1 f32.{op}))"
+                ),
+                &rows,
+            );
+        }
+        let rows: Vec<_> = values
+            .iter()
+            .map(|a| vec![Value::F32(a.to_bits())])
+            .collect();
+        for op in ["abs", "neg", "ceil", "floor", "trunc", "nearest", "sqrt"] {
+            compare_values_to_wasmtime(
+                &format!(
+                    "(module (func (export \"f\") (param f32) (result f32) local.get 0 f32.{op}))"
+                ),
+                &rows,
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_conversions_match_wasmtime() {
+        for (input, rows) in [
+            (
+                "i32",
+                vec![
+                    0,
+                    1,
+                    i32::MAX as u64,
+                    i32::MIN as u32 as u64,
+                    u32::MAX as u64,
+                ],
+            ),
+            (
+                "i64",
+                vec![
+                    0,
+                    1,
+                    i64::MAX as u64,
+                    i64::MIN as u64,
+                    u64::MAX,
+                    (1u64 << 53) + 1,
+                ],
+            ),
+        ] {
+            for output in ["f32", "f64"] {
+                for sign in ["s", "u"] {
+                    let values: Vec<_> = rows
+                        .iter()
+                        .map(|bits| {
+                            vec![if input == "i32" {
+                                Value::I32(*bits as u32)
+                            } else {
+                                Value::I64(*bits)
+                            }]
+                        })
+                        .collect();
+                    compare_values_to_wasmtime(
+                        &format!(
+                            "(module (func (export \"f\") (param {input}) (result {output}) local.get 0 {output}.convert_{input}_{sign}))"
+                        ),
+                        &values,
+                    );
+                }
+            }
+        }
+        let f64_values = [
+            0.0,
+            -0.0,
+            1.5,
+            -1.5,
+            2147483647.0,
+            2147483648.0,
+            4294967295.0,
+            4294967296.0,
+            9223372036854775808.0,
+            18446744073709551616.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        let f32_values = [
+            0.0f32,
+            -0.0,
+            1.5,
+            -1.5,
+            2147483648.0,
+            4294967296.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        for input in ["f32", "f64"] {
+            let rows: Vec<_> = if input == "f32" {
+                f32_values
+                    .iter()
+                    .map(|value| vec![Value::F32(value.to_bits())])
+                    .collect()
+            } else {
+                f64_values
+                    .iter()
+                    .map(|value| vec![Value::F64(value.to_bits())])
+                    .collect()
+            };
+            for output in ["i32", "i64"] {
+                for sign in ["s", "u"] {
+                    let wat = format!(
+                        "(module (func (export \"f\") (param {input}) (result {output}) local.get 0 {output}.trunc_sat_{input}_{sign}))"
+                    );
+                    compare_values_to_wasmtime(&wat, &rows);
+                    let wat = format!(
+                        "(module (func (export \"f\") (param {input}) (result {output}) local.get 0 {output}.trunc_{input}_{sign}))"
+                    );
+                    let wasm = wat::parse_str(&wat).unwrap();
+                    let kernel = Kernel::new(&wasm, "f").unwrap();
+                    assert!(
+                        kernel
+                            .run_values(&[vec![if input == "f32" {
+                                Value::F32(f32::NAN.to_bits())
+                            } else {
+                                Value::F64(f64::NAN.to_bits())
+                            }]])
+                            .is_err()
+                    );
+                }
+            }
+        }
+        let rows: Vec<_> = f32_values
+            .iter()
+            .map(|value| vec![Value::F32(value.to_bits())])
+            .collect();
+        compare_values_to_wasmtime(
+            "(module (func (export \"f\") (param f32) (result f64) local.get 0 f64.promote_f32))",
+            &rows,
+        );
+        let rows: Vec<_> = f64_values
+            .iter()
+            .map(|value| vec![Value::F64(value.to_bits())])
+            .collect();
+        compare_values_to_wasmtime(
+            "(module (func (export \"f\") (param f64) (result f32) local.get 0 f32.demote_f64))",
+            &rows,
+        );
+    }
+
+    #[test]
+    fn f32_subnormal_midpoint_rounds_up() {
+        let just_above_midpoint = 3.0f64 * 2.0f64.powi(-151);
+        compare_values_to_wasmtime(
+            "(module (func (export \"f\") (param f64) (result f32) local.get 0 f32.demote_f64))",
+            &[vec![Value::F64(just_above_midpoint.to_bits())]],
+        );
+        compare_values_to_wasmtime(
+            "(module (func (export \"f\") (param f32 f32) (result f32) local.get 0 local.get 1 f32.div))",
+            &[vec![Value::F32(1), Value::F32(1.5f32.to_bits())]],
+        );
+    }
+
+    #[test]
+    fn mixed_numeric_calls_memory_and_globals_match_wasmtime() {
+        let wat = r#"(module
+            (memory 1)
+            (global $g (mut f64) (f64.const 0.75))
+            (func $step (param f64 i64) (result f64 i64) (local f32)
+                local.get 0 f32.demote_f64 local.set 2
+                i32.const 0 local.get 1 i64.store
+                global.get $g local.get 0 f64.add global.set $g
+                global.get $g local.get 2 f64.promote_f32 f64.add
+                i32.const 0 i64.load)
+            (func (export "f") (param f64 i64) (result f64 i64)
+                local.get 0 local.get 1 call $step))"#;
+        compare_values_to_wasmtime(
+            wat,
+            &[
+                vec![Value::F64(1.25f64.to_bits()), Value::I64(7)],
+                vec![Value::F64((-2.5f64).to_bits()), Value::I64(u64::MAX)],
+            ],
+        );
+    }
+
+    #[test]
+    fn valid_float_to_int_truncation_matches_wasmtime() {
+        for (input, values) in [
+            (
+                "f32",
+                vec![
+                    Value::F32(0.0f32.to_bits()),
+                    Value::F32(1.75f32.to_bits()),
+                    Value::F32((-1.75f32).to_bits()),
+                ],
+            ),
+            (
+                "f64",
+                vec![
+                    Value::F64(0.0f64.to_bits()),
+                    Value::F64(1.75f64.to_bits()),
+                    Value::F64((-1.75f64).to_bits()),
+                ],
+            ),
+        ] {
+            for output in ["i32", "i64"] {
+                for sign in ["s", "u"] {
+                    let rows: Vec<_> = values
+                        .iter()
+                        .copied()
+                        .filter(|value| {
+                            sign == "s"
+                                || (value.bits()
+                                    & if input == "f32" {
+                                        1u64 << 31
+                                    } else {
+                                        1u64 << 63
+                                    })
+                                    == 0
+                        })
+                        .map(|value| vec![value])
+                        .collect();
+                    compare_values_to_wasmtime(
+                        &format!(
+                            "(module (func (export \"f\") (param {input}) (result {output}) local.get 0 {output}.trunc_{input}_{sign}))"
+                        ),
+                        &rows,
+                    );
+                }
+            }
+        }
     }
 }
