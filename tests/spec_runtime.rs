@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use metal_wasm::{Error, Kernel, Value};
-use wast::core::{WastArgCore, WastRetCore};
+use wast::core::{NanPattern, WastArgCore, WastRetCore};
 use wast::parser::{self, ParseBuffer};
 use wast::{Wast, WastArg, WastDirective, WastExecute, WastInvoke, WastRet};
 
@@ -15,10 +15,24 @@ fn arg(value: WastArg<'_>) -> Value {
     }
 }
 
-fn result(value: WastRet<'_>) -> Value {
-    match value {
-        WastRet::Core(WastRetCore::I32(value)) => Value::I32(value as u32),
-        WastRet::Core(WastRetCore::I64(value)) => Value::I64(value as u64),
+fn matches_result(actual: Value, expected: &WastRet<'_>) -> bool {
+    match (actual, expected) {
+        (Value::I32(actual), WastRet::Core(WastRetCore::I32(expected))) => {
+            actual == *expected as u32
+        }
+        (Value::I64(actual), WastRet::Core(WastRetCore::I64(expected))) => {
+            actual == *expected as u64
+        }
+        (Value::F32(actual), WastRet::Core(WastRetCore::F32(pattern))) => match pattern {
+            NanPattern::Value(expected) => actual == expected.bits,
+            NanPattern::CanonicalNan => actual & 0x7fff_ffff == 0x7fc0_0000,
+            NanPattern::ArithmeticNan => actual & 0x7fc0_0000 == 0x7fc0_0000,
+        },
+        (Value::F64(actual), WastRet::Core(WastRetCore::F64(pattern))) => match pattern {
+            NanPattern::Value(expected) => actual == expected.bits,
+            NanPattern::CanonicalNan => actual & 0x7fff_ffff_ffff_ffff == 0x7ff8_0000_0000_0000,
+            NanPattern::ArithmeticNan => actual & 0x7ff8_0000_0000_0000 == 0x7ff8_0000_0000_0000,
+        },
         other => panic!("unexpected spec result: {other:?}"),
     }
 }
@@ -56,9 +70,17 @@ fn check_script(source: &str, minimum_assertions: usize) {
                 results,
                 ..
             } => {
-                let expected: Vec<_> = results.into_iter().map(result).collect();
-                let actual = invoke(call, module.as_deref().unwrap(), &mut kernels).unwrap();
-                assert_eq!(actual, [expected]);
+                let invocation = format!("{call:?}");
+                let actual = invoke(call, module.as_deref().unwrap(), &mut kernels)
+                    .unwrap_or_else(|error| panic!("{invocation}: {error}"));
+                assert_eq!(actual.len(), 1);
+                assert_eq!(actual[0].len(), results.len());
+                for (value, expected) in actual[0].iter().zip(&results) {
+                    assert!(
+                        matches_result(*value, expected),
+                        "{invocation}: expected {expected:?}, got {value:?}"
+                    );
+                }
                 checked += 1;
             }
             WastDirective::AssertTrap {
@@ -68,7 +90,9 @@ fn check_script(source: &str, minimum_assertions: usize) {
             } => {
                 let actual = invoke(call, module.as_deref().unwrap(), &mut kernels);
                 assert!(
-                    matches!(actual, Err(Error::Trap { input_index: 0, reason }) if reason == message),
+                    matches!(actual, Err(Error::Trap { input_index: 0, reason })
+                        if reason == message || (message == "undefined element"
+                            && reason == "undefined or uninitialized table element")),
                     "expected trap {message:?}, got {actual:?}"
                 );
                 checked += 1;
@@ -102,4 +126,24 @@ fn spec_f32_comparisons() {
 #[test]
 fn spec_f64_comparisons() {
     check_script(include_str!("spec/f64_cmp.wast"), 2000);
+}
+
+#[test]
+fn spec_conversions() {
+    check_script(include_str!("spec/conversions.wast"), 500);
+}
+
+#[test]
+fn spec_f32_arithmetic() {
+    check_script(include_str!("spec/f32.wast"), 2500);
+}
+
+#[test]
+fn spec_f64_arithmetic() {
+    check_script(include_str!("spec/f64.wast"), 2500);
+}
+
+#[test]
+fn spec_if_control() {
+    check_script(include_str!("spec/if.wast"), 100);
 }

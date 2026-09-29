@@ -25,6 +25,7 @@ static ulong wasm_f64_max(ulong a, ulong b) {
 }
 
 static ulong wasm_f64_trunc(ulong a) {
+    if (wasm_f64_nan(a)) return a | 0x0008000000000000ul;
     uint exponent = uint((a >> 52u) & 2047ul);
     if (exponent < 1023u) return a & 0x8000000000000000ul;
     if (exponent >= 1075u) return a;
@@ -32,17 +33,20 @@ static ulong wasm_f64_trunc(ulong a) {
     return a & ~mask;
 }
 static ulong wasm_f64_floor(ulong a) {
-    if (wasm_f64_nan(a) || (a & 0x7ffffffffffffffful) == 0x7ff0000000000000ul) return a;
+    if (wasm_f64_nan(a)) return a | 0x0008000000000000ul;
+    if ((a & 0x7ffffffffffffffful) == 0x7ff0000000000000ul) return a;
     ulong t = wasm_f64_trunc(a);
     return t != a && (a >> 63u) != 0ul ? __softfloat64_fsub(t, 0x3ff0000000000000ul, 0u) : t;
 }
 static ulong wasm_f64_ceil(ulong a) {
-    if (wasm_f64_nan(a) || (a & 0x7ffffffffffffffful) == 0x7ff0000000000000ul) return a;
+    if (wasm_f64_nan(a)) return a | 0x0008000000000000ul;
+    if ((a & 0x7ffffffffffffffful) == 0x7ff0000000000000ul) return a;
     ulong t = wasm_f64_trunc(a);
     return t != a && (a >> 63u) == 0ul ? __softfloat64_fadd(t, 0x3ff0000000000000ul, 0u) : t;
 }
 static ulong wasm_f64_nearest(ulong a) {
-    if (wasm_f64_nan(a) || (a & 0x7ffffffffffffffful) == 0x7ff0000000000000ul) return a;
+    if (wasm_f64_nan(a)) return a | 0x0008000000000000ul;
+    if ((a & 0x7ffffffffffffffful) == 0x7ff0000000000000ul) return a;
     ulong t = wasm_f64_trunc(a);
     if (t == a) return a;
     ulong fraction = __softfloat64_fsub(a, t, 0u) & 0x7ffffffffffffffful;
