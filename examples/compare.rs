@@ -19,11 +19,43 @@ const COUNTS: [usize; 4] = [1, 1_000, 1_000_000, 10_000_000];
 const MIX_ROUNDS: u32 = 32;
 const MIX_MULTIPLIER: u32 = 0x9e37_79b1;
 const OTHER_MULTIPLIER: u32 = 0x85eb_ca6b;
+const MEMORY_DATA: [u8; 16] = [
+    5, 17, 35, 55, 77, 91, 114, 138, 161, 184, 207, 229, 13, 47, 83, 121,
+];
+
+struct SuiteWorkload {
+    name: &'static str,
+    wat: &'static str,
+    native: fn(u32) -> u32,
+    counts: &'static [usize],
+}
+
+const SUITE_WORKLOADS: [SuiteWorkload; 3] = [
+    SuiteWorkload {
+        name: "dispatch_i64",
+        wat: include_str!("workloads/dispatch_i64.wat"),
+        native: dispatch_native,
+        counts: &[1, 1_000, 100_000, 1_000_000],
+    },
+    SuiteWorkload {
+        name: "float_f64",
+        wat: include_str!("workloads/float_f64.wat"),
+        native: float_native,
+        counts: &[1, 1_000, 100_000, 1_000_000],
+    },
+    SuiteWorkload {
+        name: "stateful_memory",
+        wat: include_str!("workloads/stateful_memory.wat"),
+        native: memory_native,
+        counts: &[1, 1_000, 4_096],
+    },
+];
 
 fn main() -> Result<()> {
     let large = match std::env::args().nth(1).as_deref() {
         Some("--mix") => return compare_compute(false),
         Some("--control") => return compare_compute(true),
+        Some("--suite") => return compare_suite(),
         Some("--metal-native-100m") => true,
         Some(argument) => return Err(format!("unknown argument: {argument}").into()),
         None => false,
@@ -202,6 +234,66 @@ fn compare_compute(control: bool) -> Result<()> {
     Ok(())
 }
 
+fn compare_suite() -> Result<()> {
+    println!("workload,count,metal_total_us,metal_gpu_us,wasmtime_us,wasmi_us,native_us,samples");
+    for workload in &SUITE_WORKLOADS {
+        let wasm = wat::parse_str(workload.wat)?;
+        let metal = Kernel::new(&wasm, "calculate")?;
+        let wasmtime_engine = wasmtime::Engine::default();
+        let wasmtime_module = wasmtime::Module::new(&wasmtime_engine, &wasm)?;
+        let mut wasmtime_store = wasmtime::Store::new(&wasmtime_engine, ());
+        let wasmtime_instance =
+            wasmtime::Instance::new(&mut wasmtime_store, &wasmtime_module, &[])?;
+        let wasmtime_func =
+            wasmtime_instance.get_typed_func::<i32, i32>(&mut wasmtime_store, "calculate")?;
+        let wasmi_engine = wasmi::Engine::default();
+        let wasmi_module = wasmi::Module::new(&wasmi_engine, &wasm)?;
+        let mut wasmi_store = wasmi::Store::new(&wasmi_engine, ());
+        let wasmi_instance = wasmi::Linker::new(&wasmi_engine)
+            .instantiate_and_start(&mut wasmi_store, &wasmi_module)?;
+        let wasmi_func = wasmi_instance.get_typed_func::<i32, i32>(&wasmi_store, "calculate")?;
+        let mut run_wasmtime = |inputs: &[u32]| -> Result<Vec<u32>> {
+            let mut output = Vec::with_capacity(inputs.len());
+            for &input in inputs {
+                output.push(wasmtime_func.call(&mut wasmtime_store, input as i32)? as u32);
+            }
+            Ok(output)
+        };
+        let mut run_wasmi = |inputs: &[u32]| -> Result<Vec<u32>> {
+            let mut output = Vec::with_capacity(inputs.len());
+            for &input in inputs {
+                output.push(wasmi_func.call(&mut wasmi_store, input as i32)? as u32);
+            }
+            Ok(output)
+        };
+        let warmup = [0u32, 1, 42, 43];
+        verify_output(&warmup, &metal.run_timed(&warmup)?.0, workload.native)?;
+        verify_output(&warmup, &run_wasmtime(&warmup)?, workload.native)?;
+        verify_output(&warmup, &run_wasmi(&warmup)?, workload.native)?;
+
+        for &count in workload.counts {
+            eprintln!("measuring {} at {count} invocations...", workload.name);
+            let inputs: Vec<u32> = (0..count).map(|value| value as u32).collect();
+            let (metal_total, metal_gpu) = measure_metal(&metal, &inputs, workload.native)?;
+            let wasmtime = measure(&inputs, 3, 1, workload.native, &mut run_wasmtime)?;
+            let wasmi = measure(&inputs, 3, 1, workload.native, &mut run_wasmi)?;
+            let native = measure(&inputs, 3, 1, workload.native, |inputs| {
+                Ok(inputs.iter().copied().map(workload.native).collect())
+            })?;
+            println!(
+                "{},{count},{:.2},{:.2},{:.2},{:.2},{:.2},3",
+                workload.name,
+                micros(metal_total),
+                micros(metal_gpu),
+                micros(wasmtime),
+                micros(wasmi),
+                micros(native)
+            );
+        }
+    }
+    Ok(())
+}
+
 fn mix_wat() -> String {
     let mut wat = String::from("(module (func (export \"calculate\") (param i32) (result i32) ");
     for round in 0..MIX_ROUNDS {
@@ -323,6 +415,61 @@ fn control_native(input: u32) -> u32 {
     value
 }
 
+#[inline(always)]
+fn dispatch_native(input: u32) -> u32 {
+    let mut value = input as u64;
+    for round in 0..24u32 {
+        let salt = round as u64;
+        value = match (input ^ round) & 3 {
+            0 => (value.rotate_left(7) ^ salt).wrapping_mul(6_364_136_223_846_793_005),
+            1 => (value ^ salt.wrapping_mul(1_442_695_040_888_963_407))
+                .rotate_right(11)
+                .wrapping_add(2_862_933_555_777_941_757),
+            2 => value.wrapping_add(salt).rotate_left(17) ^ 3_935_559_000_370_003_845,
+            _ => {
+                value
+                    .wrapping_mul(2_862_933_555_777_941_757)
+                    .rotate_right(23)
+                    ^ salt
+            }
+        };
+    }
+    value as u32 ^ (value >> 32) as u32
+}
+
+#[inline(always)]
+fn float_native(input: u32) -> u32 {
+    let mut value = ((input & 2047) as f64 / 2048.0) + 0.25;
+    for round in 0..12u32 {
+        let factor = if (input ^ round) & 1 != 0 {
+            1.015625
+        } else {
+            0.984375
+        };
+        value = (value * factor) / (value + 0.125) + 0.0625;
+    }
+    (value.sqrt() * 100_000.0) as u32
+}
+
+#[inline(always)]
+fn memory_native(input: u32) -> u32 {
+    const SEED: u32 = 0x9e37_79b1;
+    let mut global = SEED;
+    let mut value = input ^ global;
+    let mut cells = [0u32; 16];
+    for round in 0..24u32 {
+        let slot = (round & 15) as usize;
+        let data = MEMORY_DATA[(input.wrapping_add(round) & 15) as usize] as u32;
+        value = (value.rotate_left(7) ^ data)
+            .wrapping_add(cells[slot])
+            .wrapping_mul(SEED)
+            .wrapping_add(global);
+        cells[slot] = value;
+        global = value.rotate_left(13);
+    }
+    value ^ global
+}
+
 fn measure_metal(
     metal: &Kernel,
     inputs: &[u32],
@@ -368,13 +515,19 @@ fn measure(
 }
 
 fn verify_output(inputs: &[u32], output: &[u32], expected: fn(u32) -> u32) -> Result<()> {
-    if output.len() != inputs.len()
-        || output
-            .iter()
-            .zip(inputs)
-            .any(|(&actual, &input)| actual != expected(input))
-    {
-        return Err("benchmark output mismatch".into());
+    if output.len() != inputs.len() {
+        return Err(format!(
+            "benchmark output length: got {}, expected {}",
+            output.len(),
+            inputs.len()
+        )
+        .into());
+    }
+    for (index, (&actual, &input)) in output.iter().zip(inputs).enumerate() {
+        let expected = expected(input);
+        if actual != expected {
+            return Err(format!("benchmark output mismatch at {index}: input {input}, got {actual}, expected {expected}").into());
+        }
     }
     Ok(())
 }
@@ -385,7 +538,7 @@ fn micros(duration: Duration) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::control_inputs;
+    use super::{SUITE_WORKLOADS, control_inputs};
 
     #[test]
     fn control_patterns_have_the_same_values_and_grouped_branches_agree() {
@@ -402,6 +555,49 @@ mod tests {
             grouped_sorted.sort_unstable();
             mixed_sorted.sort_unstable();
             assert_eq!(grouped_sorted, mixed_sorted);
+        }
+    }
+
+    #[test]
+    fn suite_workloads_match_native_on_all_engines() {
+        let inputs: Vec<u32> = (0..64).chain([u32::MAX, u32::MAX - 1]).collect();
+        for workload in &SUITE_WORKLOADS {
+            let wasm = wat::parse_str(workload.wat).unwrap();
+            let expected: Vec<u32> = inputs.iter().copied().map(workload.native).collect();
+            let metal = metal_wasm::Kernel::new(&wasm, "calculate").unwrap();
+            let metal_output = metal.run(&inputs).unwrap();
+            let wasmtime_engine = wasmtime::Engine::default();
+            let wasmtime_module = wasmtime::Module::new(&wasmtime_engine, &wasm).unwrap();
+            let mut wasmtime_store = wasmtime::Store::new(&wasmtime_engine, ());
+            let wasmtime_instance =
+                wasmtime::Instance::new(&mut wasmtime_store, &wasmtime_module, &[]).unwrap();
+            let wasmtime_func = wasmtime_instance
+                .get_typed_func::<i32, i32>(&mut wasmtime_store, "calculate")
+                .unwrap();
+            let wasmtime_output: Vec<u32> = inputs
+                .iter()
+                .map(|input| {
+                    wasmtime_func
+                        .call(&mut wasmtime_store, *input as i32)
+                        .unwrap() as u32
+                })
+                .collect();
+            let wasmi_engine = wasmi::Engine::default();
+            let wasmi_module = wasmi::Module::new(&wasmi_engine, &wasm).unwrap();
+            let mut wasmi_store = wasmi::Store::new(&wasmi_engine, ());
+            let wasmi_instance = wasmi::Linker::new(&wasmi_engine)
+                .instantiate_and_start(&mut wasmi_store, &wasmi_module)
+                .unwrap();
+            let wasmi_func = wasmi_instance
+                .get_typed_func::<i32, i32>(&wasmi_store, "calculate")
+                .unwrap();
+            let wasmi_output: Vec<u32> = inputs
+                .iter()
+                .map(|input| wasmi_func.call(&mut wasmi_store, *input as i32).unwrap() as u32)
+                .collect();
+            assert_eq!(wasmtime_output, expected, "{}: Wasmtime", workload.name);
+            assert_eq!(wasmi_output, expected, "{}: Wasmi", workload.name);
+            assert_eq!(metal_output, expected, "{}: Metal", workload.name);
         }
     }
 }
