@@ -3144,4 +3144,47 @@ mod tests {
             (elem (i32.const 0) $f $g))"#;
         compare_values_to_wasmtime(wat, &[vec![Value::I32(0)], vec![Value::I32(7)]]);
     }
+
+    #[test]
+    fn varied_float_bits_match_wasmtime() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut pairs64 = Vec::new();
+        let mut pairs32 = Vec::new();
+        let mut near_f32_zero = Vec::new();
+        for _ in 0..128 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let a = state;
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let b = state;
+            pairs64.push(vec![Value::F64(a), Value::F64(b)]);
+            pairs32.push(vec![Value::F32(a as u32), Value::F32(b as u32)]);
+            near_f32_zero.push(vec![Value::F64((873u64 << 52) | (a & ((1u64 << 52) - 1)))]);
+        }
+        for ty in ["f32", "f64"] {
+            let rows = if ty == "f32" { &pairs32 } else { &pairs64 };
+            for op in ["add", "sub", "mul", "div"] {
+                compare_values_to_wasmtime(
+                    &format!(
+                        "(module (func (export \"f\") (param {ty} {ty}) (result {ty}) local.get 0 local.get 1 {ty}.{op}))"
+                    ),
+                    rows,
+                );
+            }
+            let unary: Vec<_> = rows.iter().map(|row| vec![row[0]]).collect();
+            compare_values_to_wasmtime(
+                &format!(
+                    "(module (func (export \"f\") (param {ty}) (result {ty}) local.get 0 {ty}.sqrt))"
+                ),
+                &unary,
+            );
+        }
+        compare_values_to_wasmtime(
+            "(module (func (export \"f\") (param f64) (result f32) local.get 0 f32.demote_f64))",
+            &near_f32_zero,
+        );
+    }
 }
