@@ -26,28 +26,60 @@ const MEMORY_DATA: [u8; 16] = [
 struct SuiteWorkload {
     name: &'static str,
     wat: &'static str,
+    provider: Option<(&'static str, &'static str)>,
     native: fn(u32) -> u32,
     counts: &'static [usize],
 }
 
-const SUITE_WORKLOADS: [SuiteWorkload; 3] = [
+const SUITE_WORKLOADS: [SuiteWorkload; 7] = [
     SuiteWorkload {
         name: "dispatch_i64",
         wat: include_str!("workloads/dispatch_i64.wat"),
+        provider: None,
         native: dispatch_native,
         counts: &[1, 1_000, 100_000, 1_000_000],
     },
     SuiteWorkload {
         name: "float_f64",
         wat: include_str!("workloads/float_f64.wat"),
+        provider: None,
         native: float_native,
         counts: &[1, 1_000, 100_000, 1_000_000],
     },
     SuiteWorkload {
         name: "stateful_memory",
         wat: include_str!("workloads/stateful_memory.wat"),
+        provider: None,
         native: memory_native,
         counts: &[1, 1_000, 4_096],
+    },
+    SuiteWorkload {
+        name: "bulk_start",
+        wat: include_str!("workloads/bulk_start.wat"),
+        provider: None,
+        native: bulk_start_native,
+        counts: &[1, 1_000, 4_096],
+    },
+    SuiteWorkload {
+        name: "recursive_calls",
+        wat: include_str!("workloads/recursive_calls.wat"),
+        provider: None,
+        native: recursive_native,
+        counts: &[1, 1_000, 100_000, 1_000_000],
+    },
+    SuiteWorkload {
+        name: "mutable_table",
+        wat: include_str!("workloads/mutable_table.wat"),
+        provider: None,
+        native: mutable_table_native,
+        counts: &[1, 1_000, 100_000, 1_000_000],
+    },
+    SuiteWorkload {
+        name: "imported_calls",
+        wat: include_str!("workloads/imported_calls.wat"),
+        provider: Some(("math", include_str!("workloads/import_provider.wat"))),
+        native: imported_calls_native,
+        counts: &[1, 1_000, 100_000, 1_000_000],
     },
 ];
 
@@ -238,19 +270,39 @@ fn compare_suite() -> Result<()> {
     println!("workload,count,metal_total_us,metal_gpu_us,wasmtime_us,wasmi_us,native_us,samples");
     for workload in &SUITE_WORKLOADS {
         let wasm = wat::parse_str(workload.wat)?;
-        let metal = Kernel::new(&wasm, "calculate")?;
+        let provider = workload
+            .provider
+            .map(|(name, source)| wat::parse_str(source).map(|wasm| (name, wasm)))
+            .transpose()?;
+        let metal = if let Some((name, bytes)) = &provider {
+            Kernel::new_with_imports(&wasm, "calculate", &[(name, bytes)])?
+        } else {
+            Kernel::new(&wasm, "calculate")?
+        };
         let wasmtime_engine = wasmtime::Engine::default();
         let wasmtime_module = wasmtime::Module::new(&wasmtime_engine, &wasm)?;
         let mut wasmtime_store = wasmtime::Store::new(&wasmtime_engine, ());
+        let mut wasmtime_linker = wasmtime::Linker::new(&wasmtime_engine);
+        if let Some((name, bytes)) = &provider {
+            let module = wasmtime::Module::new(&wasmtime_engine, bytes)?;
+            let instance = wasmtime::Instance::new(&mut wasmtime_store, &module, &[])?;
+            wasmtime_linker.instance(&mut wasmtime_store, name, instance)?;
+        }
         let wasmtime_instance =
-            wasmtime::Instance::new(&mut wasmtime_store, &wasmtime_module, &[])?;
+            wasmtime_linker.instantiate(&mut wasmtime_store, &wasmtime_module)?;
         let wasmtime_func =
             wasmtime_instance.get_typed_func::<i32, i32>(&mut wasmtime_store, "calculate")?;
         let wasmi_engine = wasmi::Engine::default();
         let wasmi_module = wasmi::Module::new(&wasmi_engine, &wasm)?;
         let mut wasmi_store = wasmi::Store::new(&wasmi_engine, ());
-        let wasmi_instance = wasmi::Linker::new(&wasmi_engine)
-            .instantiate_and_start(&mut wasmi_store, &wasmi_module)?;
+        let mut wasmi_linker = wasmi::Linker::new(&wasmi_engine);
+        if let Some((name, bytes)) = &provider {
+            let module = wasmi::Module::new(&wasmi_engine, bytes)?;
+            let instance = wasmi::Linker::new(&wasmi_engine)
+                .instantiate_and_start(&mut wasmi_store, &module)?;
+            wasmi_linker.instance(&mut wasmi_store, name, instance)?;
+        }
+        let wasmi_instance = wasmi_linker.instantiate_and_start(&mut wasmi_store, &wasmi_module)?;
         let wasmi_func = wasmi_instance.get_typed_func::<i32, i32>(&wasmi_store, "calculate")?;
         let mut run_wasmtime = |inputs: &[u32]| -> Result<Vec<u32>> {
             let mut output = Vec::with_capacity(inputs.len());
@@ -470,6 +522,68 @@ fn memory_native(input: u32) -> u32 {
     value ^ global
 }
 
+#[inline(always)]
+fn bulk_start_native(input: u32) -> u32 {
+    let mut value = input ^ 17;
+    let byte = input as u8 as u32;
+    for round in 0..24u32 {
+        let data = MEMORY_DATA[(input.wrapping_add(round) & 15) as usize] as u32;
+        value = (value.rotate_left(7) ^ data)
+            .wrapping_add(byte)
+            .wrapping_mul(MIX_MULTIPLIER)
+            .wrapping_add(round);
+    }
+    value
+}
+
+#[inline(always)]
+fn recursive_native(input: u32) -> u32 {
+    fn step(depth: u32, value: u32) -> u32 {
+        let next = (value.rotate_left(5) ^ depth).wrapping_mul(MIX_MULTIPLIER);
+        if depth == 0 {
+            next
+        } else {
+            step(depth - 1, next) ^ depth.wrapping_mul(OTHER_MULTIPLIER)
+        }
+    }
+    step((input & 15) + 8, input)
+}
+
+#[inline(always)]
+fn mutable_table_native(input: u32) -> u32 {
+    let mut value = input;
+    let replaced = input & 3;
+    for round in 0..24u32 {
+        let slot = input.wrapping_add(round) & 3;
+        value = match if slot == replaced { 3 } else { slot } {
+            0 => value.rotate_left(7) ^ round,
+            1 => value.wrapping_mul(MIX_MULTIPLIER).wrapping_add(round),
+            2 => (value >> 3) ^ round,
+            _ => value.rotate_left(13) ^ round.wrapping_mul(OTHER_MULTIPLIER),
+        };
+    }
+    value
+}
+
+#[inline(always)]
+fn imported_calls_native(input: u32) -> u32 {
+    let mut value = input;
+    for round in 0..16u32 {
+        let salt = input ^ round;
+        for inner in 0..4u32 {
+            value = (value.rotate_left(5) ^ salt)
+                .wrapping_mul(MIX_MULTIPLIER)
+                .wrapping_add(inner);
+        }
+        value = if input & 1 != 0 {
+            value ^ round
+        } else {
+            value.rotate_right(3)
+        };
+    }
+    value
+}
+
 fn measure_metal(
     metal: &Kernel,
     inputs: &[u32],
@@ -563,14 +677,30 @@ mod tests {
         let inputs: Vec<u32> = (0..64).chain([u32::MAX, u32::MAX - 1]).collect();
         for workload in &SUITE_WORKLOADS {
             let wasm = wat::parse_str(workload.wat).unwrap();
+            let provider = workload
+                .provider
+                .map(|(name, source)| (name, wat::parse_str(source).unwrap()));
             let expected: Vec<u32> = inputs.iter().copied().map(workload.native).collect();
-            let metal = metal_wasm::Kernel::new(&wasm, "calculate").unwrap();
+            let metal = if let Some((name, bytes)) = &provider {
+                metal_wasm::Kernel::new_with_imports(&wasm, "calculate", &[(name, bytes)]).unwrap()
+            } else {
+                metal_wasm::Kernel::new(&wasm, "calculate").unwrap()
+            };
             let metal_output = metal.run(&inputs).unwrap();
             let wasmtime_engine = wasmtime::Engine::default();
             let wasmtime_module = wasmtime::Module::new(&wasmtime_engine, &wasm).unwrap();
             let mut wasmtime_store = wasmtime::Store::new(&wasmtime_engine, ());
-            let wasmtime_instance =
-                wasmtime::Instance::new(&mut wasmtime_store, &wasmtime_module, &[]).unwrap();
+            let mut wasmtime_linker = wasmtime::Linker::new(&wasmtime_engine);
+            if let Some((name, bytes)) = &provider {
+                let module = wasmtime::Module::new(&wasmtime_engine, bytes).unwrap();
+                let instance = wasmtime::Instance::new(&mut wasmtime_store, &module, &[]).unwrap();
+                wasmtime_linker
+                    .instance(&mut wasmtime_store, name, instance)
+                    .unwrap();
+            }
+            let wasmtime_instance = wasmtime_linker
+                .instantiate(&mut wasmtime_store, &wasmtime_module)
+                .unwrap();
             let wasmtime_func = wasmtime_instance
                 .get_typed_func::<i32, i32>(&mut wasmtime_store, "calculate")
                 .unwrap();
@@ -585,7 +715,17 @@ mod tests {
             let wasmi_engine = wasmi::Engine::default();
             let wasmi_module = wasmi::Module::new(&wasmi_engine, &wasm).unwrap();
             let mut wasmi_store = wasmi::Store::new(&wasmi_engine, ());
-            let wasmi_instance = wasmi::Linker::new(&wasmi_engine)
+            let mut wasmi_linker = wasmi::Linker::new(&wasmi_engine);
+            if let Some((name, bytes)) = &provider {
+                let module = wasmi::Module::new(&wasmi_engine, bytes).unwrap();
+                let instance = wasmi::Linker::new(&wasmi_engine)
+                    .instantiate_and_start(&mut wasmi_store, &module)
+                    .unwrap();
+                wasmi_linker
+                    .instance(&mut wasmi_store, name, instance)
+                    .unwrap();
+            }
+            let wasmi_instance = wasmi_linker
                 .instantiate_and_start(&mut wasmi_store, &wasmi_module)
                 .unwrap();
             let wasmi_func = wasmi_instance
