@@ -99,7 +99,7 @@ pub struct Kernel {
     params: Vec<ValType>,
     results: Vec<ValType>,
     instances: Vec<InstanceBuffers>,
-    memory_exports: HashMap<String, usize>,
+    memory_exports: HashMap<String, (usize, usize)>,
 }
 
 struct Translation {
@@ -110,32 +110,42 @@ struct Translation {
     instances: Vec<InstanceTemplate>,
     slots: Vec<BufferSlots>,
     recursive: bool,
-    memory_exports: HashMap<String, usize>,
+    memory_exports: HashMap<String, (usize, usize)>,
 }
 
 struct InstanceTemplate {
-    memory_template: Option<Vec<u8>>,
-    memory_capacity: Option<usize>,
+    memories: Vec<MemoryTemplate>,
     globals_template: Vec<u64>,
-    table_template: Option<Vec<u32>>,
-    table_info: TableInfo,
+    tables: Vec<TableTemplate>,
+    element_info: TableInfo,
     passive_data: Vec<u8>,
     data_lengths: Vec<u32>,
 }
 
+struct MemoryTemplate {
+    bytes: Vec<u8>,
+    capacity: usize,
+    max_pages: Option<u64>,
+}
+
+struct TableTemplate {
+    values: Vec<u32>,
+    info: TableInfo,
+    targets: Vec<usize>,
+}
+
 #[derive(Default)]
 struct BufferSlots {
-    memory: Option<u64>,
-    pages: Option<u64>,
+    memories: Vec<(u64, u64)>,
     globals: Option<u64>,
-    table: Option<u64>,
+    tables: Vec<u64>,
     passive_data: Option<u64>,
 }
 
 struct InstanceBuffers {
     template: InstanceTemplate,
     slots: BufferSlots,
-    table: Option<metal::Buffer>,
+    tables: Vec<Option<metal::Buffer>>,
     passive_data: Option<metal::Buffer>,
 }
 
@@ -225,19 +235,22 @@ impl Kernel {
         let queue = device.new_command_queue();
         let mut instances = Vec::new();
         for (template, slots) in translation.instances.into_iter().zip(translation.slots) {
-            let table = template
-                .table_template
-                .as_ref()
-                .filter(|_| !template.table_info.mutable)
-                .map(|data| make_buffer(&device, data))
-                .transpose()?;
+            let tables = template
+                .tables
+                .iter()
+                .map(|table| {
+                    (!table.info.mutable)
+                        .then(|| make_buffer(&device, &table.values))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let passive_data = (!template.data_lengths.is_empty())
                 .then(|| make_buffer(&device, &template.passive_data))
                 .transpose()?;
             instances.push(InstanceBuffers {
                 template,
                 slots,
-                table,
+                tables,
                 passive_data,
             });
         }
@@ -346,11 +359,8 @@ impl Kernel {
                 "memory inputs must have equal lengths".into(),
             ));
         }
-        let initial_size = self.instances[owner]
-            .template
-            .memory_template
-            .as_ref()
-            .unwrap()
+        let initial_size = self.instances[owner.0].template.memories[owner.1]
+            .bytes
             .len();
         if input_offset
             .checked_add(width)
@@ -374,7 +384,7 @@ impl Kernel {
     fn run_values_impl(
         &self,
         inputs: &[Vec<Value>],
-        capture: Option<(usize, Range<usize>)>,
+        capture: Option<((usize, usize), Range<usize>)>,
         memory_input: Option<MemoryInput<'_>>,
     ) -> Result<(Vec<Vec<Value>>, Vec<Vec<u8>>), Error> {
         for row in inputs {
@@ -482,7 +492,7 @@ impl Kernel {
                     &instance_buffers,
                     memory_input
                         .as_ref()
-                        .map(|input| (input.offset, input.width)),
+                        .map(|input| (capture.as_ref().unwrap().0, input.offset, input.width)),
                 )
                 .map_err(|error| shift_trap(error, start))?;
             if fast_i32 {
@@ -521,22 +531,22 @@ impl Kernel {
                         .collect()
                 }));
             }
-            if let Some((owner, range)) = &capture {
+            if let Some(((owner, resource), range)) = &capture {
                 let instance = &self.instances[*owner];
                 let buffers = &instance_buffers[*owner];
                 let buffer = |slot| &buffers.iter().find(|(index, _)| *index == slot).unwrap().1;
                 let pages = unsafe {
                     std::slice::from_raw_parts(
-                        buffer(instance.slots.pages.unwrap())
+                        buffer(instance.slots.memories[*resource].1)
                             .contents()
                             .cast::<u32>(),
                         end - start,
                     )
                 };
-                let stride = instance.template.memory_capacity.unwrap();
+                let stride = instance.template.memories[*resource].capacity;
                 let bytes = unsafe {
                     std::slice::from_raw_parts(
-                        buffer(instance.slots.memory.unwrap())
+                        buffer(instance.slots.memories[*resource].0)
                             .contents()
                             .cast::<u8>(),
                         stride * (end - start),
@@ -581,15 +591,17 @@ impl Kernel {
         }
         for instance in &self.instances {
             let template = &instance.template;
-            if instance.slots.memory.is_some() {
-                include(template.memory_capacity.unwrap().max(1))?;
+            for memory in &template.memories {
+                include(memory.capacity.max(1))?;
                 include(size_of::<u32>())?;
             }
             if instance.slots.globals.is_some() {
                 include(template.globals_template.len() * size_of::<u64>())?;
             }
-            if instance.slots.table.is_some() && template.table_info.mutable {
-                include(template.table_info.capacity.max(1) * size_of::<u32>())?;
+            for table in &template.tables {
+                if table.info.mutable {
+                    include(table.info.capacity.max(1) * size_of::<u32>())?;
+                }
             }
         }
         Ok(limit.min((MAX_BATCH_BYTES / per_lane).max(1)))
@@ -614,7 +626,7 @@ impl Kernel {
         output_bytes: usize,
         count: u32,
         instance_buffers: &[Vec<(u64, metal::Buffer)>],
-        memory_input: Option<(usize, usize)>,
+        memory_input: Option<((usize, usize), usize, usize)>,
     ) -> Result<(metal::Buffer, Option<Duration>), Error> {
         autoreleasepool(|| {
             let input_bytes = u64::try_from(input_data.len().max(4))
@@ -650,8 +662,14 @@ impl Kernel {
             encoder.set_compute_pipeline_state(&self.pipeline);
             encoder.set_buffer(0, Some(&input), 0);
             encoder.set_buffer(1, Some(&output), 0);
-            let (offset, width) = memory_input.unwrap_or((0, 0));
-            let config = [count as u64, offset as u64, width as u64];
+            let ((owner, resource), offset, width) = memory_input.unwrap_or(((0, 0), 0, 0));
+            let config = [
+                count as u64,
+                offset as u64,
+                width as u64,
+                owner as u64,
+                resource as u64,
+            ];
             encoder.set_bytes(2, size_of_val(&config) as u64, config.as_ptr().cast());
             if let Some(traps) = &traps {
                 encoder.set_buffer(3, Some(traps), 0);
@@ -817,14 +835,11 @@ impl InstanceBuffers {
     fn for_batch(&self, device: &Device, count: u32) -> Result<Vec<(u64, metal::Buffer)>, Error> {
         let mut buffers = Vec::new();
         let template = &self.template;
-        if let Some(slot) = self.slots.memory {
-            let initial = template.memory_template.as_ref().unwrap();
+        for (memory, &(slot, pages)) in template.memories.iter().zip(&self.slots.memories) {
+            let initial = &memory.bytes;
+            buffers.push((slot, lane_buffer(device, initial, memory.capacity, count)?));
             buffers.push((
-                slot,
-                lane_buffer(device, initial, template.memory_capacity.unwrap(), count)?,
-            ));
-            buffers.push((
-                self.slots.pages.unwrap(),
+                pages,
                 lane_buffer(device, &[initial.len() as u32 / 65536], 1, count)?,
             ));
         }
@@ -839,18 +854,13 @@ impl InstanceBuffers {
                 )?,
             ));
         }
-        if let Some(slot) = self.slots.table {
-            let table = if template.table_info.mutable {
-                lane_buffer(
-                    device,
-                    template.table_template.as_ref().unwrap(),
-                    template.table_info.capacity,
-                    count,
-                )?
+        for (index, (table, &slot)) in template.tables.iter().zip(&self.slots.tables).enumerate() {
+            let buffer = if table.info.mutable {
+                lane_buffer(device, &table.values, table.info.capacity, count)?
             } else {
-                self.table.as_ref().unwrap().clone()
+                self.tables[index].as_ref().unwrap().clone()
             };
-            buffers.push((slot, table));
+            buffers.push((slot, buffer));
         }
         if let Some(slot) = self.slots.passive_data {
             buffers.push((slot, self.passive_data.as_ref().unwrap().clone()));
@@ -861,20 +871,10 @@ impl InstanceBuffers {
     fn reset_batch(&self, buffers: &[(u64, metal::Buffer)], count: u32) {
         let buffer = |slot| &buffers.iter().find(|(index, _)| *index == slot).unwrap().1;
         let template = &self.template;
-        if let Some(slot) = self.slots.memory {
-            let initial = template.memory_template.as_ref().unwrap();
-            reset_lane_buffer(
-                buffer(slot),
-                initial,
-                template.memory_capacity.unwrap(),
-                count,
-            );
-            reset_lane_buffer(
-                buffer(self.slots.pages.unwrap()),
-                &[initial.len() as u32 / 65536],
-                1,
-                count,
-            );
+        for (memory, &(slot, pages)) in template.memories.iter().zip(&self.slots.memories) {
+            let initial = &memory.bytes;
+            reset_lane_buffer(buffer(slot), initial, memory.capacity, count);
+            reset_lane_buffer(buffer(pages), &[initial.len() as u32 / 65536], 1, count);
         }
         if let Some(slot) = self.slots.globals {
             reset_lane_buffer(
@@ -884,13 +884,10 @@ impl InstanceBuffers {
                 count,
             );
         }
-        if let Some(slot) = self.slots.table.filter(|_| template.table_info.mutable) {
-            reset_lane_buffer(
-                buffer(slot),
-                template.table_template.as_ref().unwrap(),
-                template.table_info.capacity,
-                count,
-            );
+        for (table, &slot) in template.tables.iter().zip(&self.slots.tables) {
+            if table.info.mutable {
+                reset_lane_buffer(buffer(slot), &table.values, table.info.capacity, count);
+            }
         }
     }
 }
@@ -931,23 +928,22 @@ struct ParsedModule<'a> {
     all_imports: Vec<(String, String, TypeRef)>,
     resolved_imports: Vec<(usize, usize)>,
     resolved_functions: Vec<usize>,
-    memory_type: Option<MemoryType>,
-    memory_owner: Option<usize>,
-    table_type: Option<TableType>,
-    table_owner: Option<usize>,
+    memory_types: Vec<MemoryType>,
+    memory_bindings: Vec<Option<(usize, usize)>>,
+    table_types: Vec<TableType>,
+    table_bindings: Vec<Option<(usize, usize)>>,
     global_types: Vec<GlobalType>,
     global_bindings: Vec<(usize, usize)>,
     local_global_slots: Vec<usize>,
     dynamic_globals: Vec<(usize, ValType, ConstExpr<'a>)>,
-    active_elements: Vec<(usize, ConstExpr<'a>)>,
-    active_data: Vec<(ConstExpr<'a>, usize, usize)>,
-    table_init_expr: Option<ConstExpr<'a>>,
+    active_elements: Vec<(usize, usize, ConstExpr<'a>)>,
+    active_data: Vec<(usize, ConstExpr<'a>, usize, usize)>,
+    table_init_exprs: Vec<(usize, ConstExpr<'a>)>,
+    dynamic_elements: Vec<(usize, usize, ConstExpr<'a>)>,
     start_index: Option<usize>,
     globals_mutable: Vec<bool>,
     reference_globals: Vec<usize>,
-    memory_max_pages: Option<u64>,
     data_offsets: Vec<usize>,
-    table_targets: Vec<usize>,
     instance: InstanceTemplate,
 }
 
@@ -970,9 +966,9 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
     let mut imports = Vec::new();
     let mut all_imports = Vec::new();
     let mut start_index = None;
-    let mut memory_template: Option<Vec<u8>> = None;
-    let mut memory_type = None;
-    let mut memory_max_pages = None;
+    let mut memories = Vec::new();
+    let mut memory_types = Vec::new();
+    let mut memory_bindings = Vec::new();
     let mut globals_template = Vec::new();
     let mut globals_mutable = Vec::new();
     let mut global_types = Vec::new();
@@ -981,12 +977,13 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
     let mut dynamic_globals = Vec::new();
     let mut active_elements = Vec::new();
     let mut active_data = Vec::new();
-    let mut table_init_expr = None;
+    let mut table_init_exprs = Vec::new();
+    let mut dynamic_elements = Vec::new();
     let mut reference_globals = Vec::new();
-    let mut table_template: Option<Vec<u32>> = None;
-    let mut table_type = None;
-    let mut table_info = TableInfo::default();
-    let mut table_max = None;
+    let mut tables = Vec::new();
+    let mut table_types = Vec::new();
+    let mut table_bindings = Vec::new();
+    let mut element_info = TableInfo::default();
     let mut passive_data = Vec::new();
     let mut data_offsets = Vec::new();
     let mut data_lengths = Vec::new();
@@ -1008,30 +1005,22 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                             imports.push((import.module.to_owned(), import.name.to_owned()));
                         }
                         TypeRef::Memory(ty) => {
-                            if memory_type.is_some()
-                                || ty.memory64
-                                || ty.shared
-                                || ty.page_size_log2() != 16
-                            {
+                            if ty.shared || ty.page_size_log2() != 16 {
                                 return Err(Error::Unsupported(
-                                    "only one unshared 32-bit memory is supported".into(),
+                                    "only unshared 64 KiB page memories are supported".into(),
                                 ));
                             }
-                            memory_type = Some(ty);
-                            memory_max_pages = ty.maximum;
+                            memory_types.push(ty);
+                            memory_bindings.push(None);
                         }
                         TypeRef::Table(ty) => {
-                            if table_type.is_some()
-                                || ty.element_type != RefType::FUNCREF
-                                || ty.table64
-                                || ty.shared
-                            {
+                            if ty.element_type != RefType::FUNCREF || ty.shared {
                                 return Err(Error::Unsupported(
-                                    "only one unshared 32-bit funcref table is supported".into(),
+                                    "only unshared funcref tables are supported".into(),
                                 ));
                             }
-                            table_type = Some(ty);
-                            table_max = ty.maximum;
+                            table_types.push(ty);
+                            table_bindings.push(None);
                         }
                         TypeRef::Global(ty) => {
                             if !is_supported_value(ty.content_type) || ty.shared {
@@ -1059,13 +1048,9 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
             Payload::TableSection(section) => {
                 for table in section {
                     let table = table?;
-                    if table_type.is_some()
-                        || table.ty.element_type != RefType::FUNCREF
-                        || table.ty.table64
-                        || table.ty.shared
-                    {
+                    if table.ty.element_type != RefType::FUNCREF || table.ty.shared {
                         return Err(Error::Unsupported(
-                            "only one unshared 32-bit funcref table is supported".into(),
+                            "only unshared funcref tables are supported".into(),
                         ));
                     }
                     let size = usize::try_from(table.ty.initial)
@@ -1077,27 +1062,40 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                     }
                     let value = match table.init {
                         TableInit::RefNull => 0,
-                        TableInit::Expr(expr) if imported_globals == 0 => eval_ref_const(&expr)?,
+                        TableInit::Expr(expr) if imported_globals == 0 => u32::try_from(
+                            eval_const(&expr, &globals_template, &local_global_slots)?,
+                        )
+                        .map_err(|_| Error::Unsupported("function reference overflow".into()))?,
                         TableInit::Expr(expr) => {
-                            table_init_expr = Some(expr);
+                            table_init_exprs.push((tables.len(), expr));
                             0
                         }
                     };
-                    table_max = table.ty.maximum;
-                    table_type = Some(table.ty);
-                    table_template = Some(vec![value; size]);
+                    let capacity = size.saturating_add(limits.table_growth_elements).min(
+                        table
+                            .ty
+                            .maximum
+                            .unwrap_or(u64::MAX)
+                            .min(MAX_TABLE_ELEMENTS as u64) as usize,
+                    );
+                    table_types.push(table.ty);
+                    table_bindings.push(None);
+                    tables.push(TableTemplate {
+                        values: vec![value; size],
+                        info: TableInfo {
+                            capacity,
+                            ..Default::default()
+                        },
+                        targets: Vec::new(),
+                    });
                 }
             }
             Payload::MemorySection(section) => {
                 for memory in section {
                     let memory = memory?;
-                    if memory_type.is_some()
-                        || memory.memory64
-                        || memory.shared
-                        || memory.page_size_log2() != 16
-                    {
+                    if memory.shared || memory.page_size_log2() != 16 {
                         return Err(Error::Unsupported(
-                            "only one unshared 32-bit memory is supported".into(),
+                            "only unshared 64 KiB page memories are supported".into(),
                         ));
                     }
                     let bytes = memory
@@ -1105,14 +1103,24 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                         .checked_mul(65536)
                         .and_then(|bytes| usize::try_from(bytes).ok())
                         .ok_or_else(|| Error::Unsupported("memory size overflow".into()))?;
-                    if bytes > limits.memory_bytes {
+                    if bytes > limits.memory_bytes
+                        || memories
+                            .iter()
+                            .map(|memory: &MemoryTemplate| memory.bytes.len())
+                            .sum::<usize>()
+                            > limits.memory_bytes - bytes
+                    {
                         return Err(Error::Unsupported(
                             "initial memory exceeds the configured per-lane limit".into(),
                         ));
                     }
-                    memory_template = Some(vec![0; bytes]);
-                    memory_type = Some(memory);
-                    memory_max_pages = memory.maximum;
+                    memory_types.push(memory);
+                    memory_bindings.push(None);
+                    memories.push(MemoryTemplate {
+                        bytes: vec![0; bytes],
+                        capacity: 0,
+                        max_pages: memory.maximum,
+                    });
                 }
             }
             Payload::GlobalSection(section) => {
@@ -1158,61 +1166,109 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
             Payload::ElementSection(section) => {
                 for element in section {
                     let element = element?;
-                    let values: Vec<u32> = match element.items {
-                        ElementItems::Functions(indices) => indices
-                            .into_iter()
-                            .map(|index| {
-                                index?.checked_add(1).ok_or_else(|| {
-                                    Error::Unsupported("function index overflow".into())
+                    let values: Vec<u32> =
+                        match element.items {
+                            ElementItems::Functions(indices) => indices
+                                .into_iter()
+                                .map(|index| {
+                                    index?.checked_add(1).ok_or_else(|| {
+                                        Error::Unsupported("function index overflow".into())
+                                    })
                                 })
-                            })
-                            .collect::<Result<_, Error>>()?,
-                        ElementItems::Expressions(RefType::FUNCREF, expressions) => expressions
-                            .into_iter()
-                            .map(|expr| eval_ref_const(&expr?))
-                            .collect::<Result<_, Error>>()?,
-                        _ => {
-                            return Err(Error::Unsupported(
-                                "only funcref elements are supported".into(),
-                            ));
-                        }
-                    };
+                                .collect::<Result<_, Error>>()?,
+                            ElementItems::Expressions(RefType::FUNCREF, expressions) => {
+                                let mut values = Vec::new();
+                                for expr in expressions {
+                                    let expr = expr?;
+                                    if imported_globals != 0
+                                        && expr
+                                            .get_operators_reader()
+                                            .into_iter()
+                                            .any(|op| matches!(op, Ok(Operator::GlobalGet { .. })))
+                                    {
+                                        dynamic_elements.push((
+                                            element_info.elements.len(),
+                                            values.len(),
+                                            expr,
+                                        ));
+                                        values.push(0);
+                                    } else {
+                                        values.push(
+                                            u32::try_from(eval_const(
+                                                &expr,
+                                                &globals_template,
+                                                &local_global_slots,
+                                            )?)
+                                            .map_err(|_| {
+                                                Error::Unsupported(
+                                                    "function reference overflow".into(),
+                                                )
+                                            })?,
+                                        );
+                                    }
+                                }
+                                values
+                            }
+                            _ => {
+                                return Err(Error::Unsupported(
+                                    "only funcref elements are supported".into(),
+                                ));
+                            }
+                        };
                     let length = match element.kind {
                         ElementKind::Active {
-                            table_index: None | Some(0),
+                            table_index,
                             offset_expr,
                         } => {
-                            if table_type.is_none() {
-                                return Err(Error::Unsupported("elements without a table".into()));
-                            }
+                            let table_index = table_index.unwrap_or(0) as usize;
+                            let table_type = table_types.get(table_index).ok_or_else(|| {
+                                Error::Unsupported("element table is out of range".into())
+                            })?;
                             let mut initialized = false;
-                            if let Some(table) =
-                                table_template.as_mut().filter(|_| imported_globals == 0)
+                            let imported = table_types.len() - tables.len();
+                            if let Some(table) = table_index
+                                .checked_sub(imported)
+                                .and_then(|index| tables.get_mut(index))
+                                .filter(|_| {
+                                    imported_globals == 0
+                                        && !dynamic_elements.iter().any(|(segment, _, _)| {
+                                            *segment == element_info.elements.len()
+                                        })
+                                })
                             {
                                 let offset = eval_const(
                                     &offset_expr,
                                     &globals_template,
                                     &local_global_slots,
-                                )? as u32 as usize;
-                                if let Some(end) = offset
-                                    .checked_add(values.len())
-                                    .filter(|&end| end <= table.len())
-                                {
-                                    table[offset..end].copy_from_slice(&values);
+                                )?;
+                                let offset = if table_type.table64 {
+                                    offset
+                                } else {
+                                    offset as u32 as u64
+                                };
+                                if let Some(end) = usize::try_from(offset).ok().and_then(|offset| {
+                                    offset
+                                        .checked_add(values.len())
+                                        .filter(|&end| end <= table.values.len())
+                                }) {
+                                    table.values[end - values.len()..end].copy_from_slice(&values);
                                     initialized = true;
                                 }
                             }
                             if !initialized {
-                                active_elements.push((table_info.elements.len(), offset_expr));
+                                active_elements.push((
+                                    element_info.elements.len(),
+                                    table_index,
+                                    offset_expr,
+                                ));
                             }
                             0
                         }
                         ElementKind::Passive => values.len() as u32,
                         ElementKind::Declared => 0,
-                        _ => return Err(Error::Unsupported("only table 0 is supported".into())),
                     };
-                    table_info.lengths.push(length);
-                    table_info.elements.push(values);
+                    element_info.lengths.push(length);
+                    element_info.elements.push(values);
                 }
             }
             Payload::DataSection(section) => {
@@ -1220,26 +1276,37 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                     let data = data?;
                     match data.kind {
                         DataKind::Active {
-                            memory_index: 0,
+                            memory_index,
                             offset_expr,
                         } => {
-                            if memory_type.is_none() {
-                                return Err(Error::Unsupported("data without memory".into()));
-                            }
+                            let memory_index = memory_index as usize;
+                            let memory_type = memory_types.get(memory_index).ok_or_else(|| {
+                                Error::Unsupported("data memory is out of range".into())
+                            })?;
                             let mut initialized = false;
-                            if let Some(memory) =
-                                memory_template.as_mut().filter(|_| imported_globals == 0)
+                            let imported = memory_types.len() - memories.len();
+                            if let Some(memory) = memory_index
+                                .checked_sub(imported)
+                                .and_then(|index| memories.get_mut(index))
+                                .filter(|_| imported_globals == 0)
                             {
                                 let offset = eval_const(
                                     &offset_expr,
                                     &globals_template,
                                     &local_global_slots,
-                                )? as u32 as usize;
-                                if let Some(end) = offset
-                                    .checked_add(data.data.len())
-                                    .filter(|&end| end <= memory.len())
-                                {
-                                    memory[offset..end].copy_from_slice(data.data);
+                                )?;
+                                let offset = if memory_type.memory64 {
+                                    offset
+                                } else {
+                                    offset as u32 as u64
+                                };
+                                if let Some(end) = usize::try_from(offset).ok().and_then(|offset| {
+                                    offset
+                                        .checked_add(data.data.len())
+                                        .filter(|&end| end <= memory.bytes.len())
+                                }) {
+                                    memory.bytes[end - data.data.len()..end]
+                                        .copy_from_slice(data.data);
                                     initialized = true;
                                 }
                             }
@@ -1247,7 +1314,12 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                                 data_offsets.push(0);
                             } else {
                                 let offset = passive_data.len();
-                                active_data.push((offset_expr, offset, data.data.len()));
+                                active_data.push((
+                                    memory_index,
+                                    offset_expr,
+                                    offset,
+                                    data.data.len(),
+                                ));
                                 data_offsets.push(offset);
                                 passive_data.extend_from_slice(data.data);
                             }
@@ -1260,11 +1332,6 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
                             data_offsets.push(passive_data.len());
                             data_lengths.push(length);
                             passive_data.extend_from_slice(data.data);
-                        }
-                        _ => {
-                            return Err(Error::Unsupported(
-                                "only data for memory 0 is supported".into(),
-                            ));
                         }
                     }
                 }
@@ -1288,11 +1355,6 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
         }
     }
 
-    table_info.capacity = table_template.as_ref().map_or(0, |t| {
-        t.len()
-            .saturating_add(limits.table_growth_elements)
-            .min(table_max.unwrap_or(u64::MAX).min(MAX_TABLE_ELEMENTS as u64) as usize)
-    });
     Ok(ParsedModule {
         types,
         function_types,
@@ -1308,23 +1370,21 @@ fn parse_module(wasm: &[u8], limits: KernelLimits) -> Result<ParsedModule<'_>, E
         dynamic_globals,
         active_elements,
         active_data,
-        table_init_expr,
+        table_init_exprs,
+        dynamic_elements,
         reference_globals,
-        memory_type,
-        memory_owner: None,
-        memory_max_pages,
-        table_type,
-        table_owner: None,
+        memory_types,
+        memory_bindings,
+        table_types,
+        table_bindings,
         data_offsets,
         resolved_functions: Vec::new(),
         resolved_imports: Vec::new(),
-        table_targets: Vec::new(),
         instance: InstanceTemplate {
-            memory_template,
-            memory_capacity: None,
+            memories,
             globals_template,
-            table_template,
-            table_info,
+            tables,
+            element_info,
             passive_data,
             data_lengths,
         },
@@ -1351,14 +1411,20 @@ fn load_dependencies<'a>(
     modules[index]
         .global_bindings
         .extend(local_slots.into_iter().map(|slot| (index, slot)));
-    if modules[index].instance.memory_template.is_some() {
-        modules[index].memory_owner = Some(index);
+    let local_memories = modules[index].instance.memories.len();
+    let memory_imports = modules[index].memory_types.len() - local_memories;
+    for local in 0..local_memories {
+        modules[index].memory_bindings[memory_imports + local] = Some((index, local));
     }
-    if modules[index].instance.table_template.is_some() {
-        modules[index].table_owner = Some(index);
+    let local_tables = modules[index].instance.tables.len();
+    let table_imports = modules[index].table_types.len() - local_tables;
+    for local in 0..local_tables {
+        modules[index].table_bindings[table_imports + local] = Some((index, local));
     }
     let links = modules[index].all_imports.clone();
     let mut global_import = 0;
+    let mut memory_import = 0;
+    let mut table_import = 0;
     for (namespace, name, ty) in links {
         let provider = if let Some(&provider) = namespaces.get(&namespace) {
             if visiting[provider] {
@@ -1396,15 +1462,18 @@ fn load_dependencies<'a>(
                 modules[index].resolved_imports.push((provider, exported));
             }
             TypeRef::Memory(expected) if kind == ExternalKind::Memory => {
-                let actual = modules[provider].memory_type.unwrap();
-                if exported != 0
-                    || !limits_match(
-                        actual.initial,
-                        actual.maximum,
-                        expected.initial,
-                        expected.maximum,
-                    )
-                    || actual.memory64 != expected.memory64
+                let actual = *modules[provider]
+                    .memory_types
+                    .get(exported)
+                    .ok_or_else(|| {
+                        Error::Unsupported("provider memory export is out of range".into())
+                    })?;
+                if !limits_match(
+                    actual.initial,
+                    actual.maximum,
+                    expected.initial,
+                    expected.maximum,
+                ) || actual.memory64 != expected.memory64
                     || actual.shared != expected.shared
                     || actual.page_size_log2() != expected.page_size_log2()
                 {
@@ -1412,18 +1481,20 @@ fn load_dependencies<'a>(
                         "memory type mismatch for import {namespace}.{name}"
                     )));
                 }
-                modules[index].memory_owner = modules[provider].memory_owner;
+                modules[index].memory_bindings[memory_import] =
+                    modules[provider].memory_bindings[exported];
+                memory_import += 1;
             }
             TypeRef::Table(expected) if kind == ExternalKind::Table => {
-                let actual = modules[provider].table_type.unwrap();
-                if exported != 0
-                    || !limits_match(
-                        actual.initial,
-                        actual.maximum,
-                        expected.initial,
-                        expected.maximum,
-                    )
-                    || actual.element_type != expected.element_type
+                let actual = *modules[provider].table_types.get(exported).ok_or_else(|| {
+                    Error::Unsupported("provider table export is out of range".into())
+                })?;
+                if !limits_match(
+                    actual.initial,
+                    actual.maximum,
+                    expected.initial,
+                    expected.maximum,
+                ) || actual.element_type != expected.element_type
                     || actual.table64 != expected.table64
                     || actual.shared != expected.shared
                 {
@@ -1431,7 +1502,9 @@ fn load_dependencies<'a>(
                         "table type mismatch for import {namespace}.{name}"
                     )));
                 }
-                modules[index].table_owner = modules[provider].table_owner;
+                modules[index].table_bindings[table_import] =
+                    modules[provider].table_bindings[exported];
+                table_import += 1;
             }
             TypeRef::Global(expected) if kind == ExternalKind::Global => {
                 if modules[provider].global_types.get(exported) != Some(&expected) {
@@ -1555,15 +1628,15 @@ fn translate_with_limits(
     let mut referenced = Vec::new();
     for module in &mut modules {
         let instance = &mut module.instance;
-        if let Some(table) = &mut instance.table_template {
-            for value in table {
+        for table in &mut instance.tables {
+            for value in &mut table.values {
                 *value = remap_reference(*value, &module.resolved_functions)?;
                 if *value != 0 {
                     referenced.push((*value - 1) as usize);
                 }
             }
         }
-        for segment in &mut instance.table_info.elements {
+        for segment in &mut instance.element_info.elements {
             for value in segment {
                 *value = remap_reference(*value, &module.resolved_functions)?;
                 if *value != 0 {
@@ -1588,7 +1661,14 @@ fn translate_with_limits(
                 }
             }
         }
-        if let Some(expr) = &module.table_init_expr {
+        for (_, expr) in &module.table_init_exprs {
+            for op in expr.get_operators_reader() {
+                if let Operator::RefFunc { function_index } = op? {
+                    referenced.push(module.resolved_functions[function_index as usize]);
+                }
+            }
+        }
+        for (_, _, expr) in &module.dynamic_elements {
             for op in expr.get_operators_reader() {
                 if let Operator::RefFunc { function_index } = op? {
                     referenced.push(module.resolved_functions[function_index as usize]);
@@ -1614,18 +1694,18 @@ fn translate_with_limits(
         })
         .collect();
     for module in &mut modules {
-        module.instance.table_info.mutable = false;
-        module.table_targets = module
-            .instance
-            .table_template
-            .iter()
-            .flatten()
-            .copied()
-            .filter(|&v| v != 0)
-            .map(|v| (v - 1) as usize)
-            .collect();
-        module.table_targets.sort_unstable();
-        module.table_targets.dedup();
+        for table in &mut module.instance.tables {
+            table.info.mutable = false;
+            table.targets = table
+                .values
+                .iter()
+                .copied()
+                .filter(|&v| v != 0)
+                .map(|v| (v - 1) as usize)
+                .collect();
+            table.targets.sort_unstable();
+            table.targets.dedup();
+        }
     }
     // A newly reachable table mutation can expose more indirect call targets.
     // Repeat reachability until those targets no longer change.
@@ -1633,7 +1713,10 @@ fn translate_with_limits(
         let mut reachable = vec![0u8; functions.len()];
         let mut ignored_order = Vec::new();
         let mut ignored_traps = false;
-        let mut ignored_growth = vec![false; modules.len()];
+        let mut ignored_growth: Vec<Vec<bool>> = modules
+            .iter()
+            .map(|module| vec![false; module.instance.memories.len()])
+            .collect();
         let mut ignored_recursion = false;
         for function in std::iter::once(&index).chain(&starts) {
             visit_function(
@@ -1648,13 +1731,23 @@ fn translate_with_limits(
                 &mut ignored_recursion,
             )?;
         }
-        let mut mutates = vec![false; modules.len()];
-        let mut grows = vec![false; modules.len()];
+        let mut mutates: Vec<Vec<bool>> = modules
+            .iter()
+            .map(|module| vec![false; module.instance.tables.len()])
+            .collect();
+        let mut grows = mutates.clone();
         for module in &modules {
-            if (!module.active_elements.is_empty() || module.table_init_expr.is_some())
-                && let Some(owner) = module.table_owner
-            {
-                mutates[owner] = true;
+            for &(_, table_index, _) in &module.active_elements {
+                let (owner, local) = module.table_bindings[table_index].unwrap();
+                mutates[owner][local] = true;
+            }
+            for &(local, _) in &module.table_init_exprs {
+                if local < module.instance.tables.len() {
+                    let (owner, table) = module.table_bindings
+                        [module.table_types.len() - module.instance.tables.len() + local]
+                        .unwrap();
+                    mutates[owner][table] = true;
+                }
             }
         }
         for (function, &state) in reachable.iter().enumerate() {
@@ -1663,22 +1756,22 @@ fn translate_with_limits(
             }
             let (module_index, local) = functions[function];
             let module = &modules[module_index];
-            let table_owner = module.table_owner;
             for op in module.bodies[local - module.imports.len()].get_operators_reader()? {
                 match op? {
-                    Operator::TableSet { .. }
-                    | Operator::TableFill { .. }
-                    | Operator::TableCopy { .. }
-                    | Operator::TableInit { .. } => {
-                        if let Some(owner) = table_owner {
-                            mutates[owner] = true;
-                        }
+                    Operator::TableSet { table }
+                    | Operator::TableFill { table }
+                    | Operator::TableInit { table, .. } => {
+                        let (owner, local) = module.table_bindings[table as usize].unwrap();
+                        mutates[owner][local] = true;
                     }
-                    Operator::TableGrow { .. } => {
-                        if let Some(owner) = table_owner {
-                            mutates[owner] = true;
-                            grows[owner] = true;
-                        }
+                    Operator::TableCopy { dst_table, .. } => {
+                        let (owner, local) = module.table_bindings[dst_table as usize].unwrap();
+                        mutates[owner][local] = true;
+                    }
+                    Operator::TableGrow { table } => {
+                        let (owner, local) = module.table_bindings[table as usize].unwrap();
+                        mutates[owner][local] = true;
+                        grows[owner][local] = true;
                     }
                     _ => {}
                 }
@@ -1686,17 +1779,20 @@ fn translate_with_limits(
         }
         let mut changed = false;
         for (module_index, module) in modules.iter_mut().enumerate() {
-            if mutates[module_index] && !module.instance.table_info.mutable {
-                module.instance.table_info.mutable = true;
-                module.table_targets = referenced.clone();
-                changed = true;
+            for (table_index, table) in module.instance.tables.iter_mut().enumerate() {
+                if mutates[module_index][table_index] && !table.info.mutable {
+                    table.info.mutable = true;
+                    table.targets = referenced.clone();
+                    changed = true;
+                }
             }
         }
         if !changed {
             for (module_index, module) in modules.iter_mut().enumerate() {
-                if !grows[module_index] {
-                    module.instance.table_info.capacity =
-                        module.instance.table_template.as_ref().map_or(0, Vec::len);
+                for (table_index, table) in module.instance.tables.iter_mut().enumerate() {
+                    if !grows[module_index][table_index] {
+                        table.info.capacity = table.values.len();
+                    }
                 }
             }
             break;
@@ -1706,11 +1802,14 @@ fn translate_with_limits(
     let mut order = Vec::new();
     let mut visit_state = vec![0u8; functions.len()];
     let mut can_trap = modules.iter().any(|m| {
-        m.instance.memory_template.is_some()
+        !m.instance.memories.is_empty()
             || !m.active_data.is_empty()
             || !m.active_elements.is_empty()
     });
-    let mut uses_growth = vec![false; modules.len()];
+    let mut uses_growth: Vec<Vec<bool>> = modules
+        .iter()
+        .map(|module| vec![false; module.instance.memories.len()])
+        .collect();
     visit_function(
         index,
         &modules,
@@ -1735,28 +1834,47 @@ fn translate_with_limits(
             &mut recursive,
         )?;
     }
+    let tail_calls = order.iter().any(|&function| {
+        let (module_index, local) = functions[function];
+        modules[module_index].bodies[local - modules[module_index].imports.len()]
+            .get_operators_reader()
+            .unwrap()
+            .into_iter()
+            .any(|op| {
+                matches!(
+                    op,
+                    Ok(Operator::ReturnCall { .. }
+                        | Operator::ReturnCallIndirect { .. }
+                        | Operator::ReturnCallRef { .. })
+                )
+            })
+    });
+    recursive |= tail_calls;
     can_trap |= recursive;
     let mut slots = Vec::new();
     let mut next_slot = 4u64;
     for (module_index, module) in modules.iter_mut().enumerate() {
         let instance = &mut module.instance;
-        instance.memory_capacity = instance.memory_template.as_ref().map(|template| {
-            let initial_pages = template.len() / 65536;
-            let wanted = initial_pages.saturating_add(if uses_growth[module_index] {
+        let initial_total: usize = instance
+            .memories
+            .iter()
+            .map(|memory| memory.bytes.len())
+            .sum();
+        let growth_budget_pages = (limits.memory_bytes - initial_total) / 65536;
+        for (memory_index, memory) in instance.memories.iter_mut().enumerate() {
+            let initial_pages = memory.bytes.len() / 65536;
+            let wanted = initial_pages.saturating_add(if uses_growth[module_index][memory_index] {
                 limits.memory_growth_pages
             } else {
                 0
             });
-            wanted
-                .min(
-                    module
-                        .memory_max_pages
-                        .unwrap_or(u64::MAX)
-                        .min(usize::MAX as u64) as usize,
-                )
-                .min(limits.memory_bytes / 65536)
-                * 65536
-        });
+            let max_pages = memory.max_pages.unwrap_or(u64::MAX).min(usize::MAX as u64) as usize;
+            let extra_pages = wanted
+                .min(max_pages)
+                .saturating_sub(initial_pages)
+                .min(growth_budget_pages);
+            memory.capacity = memory.bytes.len() + extra_pages * 65536;
+        }
         let mut allocate = |needed: bool| {
             needed.then(|| {
                 let slot = next_slot;
@@ -1764,11 +1882,16 @@ fn translate_with_limits(
                 slot
             })
         };
+        let memories = (0..instance.memories.len())
+            .map(|_| (allocate(true).unwrap(), allocate(true).unwrap()))
+            .collect();
+        let tables = (0..instance.tables.len())
+            .map(|_| allocate(true).unwrap())
+            .collect();
         slots.push(BufferSlots {
-            memory: allocate(instance.memory_template.is_some()),
-            pages: allocate(instance.memory_template.is_some()),
+            memories,
             globals: allocate(!instance.globals_template.is_empty()),
-            table: allocate(instance.table_template.is_some()),
+            tables,
             passive_data: allocate(!instance.data_lengths.is_empty()),
         });
     }
@@ -1781,9 +1904,45 @@ fn translate_with_limits(
     source.push_str(include_str!("softfloat64.metal"));
     source.push_str(include_str!("wasm_float.metal"));
     source.push_str(include_str!("wasm_simd.metal"));
-    source.push_str("struct ModuleState { device uchar* memory; device uint* pages; device ulong* globals; device uint* table; device const uchar* passive_data; uint table_size; thread uint* element_lengths; thread uint* data_lengths; };\n");
+    let max_memories = modules
+        .iter()
+        .map(|m| m.instance.memories.len())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let max_tables = modules
+        .iter()
+        .map(|m| m.instance.tables.len())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let max_elements = modules
+        .iter()
+        .map(|m| m.instance.element_info.elements.len())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    source.push_str(&format!("struct ModuleState {{ device uchar* memory[{max_memories}]; device uint* pages[{max_memories}]; device ulong* globals; device uint* table[{max_tables}]; device const uchar* passive_data; uint table_size[{max_tables}]; thread uint* element_lengths; thread uint* data_lengths; thread uint* element_values[{max_elements}]; }};\n"));
+    if tail_calls {
+        let max_args = order
+            .iter()
+            .map(|&f| {
+                global_types[f]
+                    .params()
+                    .iter()
+                    .map(|ty| value_words(*ty))
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        source.push_str(&format!(
+            "struct TailFrame {{ uint next; ulong args[{max_args}]; }};\n"
+        ));
+        source.push_str("void invoke(uint target, thread ulong* input_args, thread ulong* output_results, thread ModuleState* states, thread uint& trap, uint depth);\n");
+    }
     for (module_index, module) in modules.iter().enumerate() {
-        for (element, values) in module.instance.table_info.elements.iter().enumerate() {
+        for (element, values) in module.instance.element_info.elements.iter().enumerate() {
             source.push_str(&format!(
                 "constant uint m{module_index}_element_{element}[{}] = {{{}}};\n",
                 values.len().max(1),
@@ -1804,6 +1963,7 @@ fn translate_with_limits(
             function,
             &global_types[function],
             recursive,
+            tail_calls,
         )?);
         source.push_str(";\n");
     }
@@ -1816,8 +1976,13 @@ fn translate_with_limits(
             local,
             &global_types,
             recursive,
+            tail_calls,
             limits.call_depth,
+            limits.memory_bytes,
         )?);
+    }
+    if tail_calls {
+        source.push_str(&tail_dispatcher(&order, &global_types, limits.call_depth));
     }
     let fast_i32 = ty.params() == [ValType::I32] && ty.results() == [ValType::I32];
     let input_ty = if fast_i32 { "uint" } else { "ulong" };
@@ -1826,11 +1991,16 @@ fn translate_with_limits(
         source.push_str(", device uint* traps [[buffer(3)]]");
     }
     for (module_index, slot) in slots.iter().enumerate() {
+        for (index, &(memory, pages)) in slot.memories.iter().enumerate() {
+            source.push_str(&format!(", device uchar* m{module_index}_memory{index} [[buffer({memory})]], device uint* m{module_index}_pages{index} [[buffer({pages})]]"));
+        }
+        for (index, &table) in slot.tables.iter().enumerate() {
+            source.push_str(&format!(
+                ", device uint* m{module_index}_table{index} [[buffer({table})]]"
+            ));
+        }
         for (slot, ty, field) in [
-            (slot.memory, "uchar", "memory"),
-            (slot.pages, "uint", "pages"),
             (slot.globals, "ulong", "globals"),
-            (slot.table, "uint", "table"),
             (slot.passive_data, "const uchar", "passive_data"),
         ] {
             if let Some(slot) = slot {
@@ -1846,8 +2016,8 @@ fn translate_with_limits(
     source.push_str(&format!("ModuleState states[{}] = {{}};\n", modules.len()));
     for (module_index, module) in modules.iter().enumerate() {
         let instance = &module.instance;
-        if let Some(capacity) = instance.memory_capacity {
-            source.push_str(&format!("states[{module_index}].memory = m{module_index}_memory + ulong(id) * {}ul;\nstates[{module_index}].pages = m{module_index}_pages + id;\n", capacity.max(1)));
+        for (index, memory) in instance.memories.iter().enumerate() {
+            source.push_str(&format!("states[{module_index}].memory[{index}] = m{module_index}_memory{index} + ulong(id) * {}ul;\nstates[{module_index}].pages[{index}] = m{module_index}_pages{index} + id;\n", memory.capacity.max(1)));
         }
         if !instance.globals_template.is_empty() {
             source.push_str(&format!(
@@ -1855,20 +2025,29 @@ fn translate_with_limits(
                 instance.globals_template.len()
             ));
         }
-        if let Some(table) = &instance.table_template {
-            let offset = if instance.table_info.mutable {
-                format!(" + ulong(id) * {}ul", instance.table_info.capacity.max(1))
+        for (index, table) in instance.tables.iter().enumerate() {
+            let offset = if table.info.mutable {
+                format!(" + ulong(id) * {}ul", table.info.capacity.max(1))
             } else {
                 String::new()
             };
-            source.push_str(&format!("states[{module_index}].table = m{module_index}_table{offset};\nstates[{module_index}].table_size = {}u;\n", table.len()));
+            source.push_str(&format!("states[{module_index}].table[{index}] = m{module_index}_table{index}{offset};\nstates[{module_index}].table_size[{index}] = {}u;\n", table.values.len()));
         }
         for (field, lengths) in [
-            ("element_lengths", &instance.table_info.lengths),
+            ("element_lengths", &instance.element_info.lengths),
             ("data_lengths", &instance.data_lengths),
         ] {
             if !lengths.is_empty() {
                 source.push_str(&format!("uint m{module_index}_{field}[{}] = {{{}}};\nstates[{module_index}].{field} = m{module_index}_{field};\n", lengths.len(), lengths.iter().map(|v| format!("{v}u")).collect::<Vec<_>>().join(", ")));
+            }
+        }
+        for (segment, values) in instance.element_info.elements.iter().enumerate() {
+            if module
+                .dynamic_elements
+                .iter()
+                .any(|(index, _, _)| *index == segment)
+            {
+                source.push_str(&format!("uint m{module_index}_dynamic_element_{segment}[{}] = {{{}}};\nstates[{module_index}].element_values[{segment}] = m{module_index}_dynamic_element_{segment};\n", values.len().max(1), if values.is_empty() { "0u".into() } else { values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>().join(", ") }));
             }
         }
         if !instance.data_lengths.is_empty() {
@@ -1928,35 +2107,99 @@ fn translate_with_limits(
                 ));
             }
         }
-        if let Some(expr) = &module.table_init_expr {
+        for &(segment, item, ref expr) in &module.dynamic_elements {
             let value = const_source(expr, module)?;
-            let count = module.instance.table_template.as_ref().unwrap().len();
-            source.push_str(&format!("if (trap == 0u) {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{module_index}].table[j] = uint({value}); }}\n"));
+            source.push_str(&format!("if (trap == 0u) states[{module_index}].element_values[{segment}][{item}] = uint({value});\n"));
         }
-        for &(segment, ref expr) in &module.active_elements {
-            let offset = const_source(expr, module)?;
-            let owner = module.table_owner.unwrap();
-            let count = module.instance.table_info.elements[segment].len();
-            source.push_str(&format!("if (trap == 0u) {{ ulong offset = ulong(uint({offset})); if (offset + {count}ul > states[{owner}].table_size) trap = 6u; else {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{owner}].table[offset + j] = m{module_index}_element_{segment}[j]; }} }}\n"));
+        for &(local, ref expr) in &module.table_init_exprs {
+            let value = const_source(expr, module)?;
+            let count = module.instance.tables[local].values.len();
+            source.push_str(&format!("if (trap == 0u) {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{module_index}].table[{local}][j] = uint({value}); }}\n"));
         }
-        for (expr, data_offset, count) in &module.active_data {
+        for &(segment, table_index, ref expr) in &module.active_elements {
             let offset = const_source(expr, module)?;
-            let owner = module.memory_owner.unwrap();
-            source.push_str(&format!("if (trap == 0u) {{ ulong offset = ulong(uint({offset})); if (offset + {count}ul > ulong(states[{owner}].pages[0]) * 65536ul) trap = 4u; else {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{owner}].memory[offset + j] = states[{module_index}].passive_data[{data_offset}ul + j]; }} }}\n"));
+            let (owner, local) = module.table_bindings[table_index].unwrap();
+            let count = module.instance.element_info.elements[segment].len();
+            let offset = if module.table_types[table_index].table64 {
+                format!("ulong({offset})")
+            } else {
+                format!("ulong(uint({offset}))")
+            };
+            let values = if module
+                .dynamic_elements
+                .iter()
+                .any(|(index, _, _)| *index == segment)
+            {
+                format!("states[{module_index}].element_values[{segment}]")
+            } else {
+                format!("m{module_index}_element_{segment}")
+            };
+            source.push_str(&format!("if (trap == 0u) {{ ulong offset = {offset}; if (offset > states[{owner}].table_size[{local}] || {count}ul > states[{owner}].table_size[{local}] - offset) trap = 6u; else {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{owner}].table[{local}][offset + j] = {values}[j]; }} }}\n"));
+        }
+        for (memory_index, expr, data_offset, count) in &module.active_data {
+            let offset = const_source(expr, module)?;
+            let (owner, local) = module.memory_bindings[*memory_index].unwrap();
+            let offset = if module.memory_types[*memory_index].memory64 {
+                format!("ulong({offset})")
+            } else {
+                format!("ulong(uint({offset}))")
+            };
+            source.push_str(&format!("if (trap == 0u) {{ ulong offset = {offset}; ulong size = ulong(states[{owner}].pages[{local}][0]) * 65536ul; if (offset > size || {count}ul > size - offset) trap = 4u; else {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{owner}].memory[{local}][offset + j] = states[{module_index}].passive_data[{data_offset}ul + j]; }} }}\n"));
         }
         if let Some(local) = module.start_index {
             let start = module.resolved_functions[local];
-            source.push_str(&format!("if (trap == 0u) f{start}({context});\n"));
+            if tail_calls {
+                source.push_str(&format!("if (trap == 0u) {{ ulong start_args[1] = {{0ul}}; ulong start_results[1] = {{0ul}}; invoke({start}u, start_args, start_results, states, trap, 0u); }}\n"));
+            } else {
+                source.push_str(&format!("if (trap == 0u) f{start}({context});\n"));
+            }
         }
     }
-    if let Some(owner) = modules[0].memory_owner {
+    if !modules[0].memory_bindings.is_empty() {
         let argument_bytes = param_words * if fast_i32 { 4 } else { 8 };
-        source.push_str(&format!(
-            "if (config[2] != 0ul && trap == 0u) {{\n    device const uchar* memory_input = reinterpret_cast<device const uchar*>(input) + count * {argument_bytes}ul + ulong(id) * config[2];\n    for (ulong j = 0ul; j < config[2]; ++j) states[{owner}].memory[config[1] + j] = memory_input[j];\n}}\n"
-        ));
+        source.push_str(&format!("if (config[2] != 0ul && trap == 0u) {{\n device const uchar* memory_input = reinterpret_cast<device const uchar*>(input) + count * {argument_bytes}ul + ulong(id) * config[2];\n"));
+        for (owner, local) in modules[0].memory_bindings.iter().flatten() {
+            source.push_str(&format!("if (config[3] == {owner}ul && config[4] == {local}ul) for (ulong j = 0ul; j < config[2]; ++j) states[{owner}].memory[{local}][config[1] + j] = memory_input[j];\n"));
+        }
+        source.push_str("}\n");
     }
-    args.push(context.into());
-    source.push_str(&format!("if (trap == 0u) f{index}({});\n", args.join(", ")));
+    if tail_calls {
+        source.push_str(&format!(
+            "ulong top_args[{}] = {{}}; ulong top_results[{}] = {{}};\n",
+            param_words.max(1),
+            result_words.max(1)
+        ));
+        let mut word = 0;
+        for (arg, ty) in args.iter().take(ty.params().len()).zip(ty.params()) {
+            if *ty == ValType::V128 {
+                source.push_str(&format!(
+                    "top_args[{word}] = ({arg}).x; top_args[{}] = ({arg}).y;\n",
+                    word + 1
+                ));
+            } else {
+                source.push_str(&format!("top_args[{word}] = {arg};\n"));
+            }
+            word += value_words(*ty);
+        }
+        source.push_str(&format!(
+            "if (trap == 0u) invoke({index}u, top_args, top_results, states, trap, 0u);\n"
+        ));
+        let mut word = 0;
+        for (result, ty) in ty.results().iter().enumerate() {
+            if *ty == ValType::V128 {
+                source.push_str(&format!(
+                    "result{result} = ulong2(top_results[{word}], top_results[{}]);\n",
+                    word + 1
+                ));
+            } else {
+                source.push_str(&format!("result{result} = top_results[{word}];\n"));
+            }
+            word += value_words(*ty);
+        }
+    } else {
+        args.push(context.into());
+        source.push_str(&format!("if (trap == 0u) f{index}({});\n", args.join(", ")));
+    }
     if can_trap {
         source.push_str("traps[id] = trap;\n");
     }
@@ -1979,8 +2222,8 @@ fn translate_with_limits(
         .exports
         .iter()
         .filter_map(|(name, &(kind, index))| {
-            (kind == ExternalKind::Memory && index == 0)
-                .then(|| (name.clone(), modules[0].memory_owner.unwrap()))
+            (kind == ExternalKind::Memory)
+                .then(|| (name.clone(), modules[0].memory_bindings[index].unwrap()))
         })
         .collect();
     Ok(Translation {
@@ -2006,82 +2249,208 @@ fn value_words(ty: ValType) -> usize {
     if ty == ValType::V128 { 2 } else { 1 }
 }
 
+fn tail_dispatcher(order: &[usize], types: &[FuncType], call_depth: usize) -> String {
+    let mut source = format!(
+        "void invoke(uint target, thread ulong* input_args, thread ulong* output_results, thread ModuleState* states, thread uint& trap, uint depth) {{\nif (depth >= {call_depth}u) {{ trap = 8u; return; }}\nTailFrame tail = {{}};\nswitch (target) {{\n"
+    );
+    for &function in order {
+        let words: usize = types[function]
+            .params()
+            .iter()
+            .map(|ty| value_words(*ty))
+            .sum();
+        source.push_str(&format!("case {function}u: for (uint i = 0u; i < {words}u; ++i) tail.args[i] = input_args[i]; break;\n"));
+    }
+    source.push_str(
+        "default: trap = 7u; return;\n}\nfor (;;) {\ntail.next = 0u;\nswitch (target) {\n",
+    );
+    for &function in order {
+        let ty = &types[function];
+        source.push_str(&format!("case {function}u: {{\n"));
+        let mut args = Vec::new();
+        let mut word = 0;
+        for param in ty.params() {
+            if *param == ValType::V128 {
+                args.push(format!(
+                    "ulong2(tail.args[{word}], tail.args[{}])",
+                    word + 1
+                ));
+            } else {
+                args.push(format!("tail.args[{word}]"));
+            }
+            word += value_words(*param);
+        }
+        for (result, result_ty) in ty.results().iter().enumerate() {
+            source.push_str(&format!(
+                "{} result{result} = {};\n",
+                if *result_ty == ValType::V128 {
+                    "ulong2"
+                } else {
+                    "ulong"
+                },
+                if *result_ty == ValType::V128 {
+                    "ulong2(0ul)"
+                } else {
+                    "0ul"
+                }
+            ));
+            args.push(format!("result{result}"));
+        }
+        args.extend([
+            "states".into(),
+            "trap".into(),
+            "tail".into(),
+            "depth".into(),
+        ]);
+        source.push_str(&format!("f{function}({});\n", args.join(", ")));
+        source.push_str("if (trap != 0u) return;\nif (tail.next == 0u) {\n");
+        let mut word = 0;
+        for (result, result_ty) in ty.results().iter().enumerate() {
+            if *result_ty == ValType::V128 {
+                source.push_str(&format!("output_results[{word}] = result{result}.x; output_results[{}] = result{result}.y;\n", word + 1));
+            } else {
+                source.push_str(&format!("output_results[{word}] = result{result};\n"));
+            }
+            word += value_words(*result_ty);
+        }
+        source.push_str("return;\n}\nbreak;\n}\n");
+    }
+    source.push_str("default: trap = 7u; return;\n}\ntarget = tail.next - 1u;\n}\n}\n");
+    source
+}
+
 fn is_supported_value(ty: ValType) -> bool {
     is_numeric(ty) || ty == ValType::Ref(RefType::FUNCREF)
 }
 
 fn const_source(expr: &ConstExpr<'_>, module: &ParsedModule<'_>) -> Result<String, Error> {
     let mut operators = expr.get_operators_reader().into_iter();
-    let source = match operators.next().transpose()? {
-        Some(Operator::I32Const { value }) => format!("{}ul", value as u32),
-        Some(Operator::I64Const { value }) => format!("{}ul", value as u64),
-        Some(Operator::F32Const { value }) => format!("{}ul", value.bits()),
-        Some(Operator::F64Const { value }) => format!("{}ul", value.bits()),
-        Some(Operator::V128Const { value }) => {
-            let bytes = value.bytes();
-            format!(
-                "ulong2({}ul, {}ul)",
-                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-                u64::from_le_bytes(bytes[8..].try_into().unwrap())
-            )
-        }
-        Some(Operator::RefNull { .. }) => "0ul".into(),
-        Some(Operator::RefFunc { function_index }) => {
-            format!(
-                "{}ul",
-                module.resolved_functions[function_index as usize] + 1
-            )
-        }
-        Some(Operator::GlobalGet { global_index }) => {
-            let &(owner, slot) = module
-                .global_bindings
-                .get(global_index as usize)
-                .ok_or_else(|| {
-                    Error::Unsupported("constant global index is out of range".into())
-                })?;
-            if module.global_types[global_index as usize].content_type == ValType::V128 {
+    let mut stack: Vec<String> = Vec::new();
+    for operator in operators.by_ref() {
+        let value = match operator? {
+            Operator::I32Const { value } => format!("{}ul", value as u32),
+            Operator::I64Const { value } => format!("{}ul", value as u64),
+            Operator::F32Const { value } => format!("{}ul", value.bits()),
+            Operator::F64Const { value } => format!("{}ul", value.bits()),
+            Operator::V128Const { value } => {
+                let bytes = value.bytes();
                 format!(
-                    "ulong2(states[{owner}].globals[{slot}u], states[{owner}].globals[{}u])",
-                    slot + 1
+                    "ulong2({}ul, {}ul)",
+                    u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                    u64::from_le_bytes(bytes[8..].try_into().unwrap())
                 )
-            } else {
-                format!("states[{owner}].globals[{slot}u]")
             }
-        }
-        _ => return Err(Error::Unsupported("unsupported scalar initializer".into())),
-    };
-    if !matches!(operators.next().transpose()?, Some(Operator::End)) || operators.next().is_some() {
+            Operator::RefNull { .. } => "0ul".into(),
+            Operator::RefFunc { function_index } => {
+                format!(
+                    "{}ul",
+                    module.resolved_functions[function_index as usize] + 1
+                )
+            }
+            Operator::GlobalGet { global_index } => {
+                let &(owner, slot) = module
+                    .global_bindings
+                    .get(global_index as usize)
+                    .ok_or_else(|| {
+                        Error::Unsupported("constant global index is out of range".into())
+                    })?;
+                if module.global_types[global_index as usize].content_type == ValType::V128 {
+                    format!(
+                        "ulong2(states[{owner}].globals[{slot}u], states[{owner}].globals[{}u])",
+                        slot + 1
+                    )
+                } else {
+                    format!("states[{owner}].globals[{slot}u]")
+                }
+            }
+            op @ (Operator::I32Add
+            | Operator::I32Sub
+            | Operator::I32Mul
+            | Operator::I64Add
+            | Operator::I64Sub
+            | Operator::I64Mul) => {
+                let rhs = stack
+                    .pop()
+                    .ok_or_else(|| Error::Unsupported("invalid initializer stack".into()))?;
+                let lhs = stack
+                    .pop()
+                    .ok_or_else(|| Error::Unsupported("invalid initializer stack".into()))?;
+                let symbol = match op {
+                    Operator::I32Add | Operator::I64Add => "+",
+                    Operator::I32Sub | Operator::I64Sub => "-",
+                    _ => "*",
+                };
+                if matches!(op, Operator::I32Add | Operator::I32Sub | Operator::I32Mul) {
+                    format!("ulong(uint({lhs}) {symbol} uint({rhs}))")
+                } else {
+                    format!("({lhs} {symbol} {rhs})")
+                }
+            }
+            Operator::End => break,
+            _ => return Err(Error::Unsupported("unsupported scalar initializer".into())),
+        };
+        stack.push(value);
+    }
+    if stack.len() != 1 || operators.next().is_some() {
         return Err(Error::Unsupported("unsupported scalar initializer".into()));
     }
-    Ok(source)
+    Ok(stack.pop().unwrap())
 }
 
 fn eval_const(expr: &ConstExpr<'_>, globals: &[u64], slots: &[usize]) -> Result<u64, Error> {
     let mut operators = expr.get_operators_reader().into_iter();
-    let value = match operators.next().transpose()? {
-        Some(Operator::I32Const { value }) => value as u32 as u64,
-        Some(Operator::I64Const { value }) => value as u64,
-        Some(Operator::F32Const { value }) => value.bits() as u64,
-        Some(Operator::F64Const { value }) => value.bits(),
-        Some(Operator::RefNull {
-            hty:
-                wasmparser::HeapType::Abstract {
-                    ty: wasmparser::AbstractHeapType::Func,
-                    ..
-                },
-        }) => 0,
-        Some(Operator::RefFunc { function_index }) => u64::from(function_index) + 1,
-        Some(Operator::GlobalGet { global_index }) => *globals
-            .get(*slots.get(global_index as usize).ok_or_else(|| {
-                Error::Unsupported("constant global index is out of range".into())
-            })?)
-            .ok_or_else(|| Error::Unsupported("constant global index is out of range".into()))?,
-        _ => return Err(Error::Unsupported("unsupported scalar initializer".into())),
-    };
-    if !matches!(operators.next().transpose()?, Some(Operator::End)) || operators.next().is_some() {
+    let mut stack: Vec<u64> = Vec::new();
+    for operator in operators.by_ref() {
+        let value = match operator? {
+            Operator::I32Const { value } => value as u32 as u64,
+            Operator::I64Const { value } => value as u64,
+            Operator::F32Const { value } => value.bits() as u64,
+            Operator::F64Const { value } => value.bits(),
+            Operator::RefNull {
+                hty:
+                    wasmparser::HeapType::Abstract {
+                        ty: wasmparser::AbstractHeapType::Func,
+                        ..
+                    },
+            } => 0,
+            Operator::RefFunc { function_index } => u64::from(function_index) + 1,
+            Operator::GlobalGet { global_index } => *globals
+                .get(*slots.get(global_index as usize).ok_or_else(|| {
+                    Error::Unsupported("constant global index is out of range".into())
+                })?)
+                .ok_or_else(|| {
+                    Error::Unsupported("constant global index is out of range".into())
+                })?,
+            op @ (Operator::I32Add
+            | Operator::I32Sub
+            | Operator::I32Mul
+            | Operator::I64Add
+            | Operator::I64Sub
+            | Operator::I64Mul) => {
+                let rhs = stack
+                    .pop()
+                    .ok_or_else(|| Error::Unsupported("invalid initializer stack".into()))?;
+                let lhs = stack
+                    .pop()
+                    .ok_or_else(|| Error::Unsupported("invalid initializer stack".into()))?;
+                match op {
+                    Operator::I32Add => (lhs as u32).wrapping_add(rhs as u32) as u64,
+                    Operator::I32Sub => (lhs as u32).wrapping_sub(rhs as u32) as u64,
+                    Operator::I32Mul => (lhs as u32).wrapping_mul(rhs as u32) as u64,
+                    Operator::I64Add => lhs.wrapping_add(rhs),
+                    Operator::I64Sub => lhs.wrapping_sub(rhs),
+                    _ => lhs.wrapping_mul(rhs),
+                }
+            }
+            Operator::End => break,
+            _ => return Err(Error::Unsupported("unsupported scalar initializer".into())),
+        };
+        stack.push(value);
+    }
+    if stack.len() != 1 || operators.next().is_some() {
         return Err(Error::Unsupported("unsupported scalar initializer".into()));
     }
-    Ok(value)
+    Ok(stack.pop().unwrap())
 }
 
 fn eval_v128_const(
@@ -2119,21 +2488,6 @@ fn eval_v128_const(
     Ok(value)
 }
 
-fn eval_ref_const(expr: &ConstExpr<'_>) -> Result<u32, Error> {
-    let mut operators = expr.get_operators_reader().into_iter();
-    let value = match operators.next().transpose()? {
-        Some(Operator::RefNull { .. }) => 0,
-        Some(Operator::RefFunc { function_index }) => function_index
-            .checked_add(1)
-            .ok_or_else(|| Error::Unsupported("function index overflow".into()))?,
-        _ => return Err(Error::Unsupported("unsupported funcref initializer".into())),
-    };
-    if !matches!(operators.next().transpose()?, Some(Operator::End)) || operators.next().is_some() {
-        return Err(Error::Unsupported("unsupported funcref initializer".into()));
-    }
-    Ok(value)
-}
-
 fn visit_function(
     index: usize,
     modules: &[ParsedModule<'_>],
@@ -2142,7 +2496,7 @@ fn visit_function(
     state: &mut [u8],
     order: &mut Vec<usize>,
     can_trap: &mut bool,
-    uses_growth: &mut [bool],
+    uses_growth: &mut [Vec<bool>],
     recursive: &mut bool,
 ) -> Result<(), Error> {
     match state.get(index).copied() {
@@ -2165,7 +2519,7 @@ fn visit_function(
             _ => None,
         };
         match operator {
-            Operator::Call { function_index } => {
+            Operator::Call { function_index } | Operator::ReturnCall { function_index } => {
                 visit_function(
                     module.resolved_functions[function_index as usize],
                     modules,
@@ -2178,22 +2532,52 @@ fn visit_function(
                     recursive,
                 )?;
             }
-            Operator::CallIndirect { type_index, .. } => {
+            Operator::CallIndirect {
+                type_index,
+                table_index: _,
+            }
+            | Operator::ReturnCallIndirect {
+                type_index,
+                table_index: _,
+            }
+            | Operator::CallRef { type_index }
+            | Operator::ReturnCallRef { type_index } => {
                 *can_trap = true;
                 let expected = &module.types[type_index as usize];
-                let owner = &modules[module.table_owner.unwrap()];
-                for &target in &owner.table_targets {
-                    if !owner.instance.table_info.mutable {
-                        if let Some(slot) = previous_constant {
-                            if owner
-                                .instance
-                                .table_template
-                                .as_ref()
-                                .and_then(|t| t.get(slot as usize))
-                                .copied()
-                                != Some(target as u32 + 1)
-                            {
-                                continue;
+                let targets: Vec<usize> = match operator {
+                    Operator::CallRef { .. } | Operator::ReturnCallRef { .. } => {
+                        (0..functions.len()).collect()
+                    }
+                    Operator::CallIndirect { table_index, .. }
+                    | Operator::ReturnCallIndirect { table_index, .. } => {
+                        let (owner, local) = module.table_bindings[table_index as usize]
+                            .ok_or_else(|| Error::Unsupported("table is missing".into()))?;
+                        modules[owner].instance.tables[local].targets.clone()
+                    }
+                    _ => unreachable!(),
+                };
+                let owner = match operator {
+                    Operator::CallIndirect { table_index, .. }
+                    | Operator::ReturnCallIndirect { table_index, .. } => {
+                        let (owner, local) = module.table_bindings[table_index as usize].unwrap();
+                        Some(&modules[owner].instance.tables[local])
+                    }
+                    _ => None,
+                };
+                for target in targets {
+                    if let Some(owner) = owner
+                        && !matches!(
+                            operator,
+                            Operator::CallRef { .. } | Operator::ReturnCallRef { .. }
+                        )
+                    {
+                        if !owner.info.mutable {
+                            if let Some(slot) = previous_constant {
+                                if owner.values.get(slot as usize).copied()
+                                    != Some(target as u32 + 1)
+                                {
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -2217,10 +2601,9 @@ fn visit_function(
             | Operator::TableFill { .. }
             | Operator::TableCopy { .. }
             | Operator::TableInit { .. } => *can_trap = true,
-            Operator::MemoryGrow { .. } => {
-                if let Some(owner) = module.memory_owner {
-                    uses_growth[owner] = true;
-                }
+            Operator::MemoryGrow { mem } => {
+                let (owner, local) = module.memory_bindings[mem as usize].unwrap();
+                uses_growth[owner][local] = true;
             }
             Operator::I32DivS
             | Operator::I32DivU
@@ -2248,7 +2631,12 @@ fn visit_function(
     Ok(())
 }
 
-fn function_signature(index: usize, ty: &FuncType, recursive: bool) -> Result<String, Error> {
+fn function_signature(
+    index: usize,
+    ty: &FuncType,
+    recursive: bool,
+    tail_calls: bool,
+) -> Result<String, Error> {
     if ty
         .params()
         .iter()
@@ -2286,6 +2674,9 @@ fn function_signature(index: usize, ty: &FuncType, recursive: bool) -> Result<St
     }));
     args.push("thread ModuleState* states".into());
     args.push("thread uint& trap".into());
+    if tail_calls {
+        args.push("thread TailFrame& tail".into());
+    }
     if recursive {
         args.push("uint depth".into());
     }
@@ -2299,45 +2690,66 @@ fn translate_body(
     local_function: usize,
     global_types: &[FuncType],
     recursive: bool,
+    tail_calls: bool,
     call_depth: usize,
+    memory_bytes: usize,
 ) -> Result<String, Error> {
     let module = &modules[module_index];
     let body = &module.bodies[local_function - module.imports.len()];
     let ty = module.function_type(local_function)?;
     let types = module.types.as_slice();
     let function_types = module.function_types.as_slice();
-    let memory_owner = module.memory_owner.unwrap_or(module_index);
-    let table_owner = module.table_owner.unwrap_or(module_index);
-    let memory_instance = &modules[memory_owner].instance;
-    let table_instance = &modules[table_owner].instance;
-    let memory_bytes = memory_instance.memory_template.as_ref().map(Vec::len);
-    let memory_capacity = memory_instance.memory_capacity;
+    let memories: Vec<_> = module
+        .memory_bindings
+        .iter()
+        .enumerate()
+        .map(|(index, binding)| {
+            let (owner, local) = binding.unwrap();
+            let memory = &modules[owner].instance.memories[local];
+            MemoryState {
+                owner,
+                local,
+                capacity: memory.capacity,
+                owner_count: modules[owner].instance.memories.len(),
+                is64: module.memory_types[index].memory64,
+            }
+        })
+        .collect();
+    let tables: Vec<_> = module
+        .table_bindings
+        .iter()
+        .enumerate()
+        .map(|(index, binding)| {
+            let (owner, local) = binding.unwrap();
+            let table = &modules[owner].instance.tables[local];
+            TableState {
+                owner,
+                local,
+                values: &table.values,
+                info: &table.info,
+                targets: &table.targets,
+                is64: module.table_types[index].table64,
+            }
+        })
+        .collect();
     let globals_mutable = module.globals_mutable.as_slice();
-    let table_values = table_instance.table_template.as_deref();
-    let table_info = &table_instance.table_info;
-    let table_targets = modules[table_owner].table_targets.as_slice();
     let data_offsets = module.data_offsets.as_slice();
-    let mut source = function_signature(function_index, ty, recursive)?;
+    let mut source = function_signature(function_index, ty, recursive, tail_calls)?;
     source.push_str(" {\n");
-    if recursive {
+    if recursive && !tail_calls {
         source.push_str(&format!(
             "if (depth >= {call_depth}u) {{ trap = 8u; return; }}\n"
         ));
     }
+    if !memories.is_empty() {
+        source.push_str("device uchar* memory = nullptr; device uint* pages = nullptr;\n");
+    }
+    if !tables.is_empty() {
+        source.push_str("device uint* table = nullptr; thread uint* table_size = nullptr;\n");
+    }
     for (exists, ty, field) in [
-        (memory_bytes.is_some(), "device uchar*", "memory"),
-        (memory_bytes.is_some(), "device uint*", "pages"),
         (
-            table_values.is_some(),
-            if table_info.mutable {
-                "device uint*"
-            } else {
-                "device const uint*"
-            },
-            "table",
-        ),
-        (
-            !module.instance.table_info.lengths.is_empty(),
+            !module.instance.element_info.lengths.is_empty(),
             "thread uint*",
             "element_lengths",
         ),
@@ -2347,15 +2759,9 @@ fn translate_body(
             "passive_data",
         ),
         (!data_offsets.is_empty(), "thread uint*", "data_lengths"),
-        (table_info.mutable, "thread uint&", "table_size"),
     ] {
         if exists {
-            let owner = match field {
-                "memory" | "pages" => memory_owner,
-                "table" | "table_size" => table_owner,
-                _ => module_index,
-            };
-            source.push_str(&format!("{ty} {field} = states[{owner}].{field};\n"));
+            source.push_str(&format!("{ty} {field} = states[{module_index}].{field};\n"));
         }
     }
     let mut vector_names = HashSet::new();
@@ -2426,18 +2832,17 @@ fn translate_body(
         next_frame: 1,
         types,
         function_types,
-        memory_bytes,
-        memory_capacity,
+        memories,
+        memory_limit_pages: memory_bytes / 65536,
         globals_mutable,
         global_value_types: &module.global_types,
         global_bindings: &module.global_bindings,
-        table_len: table_values.map(<[u32]>::len),
-        table_values,
-        table_info,
-        element_info: &module.instance.table_info,
-        table_targets,
+        tables,
+        element_info: &module.instance.element_info,
+        dynamic_elements: &module.dynamic_elements,
         data_offsets,
         recursive,
+        tail_calls,
         frames: vec![Frame {
             id: 1,
             params: Vec::new(),
@@ -2525,6 +2930,23 @@ struct Frame {
     loop_label: bool,
 }
 
+struct MemoryState {
+    owner: usize,
+    local: usize,
+    capacity: usize,
+    owner_count: usize,
+    is64: bool,
+}
+
+struct TableState<'a> {
+    owner: usize,
+    local: usize,
+    values: &'a [u32],
+    info: &'a TableInfo,
+    targets: &'a [usize],
+    is64: bool,
+}
+
 struct Compiler<'a> {
     module_index: usize,
     resolved_functions: &'a [usize],
@@ -2538,31 +2960,163 @@ struct Compiler<'a> {
     next_frame: usize,
     types: &'a [FuncType],
     function_types: &'a [u32],
-    memory_bytes: Option<usize>,
-    memory_capacity: Option<usize>,
+    memories: Vec<MemoryState>,
+    memory_limit_pages: usize,
     globals_mutable: &'a [bool],
     global_value_types: &'a [GlobalType],
     global_bindings: &'a [(usize, usize)],
-    table_len: Option<usize>,
-    table_values: Option<&'a [u32]>,
-    table_info: &'a TableInfo,
+    tables: Vec<TableState<'a>>,
     element_info: &'a TableInfo,
-    table_targets: &'a [usize],
+    dynamic_elements: &'a [(usize, usize, ConstExpr<'a>)],
     data_offsets: &'a [usize],
     recursive: bool,
+    tail_calls: bool,
     frames: Vec<Frame>,
 }
 
 impl Compiler<'_> {
-    fn table_size(&self) -> Result<String, Error> {
-        let initial = self
-            .table_len
+    fn emit_dispatch_call(
+        &mut self,
+        target: &str,
+        ty: &FuncType,
+        args: Vec<String>,
+        stack: &mut Vec<String>,
+    ) {
+        let id = self.next_value;
+        self.next_value += 1;
+        let input_words: usize = ty.params().iter().map(|ty| value_words(*ty)).sum();
+        let output_words: usize = ty.results().iter().map(|ty| value_words(*ty)).sum();
+        self.source.push_str(&format!(
+            "ulong call_args{id}[{}] = {{}}; ulong call_results{id}[{}] = {{}};\n",
+            input_words.max(1),
+            output_words.max(1)
+        ));
+        let mut word = 0;
+        for (arg, param) in args.iter().zip(ty.params()) {
+            if *param == ValType::V128 {
+                self.source.push_str(&format!(
+                    "call_args{id}[{word}] = ({arg}).x; call_args{id}[{}] = ({arg}).y;\n",
+                    word + 1
+                ));
+            } else {
+                self.source
+                    .push_str(&format!("call_args{id}[{word}] = {arg};\n"));
+            }
+            word += value_words(*param);
+        }
+        self.source.push_str(&format!("invoke(uint({target}), call_args{id}, call_results{id}, states, trap, depth + 1u);\nif (trap != 0u) return;\n"));
+        let mut word = 0;
+        for result_ty in ty.results() {
+            if *result_ty == ValType::V128 {
+                self.emit_vector(
+                    stack,
+                    format!(
+                        "ulong2(call_results{id}[{word}], call_results{id}[{}])",
+                        word + 1
+                    ),
+                );
+            } else {
+                self.emit_value(stack, format!("call_results{id}[{word}]"));
+            }
+            word += value_words(*result_ty);
+        }
+    }
+
+    fn emit_tail_call(
+        &mut self,
+        operator: &Operator<'_>,
+        stack: &mut Vec<String>,
+    ) -> Result<(), Error> {
+        let (ty, target) = match operator {
+            Operator::ReturnCall { function_index } => {
+                let local = *function_index as usize;
+                let ty = self.types[self.function_types[local] as usize].clone();
+                (ty, format!("{}u", self.resolved_functions[local] + 1))
+            }
+            Operator::ReturnCallIndirect {
+                type_index,
+                table_index,
+            } => {
+                let ty = self.types[*type_index as usize].clone();
+                let element = pop(stack)?;
+                let size = self.table_size(*table_index)?;
+                self.source.push_str(&format!(
+                    "if ({element} >= {size}) {{ trap = 6u; return; }}\n"
+                ));
+                let target = self.fresh_value();
+                self.source
+                    .push_str(&format!("{target} = table[uint({element})];\n"));
+                (ty, target)
+            }
+            Operator::ReturnCallRef { type_index } => {
+                let ty = self.types[*type_index as usize].clone();
+                (ty, pop(stack)?)
+            }
+            _ => return Err(Error::Unsupported("unsupported tail call".into())),
+        };
+        if stack.len() < ty.params().len() {
+            return Err(Error::Unsupported("tail-call argument is missing".into()));
+        }
+        let args = stack.split_off(stack.len() - ty.params().len());
+        if !matches!(operator, Operator::ReturnCall { .. }) {
+            self.source.push_str(&format!(
+                "if ({target} == 0ul) {{ trap = 6u; return; }}\nswitch ({target}) {{\n"
+            ));
+            for (index, candidate) in self.global_types.iter().enumerate() {
+                if candidate == &ty {
+                    self.source
+                        .push_str(&format!("case {}u: break;\n", index + 1));
+                }
+            }
+            self.source.push_str("default: trap = 7u; return;\n}\n");
+        }
+        let mut word = 0;
+        for (arg, param) in args.iter().zip(ty.params()) {
+            if *param == ValType::V128 {
+                self.source.push_str(&format!(
+                    "tail.args[{word}] = ({arg}).x; tail.args[{}] = ({arg}).y;\n",
+                    word + 1
+                ));
+            } else {
+                self.source
+                    .push_str(&format!("tail.args[{word}] = {arg};\n"));
+            }
+            word += value_words(*param);
+        }
+        self.source
+            .push_str(&format!("tail.next = uint({target}); return;\n"));
+        Ok(())
+    }
+
+    fn table_size(&mut self, index: u32) -> Result<String, Error> {
+        let table_state = self
+            .tables
+            .get(index as usize)
             .ok_or_else(|| Error::Unsupported("table is missing".into()))?;
-        Ok(if self.table_info.mutable {
-            "ulong(table_size)".into()
+        self.source.push_str(&format!(
+            "table = states[{}].table[{}]; table_size = &states[{}].table_size[{}];\n",
+            table_state.owner, table_state.local, table_state.owner, table_state.local
+        ));
+        Ok(if table_state.info.mutable {
+            format!(
+                "ulong(states[{}].table_size[{}])",
+                table_state.owner, table_state.local
+            )
         } else {
-            format!("{initial}ul")
+            format!("{}ul", table_state.values.len())
         })
+    }
+
+    fn select_memory(&mut self, index: u32) -> Result<&MemoryState, Error> {
+        let memory = self
+            .memories
+            .get(index as usize)
+            .ok_or_else(|| Error::Unsupported("memory is missing".into()))?;
+        self.source.push_str(&format!(
+            "memory = states[{}].memory[{}]; pages = states[{}].pages[{}];\n",
+            memory.owner, memory.local, memory.owner, memory.local
+        ));
+        Ok(memory)
     }
 
     fn fresh_value(&mut self) -> String {
@@ -2608,20 +3162,19 @@ impl Compiler<'_> {
         memarg: &wasmparser::MemArg,
         width: usize,
     ) -> Result<String, Error> {
-        self.memory_bytes
-            .ok_or_else(|| Error::Unsupported("memory is missing".into()))?;
-        if memarg.memory != 0 {
-            return Err(Error::Unsupported("only memory 0 is supported".into()));
-        }
+        let is64 = self.select_memory(memarg.memory)?.is64;
         let index = self.fresh_value();
+        let address = if is64 {
+            format!("ulong({address})")
+        } else {
+            format!("ulong(uint({address}))")
+        };
         self.source.push_str(&format!(
-            "if (ulong({address}) + {}ul + {width}ul > ulong(pages[0]) * 65536ul) {{ trap = 4u; return; }}\n",
-            memarg.offset
+            "if ({address} > ulong(pages[0]) * 65536ul || {}ul > ulong(pages[0]) * 65536ul - {address} || {width}ul > ulong(pages[0]) * 65536ul - {address} - {}ul) {{ trap = 4u; return; }}\n",
+            memarg.offset, memarg.offset,
         ));
-        self.source.push_str(&format!(
-            "{index} = ulong({address}) + {}ul;\n",
-            memarg.offset
-        ));
+        self.source
+            .push_str(&format!("{index} = {address} + {}ul;\n", memarg.offset));
         Ok(index)
     }
 
@@ -2812,6 +3365,13 @@ impl Compiler<'_> {
                         reachable = false;
                         break;
                     }
+                    Operator::ReturnCall { .. }
+                    | Operator::ReturnCallIndirect { .. }
+                    | Operator::ReturnCallRef { .. } => {
+                        self.emit_tail_call(operator, stack)?;
+                        reachable = false;
+                        break;
+                    }
                     Operator::Unreachable => {
                         self.source.push_str("trap = 3u; return;\n");
                         reachable = false;
@@ -2985,59 +3545,68 @@ impl Compiler<'_> {
                 let value = pop(stack)?;
                 self.emit_value(stack, format!("uint({value} == 0ul)"));
             }
-            Operator::TableGet { table: 0 } => {
+            Operator::TableGet { table } => {
                 let index = pop(stack)?;
-                let size = self.table_size()?;
+                let size = self.table_size(*table)?;
                 self.source.push_str(&format!(
                     "if ({index} >= {size}) {{ trap = 6u; return; }}\n"
                 ));
                 self.emit_value(stack, format!("table[{index}]"));
             }
-            Operator::TableSet { table: 0 } => {
+            Operator::TableSet { table } => {
                 let value = pop(stack)?;
                 let index = pop(stack)?;
-                let size = self.table_size()?;
+                let size = self.table_size(*table)?;
                 self.source.push_str(&format!("if ({index} >= {size}) {{ trap = 6u; return; }}\ntable[{index}] = uint({value});\n"));
             }
-            Operator::TableSize { table: 0 } => {
-                let size = self.table_size()?;
+            Operator::TableSize { table } => {
+                let size = self.table_size(*table)?;
                 self.emit_value(stack, size);
             }
-            Operator::TableGrow { table: 0 } => {
+            Operator::TableGrow { table } => {
                 let count = pop(stack)?;
                 let value = pop(stack)?;
-                self.table_size()?;
+                self.table_size(*table)?;
+                let table_state = &self.tables[*table as usize];
+                let capacity = table_state.info.capacity;
+                let failure = if table_state.is64 {
+                    "0xfffffffffffffffful"
+                } else {
+                    "0xfffffffful"
+                };
                 let result = self.fresh_value();
                 let slot = self.fresh_value();
                 self.source.push_str(&format!(
-                    "{result} = 0xfffffffful;\nif (ulong(table_size) + {count} <= {}ul) {{\n{result} = table_size;\nfor ({slot} = table_size; {slot} < ulong(table_size) + {count}; ++{slot}) table[{slot}] = uint({value});\ntable_size += uint({count});\n}}\n", self.table_info.capacity));
+                    "{result} = {failure};\nif ({count} <= {capacity}ul - ulong(*table_size)) {{\n{result} = *table_size;\nfor ({slot} = *table_size; {slot} < ulong(*table_size) + {count}; ++{slot}) table[{slot}] = uint({value});\n*table_size += uint({count});\n}}\n"));
                 stack.push(result);
             }
-            Operator::TableFill { table: 0 } => {
+            Operator::TableFill { table } => {
                 let count = pop(stack)?;
                 let value = pop(stack)?;
                 let destination = pop(stack)?;
-                let size = self.table_size()?;
+                let size = self.table_size(*table)?;
                 let slot = self.fresh_value();
                 self.source.push_str(&format!(
-                    "if ({destination} + {count} > {size}) {{ trap = 6u; return; }}\nfor ({slot} = 0ul; {slot} < {count}; ++{slot}) table[{destination} + {slot}] = uint({value});\n"));
+                    "if ({destination} > {size} || {count} > {size} - {destination}) {{ trap = 6u; return; }}\nfor ({slot} = 0ul; {slot} < {count}; ++{slot}) table[{destination} + {slot}] = uint({value});\n"));
             }
             Operator::TableCopy {
-                dst_table: 0,
-                src_table: 0,
+                dst_table,
+                src_table,
             } => {
                 let count = pop(stack)?;
                 let source = pop(stack)?;
                 let destination = pop(stack)?;
-                let size = self.table_size()?;
+                let dst_size = self.table_size(*dst_table)?;
+                let dst = &self.tables[*dst_table as usize];
+                let dst_ptr = format!("states[{}].table[{}]", dst.owner, dst.local);
+                let src_size = self.table_size(*src_table)?;
+                let src = &self.tables[*src_table as usize];
+                let src_ptr = format!("states[{}].table[{}]", src.owner, src.local);
                 let slot = self.fresh_value();
                 self.source.push_str(&format!(
-                    "if ({destination} + {count} > {size} || {source} + {count} > {size}) {{ trap = 6u; return; }}\nif ({destination} > {source}) {{ for ({slot} = {count}; {slot} != 0ul; --{slot}) table[{destination} + {slot} - 1ul] = table[{source} + {slot} - 1ul]; }} else {{ for ({slot} = 0ul; {slot} < {count}; ++{slot}) table[{destination} + {slot}] = table[{source} + {slot}]; }}\n"));
+                    "if ({destination} > {dst_size} || {count} > {dst_size} - {destination} || {source} > {src_size} || {count} > {src_size} - {source}) {{ trap = 6u; return; }}\nif ({dst_ptr} == {src_ptr} && {destination} > {source}) {{ for ({slot} = {count}; {slot} != 0ul; --{slot}) {dst_ptr}[{destination} + {slot} - 1ul] = {src_ptr}[{source} + {slot} - 1ul]; }} else {{ for ({slot} = 0ul; {slot} < {count}; ++{slot}) {dst_ptr}[{destination} + {slot}] = {src_ptr}[{source} + {slot}]; }}\n"));
             }
-            Operator::TableInit {
-                elem_index,
-                table: 0,
-            } => {
+            Operator::TableInit { elem_index, table } => {
                 self.element_info
                     .elements
                     .get(*elem_index as usize)
@@ -3045,10 +3614,19 @@ impl Compiler<'_> {
                 let count = pop(stack)?;
                 let source = pop(stack)?;
                 let destination = pop(stack)?;
-                let size = self.table_size()?;
+                let size = self.table_size(*table)?;
                 let slot = self.fresh_value();
+                let values = if self
+                    .dynamic_elements
+                    .iter()
+                    .any(|(segment, _, _)| *segment == *elem_index as usize)
+                {
+                    format!("states[{}].element_values[{elem_index}]", self.module_index)
+                } else {
+                    format!("m{}_element_{elem_index}", self.module_index)
+                };
                 self.source.push_str(&format!(
-                    "if ({destination} + {count} > {size} || {source} + {count} > ulong(element_lengths[{elem_index}u])) {{ trap = 6u; return; }}\nfor ({slot} = 0ul; {slot} < {count}; ++{slot}) table[{destination} + {slot}] = m{}_element_{elem_index}[{source} + {slot}];\n", self.module_index));
+                    "if ({destination} > {size} || {count} > {size} - {destination} || {source} > ulong(element_lengths[{elem_index}u]) || {count} > ulong(element_lengths[{elem_index}u]) - {source}) {{ trap = 6u; return; }}\nfor ({slot} = 0ul; {slot} < {count}; ++{slot}) table[{destination} + {slot}] = {values}[{source} + {slot}];\n"));
             }
             Operator::ElemDrop { elem_index } => {
                 self.element_info
@@ -3203,51 +3781,68 @@ impl Compiler<'_> {
             Operator::I32Store16 { memarg } | Operator::I64Store16 { memarg } => {
                 self.emit_store(stack, memarg, 2)?
             }
-            Operator::MemorySize { mem: 0 } => {
-                self.memory_bytes
-                    .ok_or_else(|| Error::Unsupported("memory is missing".into()))?;
+            Operator::MemorySize { mem } => {
+                self.select_memory(*mem)?;
                 self.emit_value(stack, "pages[0]".into());
             }
-            Operator::MemoryGrow { mem: 0 } => {
-                let capacity = self
-                    .memory_capacity
-                    .ok_or_else(|| Error::Unsupported("memory is missing".into()))?;
+            Operator::MemoryGrow { mem } => {
+                let memory = self.select_memory(*mem)?;
+                let capacity = memory.capacity;
+                let owner = memory.owner;
+                let owner_count = memory.owner_count;
+                let failure = if memory.is64 {
+                    "0xfffffffffffffffful"
+                } else {
+                    "0xfffffffful"
+                };
                 let delta = pop(stack)?;
                 let prior = self.fresh_value();
+                let total = self.fresh_value();
+                let pages = (0..owner_count)
+                    .map(|index| format!("ulong(states[{owner}].pages[{index}][0])"))
+                    .collect::<Vec<_>>()
+                    .join(" + ");
                 self.source.push_str(&format!(
-                    "{prior} = pages[0];\nif ({delta} <= ulong({}u - pages[0])) pages[0] += uint({delta}); else {prior} = 4294967295ul;\n",
-                    capacity / 65536
+                    "{prior} = pages[0];\n{total} = {pages};\nif ({delta} <= ulong({}u - pages[0]) && {total} <= {}ul && {delta} <= {}ul - {total}) pages[0] += uint({delta}); else {prior} = {failure};\n",
+                    capacity / 65536,
+                    self.memory_limit_pages,
+                    self.memory_limit_pages
                 ));
                 stack.push(prior);
             }
-            Operator::MemoryFill { mem: 0 } => {
-                self.memory_bytes
-                    .ok_or_else(|| Error::Unsupported("memory is missing".into()))?;
+            Operator::MemoryFill { mem } => {
+                self.select_memory(*mem)?;
                 let length = pop(stack)?;
                 let value = pop(stack)?;
                 let destination = pop(stack)?;
                 let offset = self.fresh_value();
                 self.source.push_str(&format!(
-                    "if (ulong({destination}) + ulong({length}) > ulong(pages[0]) * 65536ul) {{ trap = 4u; return; }}\nfor ({offset} = 0ul; {offset} < ulong({length}); ++{offset}) memory[ulong({destination}) + {offset}] = uchar({value});\n"
+                    "if (ulong({destination}) > ulong(pages[0]) * 65536ul || ulong({length}) > ulong(pages[0]) * 65536ul - ulong({destination})) {{ trap = 4u; return; }}\nfor ({offset} = 0ul; {offset} < ulong({length}); ++{offset}) memory[ulong({destination}) + {offset}] = uchar({value});\n"
                 ));
             }
-            Operator::MemoryCopy {
-                dst_mem: 0,
-                src_mem: 0,
-            } => {
-                self.memory_bytes
+            Operator::MemoryCopy { dst_mem, src_mem } => {
+                let dst = self
+                    .memories
+                    .get(*dst_mem as usize)
                     .ok_or_else(|| Error::Unsupported("memory is missing".into()))?;
+                let dst_ptr = format!("states[{}].memory[{}]", dst.owner, dst.local);
+                let dst_pages = format!("states[{}].pages[{}][0]", dst.owner, dst.local);
+                let src = self
+                    .memories
+                    .get(*src_mem as usize)
+                    .ok_or_else(|| Error::Unsupported("memory is missing".into()))?;
+                let src_ptr = format!("states[{}].memory[{}]", src.owner, src.local);
+                let src_pages = format!("states[{}].pages[{}][0]", src.owner, src.local);
                 let length = pop(stack)?;
                 let source = pop(stack)?;
                 let destination = pop(stack)?;
                 let offset = self.fresh_value();
                 self.source.push_str(&format!(
-                    "if (ulong({destination}) + ulong({length}) > ulong(pages[0]) * 65536ul || ulong({source}) + ulong({length}) > ulong(pages[0]) * 65536ul) {{ trap = 4u; return; }}\nif ({destination} <= {source}) {{\nfor ({offset} = 0ul; {offset} < ulong({length}); ++{offset}) memory[ulong({destination}) + {offset}] = memory[ulong({source}) + {offset}];\n}} else {{\nfor ({offset} = ulong({length}); {offset} > 0ul; --{offset}) memory[ulong({destination}) + {offset} - 1ul] = memory[ulong({source}) + {offset} - 1ul];\n}}\n"
+                    "if (ulong({destination}) > ulong({dst_pages}) * 65536ul || ulong({length}) > ulong({dst_pages}) * 65536ul - ulong({destination}) || ulong({source}) > ulong({src_pages}) * 65536ul || ulong({length}) > ulong({src_pages}) * 65536ul - ulong({source})) {{ trap = 4u; return; }}\nif ({dst_ptr} == {src_ptr} && {destination} > {source}) {{\nfor ({offset} = ulong({length}); {offset} > 0ul; --{offset}) {dst_ptr}[ulong({destination}) + {offset} - 1ul] = {src_ptr}[ulong({source}) + {offset} - 1ul];\n}} else {{\nfor ({offset} = 0ul; {offset} < ulong({length}); ++{offset}) {dst_ptr}[ulong({destination}) + {offset}] = {src_ptr}[ulong({source}) + {offset}];\n}}\n"
                 ));
             }
-            Operator::MemoryInit { data_index, mem: 0 } => {
-                self.memory_bytes
-                    .ok_or_else(|| Error::Unsupported("memory is missing".into()))?;
+            Operator::MemoryInit { data_index, mem } => {
+                self.select_memory(*mem)?;
                 let offset = *self.data_offsets.get(*data_index as usize).ok_or_else(|| {
                     Error::Unsupported("data segment index is out of range".into())
                 })?;
@@ -3256,7 +3851,7 @@ impl Compiler<'_> {
                 let destination = pop(stack)?;
                 let byte = self.fresh_value();
                 self.source.push_str(&format!(
-                    "if (ulong({destination}) + ulong({length}) > ulong(pages[0]) * 65536ul || ulong({source}) + ulong({length}) > ulong(data_lengths[{data_index}u])) {{ trap = 4u; return; }}\nfor ({byte} = 0ul; {byte} < ulong({length}); ++{byte}) memory[ulong({destination}) + {byte}] = passive_data[{offset}ul + ulong({source}) + {byte}];\n"
+                    "if (ulong({destination}) > ulong(pages[0]) * 65536ul || ulong({length}) > ulong(pages[0]) * 65536ul - ulong({destination}) || ulong({source}) > ulong(data_lengths[{data_index}u]) || ulong({length}) > ulong(data_lengths[{data_index}u]) - ulong({source})) {{ trap = 4u; return; }}\nfor ({byte} = 0ul; {byte} < ulong({length}); ++{byte}) memory[ulong({destination}) + {byte}] = passive_data[{offset}ul + ulong({source}) + {byte}];\n"
                 ));
             }
             Operator::DataDrop { data_index } => {
@@ -3290,6 +3885,12 @@ impl Compiler<'_> {
                     return Err(Error::Unsupported("call argument is missing".into()));
                 }
                 let args = stack.split_off(stack.len() - ty.params().len());
+                if self.tail_calls {
+                    let ty = ty.clone();
+                    let target = self.resolved_functions[index];
+                    self.emit_dispatch_call(&format!("{target}u"), &ty, args, stack);
+                    return Ok(());
+                }
                 let result_types = ty.results().to_vec();
                 let results: Vec<_> = result_types
                     .into_iter()
@@ -3311,11 +3912,14 @@ impl Compiler<'_> {
             }
             Operator::CallIndirect {
                 type_index,
-                table_index: 0,
+                table_index,
             } => {
-                let table_len = self
-                    .table_len
+                self.tables
+                    .get(*table_index as usize)
                     .ok_or_else(|| Error::Unsupported("table is missing".into()))?;
+                let table_mutable = self.tables[*table_index as usize].info.mutable;
+                let table_values = self.tables[*table_index as usize].values;
+                let table_targets = self.tables[*table_index as usize].targets;
                 let ty = self.types.get(*type_index as usize).ok_or_else(|| {
                     Error::Unsupported("indirect type index is out of range".into())
                 })?;
@@ -3336,18 +3940,31 @@ impl Compiler<'_> {
                     ));
                 }
                 let args = stack.split_off(stack.len() - ty.params().len());
+                let size = self.table_size(*table_index)?;
+                if self.tail_calls {
+                    let ty = ty.clone();
+                    self.source.push_str(&format!(
+                        "if ({element} >= {size}) {{ trap = 6u; return; }}\n"
+                    ));
+                    let target = self.fresh_value();
+                    self.source.push_str(&format!("{target} = table[uint({element})];\nif ({target} == 0ul) {{ trap = 6u; return; }}\nswitch ({target}) {{\n"));
+                    for (index, candidate) in self.global_types.iter().enumerate() {
+                        if candidate == &ty {
+                            self.source
+                                .push_str(&format!("case {}u: break;\n", index + 1));
+                        }
+                    }
+                    self.source.push_str("default: trap = 7u; return;\n}\n");
+                    self.emit_dispatch_call(&format!("{target} - 1ul"), &ty, args, stack);
+                    return Ok(());
+                }
                 let result_types = ty.results().to_vec();
                 let results: Vec<_> = result_types
                     .into_iter()
                     .map(|ty| self.fresh_typed(ty))
                     .collect();
-                let table_len = if self.table_info.mutable {
-                    "table_size".into()
-                } else {
-                    format!("{table_len}ul")
-                };
                 self.source.push_str(&format!(
-                    "if ({element} >= {table_len}) {{ trap = 6u; return; }}\n"
+                    "if ({element} >= {size}) {{ trap = 6u; return; }}\n"
                 ));
                 let target = self.fresh_value();
                 self.source
@@ -3358,13 +3975,10 @@ impl Compiler<'_> {
                 let constant_slot = element
                     .strip_suffix("ul")
                     .and_then(|digits| digits.parse::<usize>().ok());
-                let constant_target = constant_slot.and_then(|slot| {
-                    self.table_values
-                        .and_then(|values| values.get(slot))
-                        .copied()
-                });
-                for &index in self.table_targets {
-                    if !self.table_info.mutable
+                let constant_target =
+                    constant_slot.and_then(|slot| table_values.get(slot).copied());
+                for &index in table_targets {
+                    if !table_mutable
                         && constant_slot.is_some()
                         && constant_target != Some(index as u32 + 1)
                     {
@@ -6364,10 +6978,32 @@ mod tests {
         )
         .unwrap();
         let translation = translate_with_limits(&wasm, "f", &[], KernelLimits::default()).unwrap();
-        assert!(!translation.instances[0].table_info.mutable);
-        assert_eq!(translation.instances[0].table_info.capacity, 65536);
+        assert!(!translation.instances[0].tables[0].info.mutable);
+        assert_eq!(translation.instances[0].tables[0].info.capacity, 65536);
         let kernel = Kernel::new(&wasm, "f").unwrap();
         assert_eq!(kernel.run(&[0, 1, 2]).unwrap(), [65536, 65537, 65538]);
+    }
+
+    #[test]
+    fn mutating_one_table_keeps_other_table_fixed() {
+        let source = r#"(module (type $t (func (param i32) (result i32)))
+                (table $fixed 1 funcref) (table $mutable 1 2 funcref)
+                (func $safe (type $t) local.get 0 i32.const 1 i32.add)
+                (func $other (type $t) local.get 0 i32.const 7 i32.add)
+                (elem (table $fixed) (i32.const 0) func $safe)
+                (elem declare func $other)
+                (func (export "f") (param i32) (result i32)
+                    i32.const 0 ref.func $other table.set $mutable
+                    ref.null func i32.const 1 table.grow $mutable drop
+                    local.get 0 i32.const 0 call_indirect $fixed (type $t)))"#;
+        let wasm = wat::parse_str(source).unwrap();
+        let translation = translate_with_limits(&wasm, "f", &[], KernelLimits::default()).unwrap();
+        assert!(!translation.instances[0].tables[0].info.mutable);
+        assert_eq!(translation.instances[0].tables[0].info.capacity, 1);
+        assert_eq!(translation.instances[0].tables[0].targets, [0]);
+        assert!(translation.instances[0].tables[1].info.mutable);
+        assert_eq!(translation.instances[0].tables[1].info.capacity, 2);
+        matches_wasmtime(source, &[0, 37]);
     }
 
     #[test]
@@ -6770,6 +7406,335 @@ mod tests {
                 Value::I32(6),
                 Value::V128([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 7, 0, 0]),
             ]],
+        );
+    }
+
+    #[test]
+    fn extended_constant_expressions_match_wasmtime() {
+        compare_values_to_wasmtime(
+            "(module
+                (global $base i32 (i32.const 40))
+                (global $answer i32 (i32.add (global.get $base) (i32.const 2)))
+                (memory 1)
+                (data (i32.add (i32.const 1) (i32.const 1)) \"\\2a\")
+                (func (export \"f\") (param i32) (result i32)
+                    global.get $answer
+                    i32.const 2 i32.load8_u i32.add
+                    local.get 0 i32.add))",
+            &[vec![Value::I32(0)], vec![Value::I32(7)]],
+        );
+    }
+
+    #[test]
+    fn tail_calls_reuse_the_call_frame() {
+        compare_values_to_wasmtime(
+            "(module
+                (func $sum (param i32 i32) (result i32)
+                    local.get 0 i32.eqz
+                    if (result i32) local.get 1
+                    else
+                        local.get 0 i32.const 1 i32.sub
+                        local.get 1 local.get 0 i32.add
+                        return_call $sum
+                    end)
+                (func (export \"f\") (param i32) (result i32)
+                    local.get 0 i32.const 0 return_call $sum))",
+            &[
+                vec![Value::I32(1)],
+                vec![Value::I32(10)],
+                vec![Value::I32(1_000)],
+            ],
+        );
+        compare_values_to_wasmtime(
+            "(module (type $t (func (param i32) (result i32)))
+                (table 1 funcref) (elem (i32.const 0) $inc)
+                (func $inc (type $t) local.get 0 i32.const 1 i32.add)
+                (func (export \"f\") (param i32) (result i32)
+                    local.get 0 i32.const 0 return_call_indirect (type $t)))",
+            &[vec![Value::I32(0)], vec![Value::I32(100)]],
+        );
+        compare_values_to_wasmtime(
+            "(module (type $t (func (param i32) (result i32)))
+                (func $inc (type $t) local.get 0 i32.const 1 i32.add)
+                (elem declare func $inc)
+                (func (export \"f\") (param i32) (result i32)
+                    local.get 0 ref.func $inc return_call_ref $t))",
+            &[vec![Value::I32(0)], vec![Value::I32(100)]],
+        );
+    }
+
+    #[test]
+    fn multiple_memories_and_memory64_match_wasmtime() {
+        compare_values_to_wasmtime(
+            "(module (memory $a 1 2) (memory $b 1 2)
+                (data (memory $a) (i32.const 0) \"\\05\")
+                (data (memory $b) (i32.const 0) \"\\07\")
+                (func (export \"f\") (param i32) (result i32)
+                    (memory.copy $b $a (i32.const 2) (i32.const 0) (i32.const 1))
+                    (i32.store8 $a (i32.const 1) (local.get 0))
+                    (i32.add (i32.load8_u $a (i32.const 1)) (i32.load8_u $b (i32.const 2)))))",
+            &[vec![Value::I32(0)], vec![Value::I32(37)]],
+        );
+        compare_values_to_wasmtime(
+            "(module (memory $a i64 1 2) (memory $b i64 1 2)
+                (data (memory $b) (i64.const 2) \"\\0b\")
+                (func (export \"f\") (param i64) (result i64)
+                    (i64.store8 $a (i64.const 1) (local.get 0))
+                    (memory.copy $a $b (i64.const 3) (i64.const 2) (i64.const 1))
+                    (i64.add (i64.load8_u $a (i64.const 1)) (i64.load8_u $a (i64.const 3)))))",
+            &[vec![Value::I64(0)], vec![Value::I64(37)]],
+        );
+    }
+
+    #[test]
+    fn multiple_tables_and_table64_match_wasmtime() {
+        compare_values_to_wasmtime(
+            "(module (type $t (func (param i32) (result i32)))
+                (table $a 2 funcref) (table $b 2 funcref)
+                (func $inc (type $t) local.get 0 i32.const 1 i32.add)
+                (elem (table $a) (i32.const 1) func $inc)
+                (func (export \"f\") (param i32) (result i32)
+                    (table.copy $b $a (i32.const 0) (i32.const 1) (i32.const 1))
+                    (call_indirect $b (type $t) (local.get 0) (i32.const 0))))",
+            &[vec![Value::I32(0)], vec![Value::I32(37)]],
+        );
+        compare_values_to_wasmtime(
+            "(module (type $t (func (param i32) (result i32)))
+                (table $a i64 1 2 funcref)
+                (func $inc (type $t) local.get 0 i32.const 1 i32.add)
+                (elem (table $a) (i64.const 0) func $inc)
+                (func (export \"f\") (param i32) (result i32)
+                    (call_indirect $a (type $t) (local.get 0) (i64.const 0))))",
+            &[vec![Value::I32(0)], vec![Value::I32(37)]],
+        );
+    }
+
+    #[test]
+    fn funcref_global_initializers_match_wasmtime() {
+        compare_values_to_wasmtime(
+            "(module (type $t (func (param i32) (result i32)))
+                (func $inc (type $t) local.get 0 i32.const 1 i32.add)
+                (global $r funcref (ref.func $inc))
+                (table 1 funcref)
+                (elem (i32.const 0) funcref (global.get $r))
+                (func (export \"f\") (param i32) (result i32)
+                    (call_indirect (type $t) (local.get 0) (i32.const 0))))",
+            &[vec![Value::I32(0)], vec![Value::I32(37)]],
+        );
+    }
+
+    #[test]
+    fn imported_funcref_element_expressions_match_wasmtime() {
+        let provider = "(module (type $t (func (param i32) (result i32)))
+            (func $inc (type $t) local.get 0 i32.const 7 i32.add)
+            (global (export \"ref\") funcref (ref.func $inc)))";
+        linked_matches_wasmtime(
+            "(module (type $t (func (param i32) (result i32)))
+                (import \"p\" \"ref\" (global $r funcref))
+                (table 1 funcref (global.get $r))
+                (func (export \"f\") (param i32) (result i32)
+                    (call_indirect (type $t) (local.get 0) (i32.const 0))))",
+            &[("p", provider)],
+            &[0, 1, 37],
+        );
+        linked_matches_wasmtime(
+            "(module (type $t (func (param i32) (result i32)))
+                (import \"p\" \"ref\" (global $r funcref))
+                (table 1 funcref)
+                (elem (i32.const 0) funcref (global.get $r))
+                (func (export \"f\") (param i32) (result i32)
+                    (call_indirect (type $t) (local.get 0) (i32.const 0))))",
+            &[("p", provider)],
+            &[0, 1, 37],
+        );
+        linked_matches_wasmtime(
+            "(module (type $t (func (param i32) (result i32)))
+                (import \"p\" \"ref\" (global $r funcref))
+                (table 1 funcref)
+                (elem $e funcref (global.get $r))
+                (func (export \"f\") (param i32) (result i32)
+                    (table.init $e (i32.const 0) (i32.const 0) (i32.const 1))
+                    (call_indirect (type $t) (local.get 0) (i32.const 0))))",
+            &[("p", provider)],
+            &[0, 1, 37],
+        );
+    }
+
+    #[test]
+    fn second_memory_export_supports_per_lane_io() {
+        let wasm = wat::parse_str(
+            "(module (memory $a (export \"first\") 1) (memory $b (export \"second\") 1)
+                (func (export \"f\") (param i32) (result i32)
+                    (i32.load8_u $b (local.get 0))))",
+        )
+        .unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        let (values, memories) = kernel
+            .run_values_with_memory_io(
+                &[vec![Value::I32(1)], vec![Value::I32(1)]],
+                "second",
+                1,
+                &[vec![11], vec![23]],
+                0..3,
+            )
+            .unwrap();
+        assert_eq!(values, [vec![Value::I32(11)], vec![Value::I32(23)]]);
+        assert_eq!(memories, [vec![0, 11, 0], vec![0, 23, 0]]);
+    }
+
+    #[test]
+    fn multiple_imported_memories_and_tables_keep_provider_state() {
+        let provider = r#"(module
+            (type $t (func (param i32) (result i32)))
+            (memory $a (export "a") 1) (memory $b (export "b") 1)
+            (table $ta (export "ta") 1 funcref)
+            (table $tb (export "tb") 1 funcref)
+            (func $inc (type $t) local.get 0 i32.const 1 i32.add)
+            (elem (table $tb) (i32.const 0) func $inc)
+            (data (memory $b) (i32.const 0) "\09"))"#;
+        let root = r#"(module
+            (type $t (func (param i32) (result i32)))
+            (import "p" "a" (memory $a 1))
+            (import "p" "b" (memory $b 1))
+            (import "p" "ta" (table $ta 1 funcref))
+            (import "p" "tb" (table $tb 1 funcref))
+            (func (export "f") (param i32) (result i32)
+                (i32.store8 $a (i32.const 0) (local.get 0))
+                (call_indirect $tb (type $t)
+                    (i32.add (i32.load8_u $a (i32.const 0))
+                             (i32.load8_u $b (i32.const 0)))
+                    (i32.const 0))))"#;
+        linked_matches_wasmtime(root, &[("p", provider)], &[0, 1, 25]);
+    }
+
+    #[test]
+    fn table64_growth_bulk_operations_and_failure_match_wasmtime() {
+        compare_values_to_wasmtime(
+            r#"(module (type $t (func (param i32) (result i32)))
+                (table $table i64 1 2 funcref)
+                (func $inc (type $t) local.get 0 i32.const 1 i32.add)
+                (elem $segment func $inc)
+                (func (export "f") (param i32) (result i32 i64)
+                    ref.null func i64.const 1 table.grow $table drop
+                    i64.const 0 i32.const 0 i32.const 1 table.init $table $segment
+                    i64.const 1 i64.const 0 i64.const 1 table.copy $table $table
+                    i64.const 0 ref.func $inc table.set $table
+                    i64.const 0 ref.func $inc i64.const 1 table.fill $table
+                    local.get 0 i64.const 1 call_indirect $table (type $t)
+                    ref.null func i64.const 1 table.grow $table) )"#,
+            &[vec![Value::I32(0)], vec![Value::I32(9)]],
+        );
+    }
+
+    #[test]
+    fn memory64_and_second_memory_growth_are_independent() {
+        compare_values_to_wasmtime(
+            r#"(module (memory $small 1 2) (memory $wide i64 1 2)
+                (func (export "f") (param i32) (result i32 i64 i32 i64)
+                    local.get 0 memory.grow $small
+                    i64.const 1 memory.grow $wide
+                    memory.size $small
+                    memory.size $wide))"#,
+            &[
+                vec![Value::I32(0)],
+                vec![Value::I32(1)],
+                vec![Value::I32(u32::MAX)],
+            ],
+        );
+    }
+
+    #[test]
+    fn growth_reserve_follows_the_selected_memory() {
+        let wasm = wat::parse_str(
+            r#"(module (memory $first 1 2) (memory $second 1 2)
+                (func (export "f") (param i32) (result i32 i32 i32)
+                    local.get 0 memory.grow $second
+                    memory.size $first
+                    memory.size $second))"#,
+        )
+        .unwrap();
+        let limits = KernelLimits {
+            memory_bytes: 3 * 65536,
+            memory_growth_pages: 1,
+            ..KernelLimits::default()
+        };
+        let actual = Kernel::new_with_limits(&wasm, "f", limits)
+            .unwrap()
+            .run_values(&[vec![Value::I32(1)], vec![Value::I32(2)]])
+            .unwrap();
+        assert_eq!(
+            actual,
+            [
+                vec![Value::I32(1), Value::I32(1), Value::I32(2)],
+                vec![Value::I32(u32::MAX), Value::I32(1), Value::I32(1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn growable_memories_share_the_runtime_page_limit() {
+        let wasm = wat::parse_str(
+            r#"(module (memory $first 1 2) (memory $second 1 2)
+                (func (export "f") (param i32) (result i32 i32)
+                    local.get 0
+                    if
+                        i32.const 1 memory.grow $second drop
+                    else
+                        i32.const 1 memory.grow $first drop
+                    end
+                    memory.size $first
+                    memory.size $second)
+                (func (export "both") (result i32 i32)
+                    i32.const 1 memory.grow $first
+                    i32.const 1 memory.grow $second))"#,
+        )
+        .unwrap();
+        let limits = KernelLimits {
+            memory_bytes: 3 * 65536,
+            memory_growth_pages: 1,
+            ..KernelLimits::default()
+        };
+        let actual = Kernel::new_with_limits(&wasm, "f", limits)
+            .unwrap()
+            .run_values(&[vec![Value::I32(0)], vec![Value::I32(1)]])
+            .unwrap();
+        assert_eq!(
+            actual,
+            [
+                vec![Value::I32(2), Value::I32(1)],
+                vec![Value::I32(1), Value::I32(2)],
+            ]
+        );
+        let both = Kernel::new_with_limits(&wasm, "both", limits).unwrap();
+        assert_eq!(
+            both.run_values(&[vec![]]).unwrap(),
+            [vec![Value::I32(1), Value::I32(u32::MAX)]]
+        );
+    }
+
+    #[test]
+    fn table_copy_between_32_and_64_bit_tables_matches_wasmtime() {
+        compare_values_to_wasmtime(
+            r#"(module (type $t (func (param i32) (result i32)))
+                (table $small 1 funcref) (table $wide i64 1 funcref)
+                (func $inc (type $t) local.get 0 i32.const 1 i32.add)
+                (elem (table $wide) (i64.const 0) func $inc)
+                (func (export "f") (param i32) (result i32)
+                    (table.copy $small $wide (i32.const 0) (i64.const 0) (i32.const 1))
+                    (call_indirect $small (type $t) (local.get 0) (i32.const 0))))"#,
+            &[vec![Value::I32(0)], vec![Value::I32(17)]],
+        );
+    }
+
+    #[test]
+    fn memory_copy_between_32_and_64_bit_memories_matches_wasmtime() {
+        compare_values_to_wasmtime(
+            r#"(module (memory $small 1) (memory $wide i64 1)
+                (data (memory $wide) (i64.const 0) "\2a")
+                (func (export "f") (param i32) (result i32)
+                    (memory.copy $small $wide (i32.const 1) (i64.const 0) (i32.const 1))
+                    (i32.add (i32.load8_u $small (i32.const 1)) (local.get 0))))"#,
+            &[vec![Value::I32(0)], vec![Value::I32(17)]],
         );
     }
 }

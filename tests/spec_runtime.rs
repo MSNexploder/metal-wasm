@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use metal_wasm::{Error, Kernel, Value};
 use wast::core::{NanPattern, V128Pattern, WastArgCore, WastRetCore};
@@ -7,6 +7,7 @@ use wast::parser::{self, ParseBuffer};
 use wast::{Wast, WastArg, WastDirective, WastExecute, WastInvoke, WastRet};
 
 static GPU_LOCK: Mutex<()> = Mutex::new(());
+static SPECTEST: OnceLock<Vec<u8>> = OnceLock::new();
 
 fn arg(value: WastArg<'_>) -> Value {
     match value {
@@ -89,13 +90,30 @@ fn invoke(
         call.module.is_none(),
         "named modules are outside this harness"
     );
-    let kernel = kernels
-        .entry(call.name.to_owned())
-        .or_insert_with(|| Kernel::new(module, call.name).unwrap());
+    if !kernels.contains_key(call.name) {
+        let spectest = SPECTEST.get_or_init(|| {
+            wat::parse_str(
+                "(module (func (export \"print_i32_f32\") (param i32 f32))
+                (global (export \"global_i32\") i32 (i32.const 666)))",
+            )
+            .unwrap()
+        });
+        let kernel = Kernel::new_with_imports(module, call.name, &[("spectest", spectest)])?;
+        kernels.insert(call.name.to_owned(), kernel);
+    }
+    let kernel = &kernels[call.name];
     kernel.run_values(&[call.args.into_iter().map(arg).collect()])
 }
 
 fn check_script(source: &str, minimum_assertions: usize) {
+    check_script_with_options(source, minimum_assertions, false);
+}
+
+fn check_script_with_options(
+    source: &str,
+    minimum_assertions: usize,
+    skip_reference_exports: bool,
+) {
     // Concurrent Metal compilation and execution can exhaust this device's resources.
     let _gpu_lock = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let buffer = ParseBuffer::new(source).unwrap();
@@ -104,6 +122,7 @@ fn check_script(source: &str, minimum_assertions: usize) {
     let mut kernels = HashMap::new();
     let mut checked = 0;
     let mut validation_cases = 0;
+    let mut skipped = 0;
     for directive in script.directives {
         match directive {
             WastDirective::Module(mut wat) => {
@@ -115,9 +134,43 @@ fn check_script(source: &str, minimum_assertions: usize) {
                 results,
                 ..
             } => {
+                if skip_reference_exports
+                    && (call.args.iter().any(|arg| {
+                        !matches!(
+                            arg,
+                            WastArg::Core(
+                                WastArgCore::I32(_)
+                                    | WastArgCore::I64(_)
+                                    | WastArgCore::F32(_)
+                                    | WastArgCore::F64(_)
+                                    | WastArgCore::V128(_)
+                            )
+                        )
+                    }) || results.iter().any(|ret| {
+                        !matches!(
+                            ret,
+                            WastRet::Core(
+                                WastRetCore::I32(_)
+                                    | WastRetCore::I64(_)
+                                    | WastRetCore::F32(_)
+                                    | WastRetCore::F64(_)
+                                    | WastRetCore::V128(_)
+                            )
+                        )
+                    }))
+                {
+                    skipped += 1;
+                    continue;
+                }
                 let invocation = format!("{call:?}");
-                let actual = invoke(call, module.as_deref().unwrap(), &mut kernels)
-                    .unwrap_or_else(|error| panic!("{invocation}: {error}"));
+                let actual = invoke(call, module.as_deref().unwrap(), &mut kernels);
+                if skip_reference_exports
+                    && matches!(&actual, Err(Error::Unsupported(reason)) if reason == "exported signatures must contain numeric values")
+                {
+                    skipped += 1;
+                    continue;
+                }
+                let actual = actual.unwrap_or_else(|error| panic!("{invocation}: {error}"));
                 assert_eq!(actual.len(), 1);
                 assert_eq!(actual[0].len(), results.len());
                 for (value, expected) in actual[0].iter().zip(&results) {
@@ -133,10 +186,33 @@ fn check_script(source: &str, minimum_assertions: usize) {
                 message,
                 ..
             } => {
+                if skip_reference_exports
+                    && call.args.iter().any(|arg| {
+                        !matches!(
+                            arg,
+                            WastArg::Core(
+                                WastArgCore::I32(_)
+                                    | WastArgCore::I64(_)
+                                    | WastArgCore::F32(_)
+                                    | WastArgCore::F64(_)
+                                    | WastArgCore::V128(_)
+                            )
+                        )
+                    })
+                {
+                    skipped += 1;
+                    continue;
+                }
                 let actual = invoke(call, module.as_deref().unwrap(), &mut kernels);
+                if skip_reference_exports
+                    && matches!(&actual, Err(Error::Unsupported(reason)) if reason == "exported signatures must contain numeric values")
+                {
+                    skipped += 1;
+                    continue;
+                }
                 assert!(
                     matches!(actual, Err(Error::Trap { input_index: 0, reason })
-                        if reason == message || (message == "undefined element"
+                        if reason == message || ((message == "undefined element" || message == "uninitialized element")
                             && reason == "undefined or uninitialized table element")),
                     "expected trap {message:?}, got {actual:?}"
                 );
@@ -158,7 +234,39 @@ fn check_script(source: &str, minimum_assertions: usize) {
         }
     }
     assert!(checked >= minimum_assertions, "only {checked} cases ran");
-    eprintln!("checked {checked} runtime cases and {validation_cases} validation cases");
+    eprintln!(
+        "checked {checked} runtime cases and {validation_cases} validation cases; skipped {skipped} reference API cases"
+    );
+}
+
+#[test]
+fn spec_constant_expressions() {
+    check_script(include_str!("spec/const.wast"), 300);
+}
+
+#[test]
+fn spec_extended_constant_elements() {
+    check_script(include_str!("spec/extended_const_elements.wast"), 8);
+}
+
+#[test]
+fn spec_tail_calls() {
+    check_script_with_options(include_str!("spec/return_call.wast"), 20, true);
+}
+
+#[test]
+fn spec_tail_calls_indirect() {
+    check_script_with_options(include_str!("spec/return_call_indirect.wast"), 30, true);
+}
+
+#[test]
+fn spec_multiple_memories() {
+    check_script(include_str!("spec/multi_memory_load0.wast"), 2);
+}
+
+#[test]
+fn spec_memory64_loads() {
+    check_script(include_str!("spec/memory64_load64.wast"), 37);
 }
 
 #[test]
@@ -349,3 +457,37 @@ fn spec_simd_memory() {
         check_script(source, 1);
     }
 }
+
+macro_rules! new_feature_spec {
+    ($name:ident, $file:literal, $minimum:expr) => {
+        #[test]
+        fn $name() {
+            check_script(include_str!($file), $minimum);
+        }
+    };
+}
+
+new_feature_spec!(spec_memory64_address, "spec/memory64_address64.wast", 238);
+new_feature_spec!(spec_memory64_align, "spec/memory64_align64.wast", 48);
+new_feature_spec!(
+    spec_table64_indirect,
+    "spec/memory64_call_indirect64.wast",
+    1
+);
+new_feature_spec!(
+    spec_memory64_endianness,
+    "spec/memory64_endianness64.wast",
+    68
+);
+new_feature_spec!(spec_multi_memory_load2, "spec/multi_memory_load2.wast", 37);
+new_feature_spec!(
+    spec_multi_memory_address0,
+    "spec/multi_memory_address0.wast",
+    91
+);
+new_feature_spec!(
+    spec_multi_memory_address1,
+    "spec/multi_memory_address1.wast",
+    126
+);
+new_feature_spec!(spec_multi_memory_traps, "spec/multi_memory_traps0.wast", 14);
