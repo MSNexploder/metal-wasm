@@ -6,32 +6,32 @@ impl Compiler<'_> {
             .local_types
             .iter()
             .enumerate()
-            .filter(|(_, ty)| matches!(ty, ValType::Ref(_)))
-            .map(|(i, _)| format!("l{i}"))
+            .filter_map(|(i, ty)| {
+                if let ValType::Ref(r) = ty {
+                    Some((format!("l{i}"), *r))
+                } else {
+                    None
+                }
+            })
             .collect::<Vec<_>>();
         roots.extend(
             stack
                 .iter()
-                .filter(|v| !self.vector_names.contains(*v))
-                .cloned(),
+                .filter_map(|v| self.reference_names.get(v).map(|&r| (v.clone(), r))),
         );
-        roots.extend(
-            self.frames
-                .iter()
-                .flat_map(|f| f.params.iter())
-                .filter(|v| !self.vector_names.contains(*v))
-                .cloned(),
-        );
-        roots.sort();
-        roots.dedup();
+        roots.sort_by(|a, b| a.0.cmp(&b.0));
+        roots.dedup_by(|a, b| a.0 == b.0);
         self.max_gc_roots = self.max_gc_roots.max(roots.len());
         self.source
             .push_str("for(uint j=0u;j<GC_FRAME_SLOTSu;++j) gc.roots[gc_frame.base+j]=0ul;\n");
-        for (i, v) in roots.iter().enumerate() {
-            self.source
-                .push_str(&format!("gc.roots[gc_frame.base+{i}u]={v};\n"));
+        for (i, (v, r)) in roots.iter().enumerate() {
+            self.source.push_str(&format!(
+                "gc.roots[gc_frame.base+{i}u]={};\n",
+                root_word(v, *r)
+            ));
         }
     }
+
     fn gc_type(&self, index: u32) -> Result<GcType, Error> {
         self.gc_types
             .get(index as usize)
@@ -71,11 +71,11 @@ impl Compiler<'_> {
                 stack,
                 format!("uint(int(as_type<short>(ushort({ptr}[{index}]))))"),
             ),
-            _ => self.emit_value(stack, format!("{ptr}[{index}]")),
+            _ => self.emit_typed(stack, format!("{ptr}[{index}]"), ty.unpack()),
         }
     }
     fn gc_allocate(&mut self, index: u32, length: &str, words: &str) -> String {
-        let value = self.fresh_value();
+        let value = self.fresh_typed(ValType::Ref(RefType::ANYREF));
         let id = self.gc_ids[index as usize];
         self.source.push_str(&format!("if ({words} > ulong(gc.capacity)) {{trap=15u;return;}}\n{value}=gc_alloc(gc,{id}u,uint({length}),uint({words}),trap); if(trap!=0u) return;\n"));
         value
@@ -124,14 +124,19 @@ impl Compiler<'_> {
             }
             Operator::AnyConvertExtern => {
                 let v = pop(stack)?;
-                self.emit_value(
+                self.emit_typed(
                     stack,
                     format!("({v}==0ul ? 0ul : ({v}>>32u)==0ul ? 0x200000000ul | {v} : {v})"),
+                    ValType::Ref(RefType::ANYREF),
                 );
             }
             Operator::ExternConvertAny => {
                 let v = pop(stack)?;
-                self.emit_value(stack, format!("(({v}>>32u)==2ul ? ulong(uint({v})) : {v})"));
+                self.emit_typed(
+                    stack,
+                    format!("(({v}>>32u)==2ul ? ulong(uint({v})) : {v})"),
+                    ValType::EXTERNREF,
+                );
             }
             Operator::StructNew {
                 struct_type_index: index,
@@ -155,7 +160,7 @@ impl Compiler<'_> {
                     stack.split_off(stack.len() - t.fields.len())
                 };
                 let id = self.gc_ids[*index as usize];
-                let value = self.fresh_value();
+                let value = self.fresh_typed(ValType::Ref(RefType::ANYREF));
                 self.source.push_str(&format!(
                     "{value}=gc_struct_{id}({}gc,trap); if(trap!=0u) return;\n",
                     if args.is_empty() {
@@ -230,7 +235,7 @@ impl Compiler<'_> {
                     pop(stack)?
                 };
                 let id = self.gc_ids[*index as usize];
-                let value = self.fresh_value();
+                let value = self.fresh_typed(ValType::Ref(RefType::ANYREF));
                 self.source.push_str(&format!(
                     "{value}=gc_array_{id}({v},{len},gc,trap);if(trap!=0u)return;\n"
                 ));
@@ -437,7 +442,7 @@ pub(super) fn gc_type_source(
         .flat_map(|m| m.supertypes.iter().map(|(&id, &p)| (id, p)))
         .collect();
     let mut s = String::from(
-        "inline ulong gc_internalize(ulong v) { return v==0ul ? 0ul : (v>>32u)==0ul ? 0x200000000ul | v : v; }\ninline ulong gc_externalize(ulong v) { return (v>>32u)==2ul ? ulong(uint(v)) : v; }\ninline ulong gc_keep(thread GcState& gc, uint slot, ulong value) { gc.roots[slot] = value; return value; }\ninline uint gc_kind(uint type) { switch(type) {\n",
+        "inline ulong gc_internalize(ulong v) { return v==0ul ? 0ul : (v>>32u)==0ul ? 0x200000000ul | v : v; }\ninline ulong gc_externalize(ulong v) { return (v>>32u)==2ul ? ulong(uint(v)) : v; }\ninline ulong gc_keep(thread GcState& gc, uint slot, ulong value, uint kind) { gc.roots[slot] = kind==2u ? (0x400000000ul | value) : kind==1u ? value : 0ul; return value; }\ninline uint gc_kind(uint type) { switch(type) {\n",
     );
     for (i, t) in types.iter().enumerate() {
         s.push_str(&format!(
@@ -457,78 +462,79 @@ pub(super) fn gc_type_source(
             .join(" || ");
         s.push_str(&format!("case {}u: return {accepted};\n", i + 1));
     }
-    s.push_str("default: return false; } }\ninline bool gc_ref_word(uint type, uint word) { switch(type) {\n");
+    s.push_str("default: return false; } }\ninline uint gc_ref_word(uint type, uint word) { switch(type) {\n");
     for (i, t) in types.iter().enumerate() {
-        let mut words = Vec::new();
+        s.push_str(&format!("case {}u: ", i + 1));
+        if t.array {
+            s.push_str(&format!("word %= {}u; ", t.words()));
+        }
+        s.push_str("switch(word) { ");
         let mut offset = 0;
         for f in &t.fields {
-            if storage_is_ref(f) {
-                words.push(offset);
+            if let StorageType::Val(ValType::Ref(r)) = f {
+                s.push_str(&format!("case {offset}u: return {}u; ", root_kind(*r)));
             }
             offset += storage_words(f);
         }
-        let condition = if words.is_empty() {
-            "false".into()
-        } else if t.array {
-            format!("word % {}u == 0u", t.words())
-        } else {
-            words
-                .iter()
-                .map(|w| format!("word == {w}u"))
-                .collect::<Vec<_>>()
-                .join(" || ")
-        };
-        s.push_str(&format!("case {}u: return {condition};\n", i + 1));
+        s.push_str("default: return 0u; }\n");
     }
-    s.push_str("default: return false; } }\ninline void gc_mark_state(thread GcState& gc) {\n");
+    s.push_str("default: return 0u; } }\ninline void gc_mark_state(thread GcState& gc) {\n");
     if persistent {
-        s.push_str("for (uint j=0u;j<gc.host_count;++j) gc_mark(gc,gc.host_roots[j]);\n");
+        s.push_str("for(uint j=0u;j<gc.host_count;++j) gc_mark(gc,gc.host_roots[j]);\n");
     }
     for (m, module) in modules.iter().enumerate() {
         let imported = module.global_types.len() - module.local_global_slots.len();
         for (i, &slot) in module.local_global_slots.iter().enumerate() {
-            if matches!(module.global_types[imported+i].content_type,ValType::Ref(r) if is_gc_ref(r,&parents)||is_external_ref(r))
-            {
-                s.push_str(&format!("if (gc.states[{m}].globals != nullptr) gc_mark(gc, gc.states[{m}].globals[{slot}u]);\n"));
+            if let ValType::Ref(r) = module.global_types[imported + i].content_type {
+                s.push_str(&format!(
+                    "if(gc.states[{m}].globals!=nullptr) gc_mark(gc,{});\n",
+                    root_word(&format!("gc.states[{m}].globals[{slot}u]"), r)
+                ));
             }
         }
         let imported = module.table_types.len() - module.instance.tables.len();
         for (i, _) in module.instance.tables.iter().enumerate() {
             let r = module.table_types[imported + i].element_type;
-            if is_gc_ref(r, &parents) || is_external_ref(r) {
-                s.push_str(&format!("if (gc.states[{m}].table[{i}] != nullptr) for (uint j=0u;j<gc.states[{m}].table_size[{i}];++j) gc_mark(gc,gc.states[{m}].table[{i}][j]);\n"));
-            }
+            s.push_str(&format!("if(gc.states[{m}].table[{i}]!=nullptr) for(uint j=0u;j<gc.states[{m}].table_size[{i}];++j) gc_mark(gc,{});\n",root_word(&format!("gc.states[{m}].table[{i}][j]"),r)));
         }
-        for (i, values) in module.instance.element_info.elements.iter().enumerate() {
+        for (i, _) in module.instance.element_info.elements.iter().enumerate() {
             if module.dynamic_elements.iter().any(|(seg, _, _)| *seg == i) {
-                s.push_str(&format!("if (gc.states[{m}].element_values[{i}] != nullptr) for (uint j=0u;j<{}u;++j) gc_mark(gc,gc.states[{m}].element_values[{i}][j]);\n",values.len()));
+                let r = module.instance.element_info.element_types[i];
+                s.push_str(&format!("if(gc.states[{m}].element_values[{i}]!=nullptr) for(uint j=0u;j<gc.states[{m}].element_lengths[{i}];++j) gc_mark(gc,{});\n",root_word(&format!("gc.states[{m}].element_values[{i}][j]"),r)));
             }
         }
     }
-    if modules.iter().any(|m| m.uses_exceptions) {
-        s.push_str("if (gc.states[0].exceptions != nullptr) { thread ExceptionState& ex = *gc.states[0].exceptions; for (uint i=0u;i<ex.count;++i) { switch(ex.tags[i]) {\n");
+    let exceptions = modules.iter().any(|m| m.uses_exceptions);
+    if exceptions {
+        s.push_str("if(gc.states[0].exceptions!=nullptr) { thread ExceptionState& ex=*gc.states[0].exceptions; gc_mark_exception(gc,ex.pending); for(uint j=1u;j<=ex.pinned_count;++j) gc_mark_exception(gc,j); }\n");
+    }
+    s.push_str("}\n");
+    if exceptions {
+        s.push_str("inline void gc_reset_exceptions(thread GcState& gc) { if(gc.states[0].exceptions!=nullptr) { thread ExceptionState& ex=*gc.states[0].exceptions; for(uint j=0u;j<ex.count;++j) ex.marks[j]=0u; } }\ninline void gc_mark_exception(thread GcState& gc, ulong reference) { if(gc.states[0].exceptions==nullptr || reference==0ul) return; thread ExceptionState& ex=*gc.states[0].exceptions; if(reference<=ulong(ex.count)&&ex.tags[uint(reference)-1u]!=0u) ex.marks[uint(reference)-1u]|=1u; }\ninline bool gc_scan_exceptions(thread GcState& gc) { if(gc.states[0].exceptions==nullptr) return false; thread ExceptionState& ex=*gc.states[0].exceptions; bool visited=false; for(uint i=0u;i<ex.count;++i) if(ex.marks[i]==1u) { ex.marks[i]=3u; visited=true; switch(ex.tags[i]) {\n");
         let mut seen = HashSet::new();
         for m in modules {
             for (&tag, &ty) in m.tag_bindings.iter().zip(&m.tag_types) {
                 if !seen.insert(tag) {
                     continue;
                 }
-                s.push_str(&format!("case {tag}u: {{\n"));
+                s.push_str(&format!("case {tag}u: "));
                 let mut word = 0;
                 for t in m.types[ty as usize].params() {
-                    if matches!(t,ValType::Ref(r) if is_gc_ref(*r,&parents)||is_external_ref(*r)) {
+                    if let ValType::Ref(r) = t {
                         s.push_str(&format!(
-                            "gc_mark(gc,ex.values[i*EXCEPTION_WORDS+{word}u]);\n"
+                            "gc_mark(gc,{}); ",
+                            root_word(&format!("ex.values[i*EXCEPTION_WORDS+{word}u]"), *r)
                         ));
                     }
                     word += value_words(*t);
                 }
-                s.push_str("break; }\n");
+                s.push_str("break;\n");
             }
         }
-        s.push_str("default: break; } } }\n");
+        s.push_str("default: break; } } return visited; }\ninline void gc_sweep_exceptions(thread GcState& gc) { if(gc.states[0].exceptions==nullptr) return; thread ExceptionState& ex=*gc.states[0].exceptions; for(uint j=0u;j<ex.count;++j) if(ex.marks[j]==0u) { ex.tags[j]=0u; for(uint k=0u;k<EXCEPTION_WORDS;++k) ex.values[j*EXCEPTION_WORDS+k]=0ul; } }\ninline uint exception_alloc(thread GcState& gc, thread uint& trap) { thread ExceptionState& ex=*gc.states[0].exceptions; for(uint attempt=0u;attempt<2u;++attempt) { for(uint j=0u;j<ex.count;++j) if(ex.tags[j]==0u) return j+1u; if(ex.count<EXCEPTION_RECORDS) return ++ex.count; if(attempt==0u) gc_collect(gc); } trap=10u; return 0u; }\n");
+    } else {
+        s.push_str("inline void gc_reset_exceptions(thread GcState&) {}\ninline void gc_mark_exception(thread GcState&,ulong) {}\ninline bool gc_scan_exceptions(thread GcState&) {return false;}\ninline void gc_sweep_exceptions(thread GcState&) {}\n");
     }
-    s.push_str("}\n");
     for (i, t) in types.iter().enumerate() {
         let id = i + 1;
         if t.array {
@@ -537,7 +543,16 @@ pub(super) fn gc_type_source(
             let argty = if width == 2 { "ulong2" } else { "ulong" };
             s.push_str(&format!("inline ulong gc_array_{id}({argty} value, ulong length, thread GcState& gc, thread uint& trap) {{\nif (length > ulong(gc.capacity) / {width}ul) {{ trap=15u; return 0ul; }}\nGcRootFrame roots(gc,1u,trap); if (trap!=0u) return 0ul;\n"));
             if storage_is_ref(&f) {
-                s.push_str("gc.roots[roots.base]=value;\n");
+                s.push_str(&format!(
+                    "gc.roots[roots.base]={};\n",
+                    root_word(
+                        "value",
+                        match f {
+                            StorageType::Val(ValType::Ref(r)) => r,
+                            _ => unreachable!(),
+                        }
+                    )
+                ));
             }
             s.push_str(&format!("ulong r=gc_alloc(gc,{id}u,uint(length),uint(length)*{width}u,trap); if(trap!=0u) return 0ul; device ulong* p=gc_ptr(gc,r,trap); for(uint j=0u;j<uint(length);++j) {{\n"));
             s.push_str(&storage_write("p", &format!("j*{width}u"), &f, "value"));
@@ -561,7 +576,16 @@ pub(super) fn gc_type_source(
             s.push_str(&format!("inline ulong gc_struct_{id}({}thread GcState& gc, thread uint& trap) {{ GcRootFrame roots(gc,{}u,trap); if(trap!=0u) return 0ul;\n",if args.is_empty(){String::new()}else{format!("{}, ",args.join(", "))},t.fields.len().max(1)));
             for (j, f) in t.fields.iter().enumerate() {
                 if storage_is_ref(f) {
-                    s.push_str(&format!("gc.roots[roots.base+{j}u]=v{j};\n"));
+                    s.push_str(&format!(
+                        "gc.roots[roots.base+{j}u]={};\n",
+                        root_word(
+                            &format!("v{j}"),
+                            match f {
+                                StorageType::Val(ValType::Ref(r)) => *r,
+                                _ => unreachable!(),
+                            }
+                        )
+                    ));
                 }
             }
             s.push_str(&format!("ulong r=gc_alloc(gc,{id}u,{}u,{}u,trap); if(trap!=0u) return 0ul; device ulong* p=gc_ptr(gc,r,trap);\n",t.fields.len(),t.words()));
@@ -632,5 +656,24 @@ fn storage_write(ptr: &str, index: &str, ty: &StorageType, value: &str) -> Strin
             format!("{ptr}[{index}]=ulong(uint({value}));\n")
         }
         _ => format!("{ptr}[{index}]={value};\n"),
+    }
+}
+
+/// Root words use a tag only in the collector scratch space. Guest exception
+/// identities remain stable one-based arena slots.
+pub(super) fn root_kind(r: RefType) -> u32 {
+    if is_exception_ref(r) {
+        2
+    } else if is_function_ref(r) {
+        0
+    } else {
+        1
+    }
+}
+pub(super) fn root_word(value: &str, r: RefType) -> String {
+    match root_kind(r) {
+        0 => "0ul".into(),
+        2 => format!("(0x400000000ul | ulong({value}))"),
+        _ => value.into(),
     }
 }

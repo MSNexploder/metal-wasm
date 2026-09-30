@@ -2,7 +2,7 @@ use std::error::Error;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use metal_wasm::{Kernel, Store};
+use metal_wasm::{Kernel, KernelLimits, Store};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -26,6 +26,7 @@ const PERSISTENT_COUNTS: [usize; 4] = [1, 1_000, 4_096, 10_000];
 const PERSISTENT_STEPS: usize = 16;
 const PERSISTENT_INIT_XORS: [u32; 4] = [0xa5a5_a5a5, 0x3c6e_f372, 0xdaa6_6d2b, 0x78de_e6e4];
 const PERSISTENT_WAT: &str = include_str!("workloads/persistent_state.wat");
+const LIFETIME_WAT: &str = include_str!("workloads/lifetime_cycles.wat");
 
 struct SuiteWorkload {
     name: &'static str,
@@ -149,6 +150,7 @@ fn main() -> Result<()> {
         Some("--control") => return compare_compute(true),
         Some("--suite") => return compare_suite(None),
         Some("--persistent") => return compare_persistent(),
+        Some("--lifetime") => return compare_lifetime(),
         Some("--gc") => return compare_suite(Some("gc_graph")),
         Some("--reference-casts") => return compare_suite(Some("reference_casts")),
         Some("--typed-exceptions") => return compare_suite(Some("typed_exceptions")),
@@ -427,6 +429,7 @@ fn compare_suite(filter: Option<&str>) -> Result<()> {
     }
     if filter.is_none() {
         compare_persistent_rows()?;
+        compare_lifetime_rows()?;
     }
     Ok(())
 }
@@ -449,7 +452,8 @@ fn compare_persistent_rows() -> Result<()> {
         let seeds = persistent_seeds(count);
         let inputs = persistent_inputs(&seeds);
         let expected = persistent_expected_digests(&seeds, &inputs);
-        let (metal_total, metal_gpu) = measure_persistent_metal(&wasm, &seeds, &inputs, &expected)?;
+        let (metal_total, metal_gpu) =
+            measure_persistent_metal(&wasm, &seeds, &inputs, &expected, KernelLimits::default())?;
         let wasmtime = measure_persistent_wasmtime(&wasm, &seeds, &inputs, &expected)?;
         let wasmi = measure_persistent_wasmi(&wasm, &seeds, &inputs, &expected)?;
         let native = measure_persistent_native(&seeds, &inputs, &expected)?;
@@ -463,6 +467,107 @@ fn compare_persistent_rows() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn compare_lifetime() -> Result<()> {
+    println!("workload,count,metal_total_us,metal_gpu_us,wasmtime_us,wasmi_us,native_us,samples");
+    compare_lifetime_rows()
+}
+
+fn compare_lifetime_rows() -> Result<()> {
+    let wasm = wat::parse_str(LIFETIME_WAT)?;
+    for count in PERSISTENT_COUNTS {
+        eprintln!(
+            "measuring lifetime_cycles at {count} lanes (16 calls per lane, 64 cycles per call)..."
+        );
+        let seeds = persistent_seeds(count);
+        let inputs = persistent_inputs(&seeds);
+        let expected = lifetime_expected_digests(&seeds, &inputs);
+        let wasmtime = measure_persistent_wasmtime(&wasm, &seeds, &inputs, &expected)?;
+        let native = measure_lifetime_native(&seeds, &inputs, &expected)?;
+        for (name, fuel) in [
+            ("lifetime_cycles", Some(1_000_000)),
+            ("lifetime_cycles_unmetered", None),
+        ] {
+            let limits = KernelLimits {
+                fuel,
+                exception_records: 8,
+                gc_heap_words: 64,
+                ..KernelLimits::default()
+            };
+            let (total, gpu) = measure_persistent_metal(&wasm, &seeds, &inputs, &expected, limits)?;
+            println!(
+                "{name},{count},{:.2},{:.2},{:.2},,{:.2},3",
+                micros(total),
+                micros(gpu),
+                micros(wasmtime),
+                micros(native)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn lifetime_step(state: &mut u32, input: u32) -> u32 {
+    let mut value = *state ^ input;
+    for round in 0..64u32 {
+        value = value
+            .rotate_left(5)
+            .wrapping_mul(MIX_MULTIPLIER)
+            .wrapping_add(round);
+        *state ^= value;
+    }
+    *state
+}
+
+fn lifetime_expected_digests(seeds: &[u32], inputs: &[Vec<u32>]) -> Vec<u32> {
+    let mut states = seeds.to_vec();
+    for round in inputs {
+        for (state, &input) in states.iter_mut().zip(round) {
+            lifetime_step(state, input);
+        }
+    }
+    states
+        .iter()
+        .zip(seeds)
+        .map(|(&state, &seed)| state ^ seed)
+        .collect()
+}
+
+fn measure_lifetime_native(
+    seeds: &[u32],
+    inputs: &[Vec<u32>],
+    expected: &[u32],
+) -> Result<Duration> {
+    let mut times = Vec::with_capacity(3);
+    let mut warmup = seeds.to_vec();
+    for (state, &input) in warmup
+        .iter_mut()
+        .zip(inputs.first().ok_or("lifetime workload has no steps")?)
+    {
+        black_box(lifetime_step(state, input));
+    }
+    for _ in 0..3 {
+        let mut states = seeds.to_vec();
+        let start = Instant::now();
+        for round in inputs {
+            let output: Vec<_> = states
+                .iter_mut()
+                .zip(black_box(round))
+                .map(|(state, &input)| lifetime_step(state, input))
+                .collect();
+            black_box(output);
+        }
+        times.push(start.elapsed());
+        let digest: Vec<_> = states
+            .iter()
+            .zip(seeds)
+            .map(|(&state, &seed)| state ^ seed)
+            .collect();
+        verify_persistent_values(&digest, expected, "native lifetime digest")?;
+    }
+    times.sort_unstable();
+    Ok(times[1])
 }
 
 fn persistent_seeds(count: usize) -> Vec<u32> {
@@ -580,8 +685,9 @@ fn measure_persistent_metal(
     seeds: &[u32],
     inputs: &[Vec<u32>],
     expected: &[u32],
+    limits: KernelLimits,
 ) -> Result<(Duration, Duration)> {
-    let mut store = Store::new(seeds.len())?;
+    let mut store = Store::new_with_limits(seeds.len(), limits)?;
     let instance = store.instantiate(wasm, &[])?;
     let mut total_times = Vec::with_capacity(3);
     let mut gpu_times = Vec::with_capacity(3);
@@ -1268,8 +1374,8 @@ fn micros(duration: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        PERSISTENT_WAT, SUITE_WORKLOADS, WasmiPersistent, WasmtimePersistent,
-        call_wasmi_persistent, call_wasmtime_persistent, control_inputs,
+        LIFETIME_WAT, PERSISTENT_WAT, SUITE_WORKLOADS, WasmiPersistent, WasmtimePersistent,
+        call_wasmi_persistent, call_wasmtime_persistent, control_inputs, lifetime_expected_digests,
         persistent_expected_digests, persistent_inputs, persistent_seeds,
     };
 
@@ -1399,5 +1505,27 @@ mod tests {
         }
         let digest = call_wasmi_persistent(&mut wasmi.store, &wasmi.digest, &seeds).unwrap();
         assert_eq!(digest, expected, "Wasmi digest");
+    }
+
+    #[test]
+    fn lifetime_workload_matches_native_after_repeated_calls_and_reset() {
+        let wasm = wat::parse_str(LIFETIME_WAT).unwrap();
+        let seeds = persistent_seeds(3);
+        let inputs = persistent_inputs(&seeds);
+        let expected = lifetime_expected_digests(&seeds, &inputs);
+        let mut runner = WasmtimePersistent::new(&wasm, seeds.len()).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                call_wasmtime_persistent(&mut runner.store, &runner.init, &seeds).unwrap(),
+                seeds
+            );
+            for round in &inputs {
+                call_wasmtime_persistent(&mut runner.store, &runner.step, round).unwrap();
+            }
+            assert_eq!(
+                call_wasmtime_persistent(&mut runner.store, &runner.digest, &seeds).unwrap(),
+                expected
+            );
+        }
     }
 }

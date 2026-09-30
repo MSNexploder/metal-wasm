@@ -11,6 +11,7 @@ const ALLOCATED: u64 = 1 << 63;
 /// Store references retain the live object and belong to the originating lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GcRef {
+    pub(super) generation: u64,
     pub(super) kernel: u64,
     pub(super) index: u64,
     pub(super) ty: RefType,
@@ -131,6 +132,7 @@ impl Kernel {
         }
         Ok(match reference.index >> 32 {
             0 => Value::GcRef(Some(GcRef {
+                generation: 0,
                 kernel: self.id,
                 index: FOREIGN_TAG | reference.index,
                 ty: nonnull(AbstractHeapType::Any),
@@ -140,6 +142,7 @@ impl Kernel {
                 let records = self.gc_values.lock().unwrap_or_else(|e| e.into_inner());
                 let record = &records[reference.index as u32 as usize - 1];
                 Value::GcRef(Some(GcRef {
+                    generation: 0,
                     kernel: self.id,
                     index: reference.index,
                     ty: self.gc_types[record.type_index].reference,
@@ -169,6 +172,7 @@ impl Kernel {
             }
         };
         Ok(Some(ExternalRef {
+            generation: 0,
             kernel: self.id,
             index,
         }))
@@ -295,6 +299,7 @@ impl Kernel {
             existing_exceptions: exception_ids
                 .into_iter()
                 .map(|index| ExceptionRef {
+                    generation: 0,
                     kernel: self.id,
                     index,
                 })
@@ -477,6 +482,7 @@ impl Kernel {
                 (
                     id,
                     GcRef {
+                        generation: 0,
                         kernel: self.id,
                         index: OBJECT_TAG | (retained_objects.len() + slot + 1) as u64,
                         ty: self.gc_types[objects[&id].0].reference,
@@ -491,6 +497,7 @@ impl Kernel {
                 let reference = if copy_exceptions.contains(&id) {
                     next_exception += 1;
                     ExceptionRef {
+                        generation: 0,
                         kernel: self.id,
                         index: next_exception as u32,
                     }
@@ -507,6 +514,7 @@ impl Kernel {
                     _ if word == 0 => Value::GcRef(None),
                     1 => Value::I31(word as u32 & 0x7fffffff),
                     2 if word as u32 != 0 => Value::GcRef(Some(GcRef {
+                        generation: 0,
                         kernel: self.id,
                         index: word,
                         ty: nonnull(AbstractHeapType::Any),
@@ -522,6 +530,7 @@ impl Kernel {
                     None
                 } else {
                     Some(ExternalRef {
+                        generation: 0,
                         kernel: self.id,
                         index: if word >> 32 == 3 {
                             object_map

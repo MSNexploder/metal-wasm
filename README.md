@@ -22,10 +22,10 @@ Metal has no native `f64`, and this Mac flushes native `f32` subnormals. Both ty
 
 `Kernel::exception_reference(tag_export, payload)` creates an immutable exception for an exported tag. Pass it as `Value::ExnRef(Some(handle))`, or use `Value::ExnRef(None)` for null. `run_values` returns captured exception handles with their original tag and payload. `Kernel::exception_payload(handle)` reads raw payload values, including vectors and nested references. Returned handles can be passed to later invocations of the same kernel. Input serialization maps the reachable exception records into each lane and preserves shared child identities. Imported records count toward the lane's exception limit. Signatures with exception references also transfer an exception arena; numeric signatures retain their existing transfer format.
 
-External values, host GC snapshots, and host exception records remain retained until their kernel is dropped. Dropping a copied handle does not release its record. All reference handles belong to one compiled kernel; input and payload checks reject handles from other kernels. The API has no host record reclamation, so long-running applications that return many new objects or exceptions must bound kernel lifetime.
+External values, host GC snapshots, and host exception records remain retained until their kernel is dropped. Dropping a copied handle does not release its record. All reference handles belong to one compiled kernel; input and payload checks reject handles from other kernels. The `Kernel` API has no host record reclamation, so long-running applications that return many new objects or exceptions must bound kernel lifetime. `Store` supports explicit release, as described below.
 
 
-Exception handling supports tags, `try_table`, `throw`, `throw_ref`, `catch`, `catch_ref`, `catch_all`, and `catch_all_ref`. Calls propagate exceptions to the nearest matching handler. Tail calls remove the caller’s handlers. Traps cannot be caught. Exception references can be kept in locals, globals, or tables and rethrown. Each lane retains at most 64 immutable exception records per invocation by default; `KernelLimits::exception_records` changes this limit. Handled records remain allocated so retained references stay valid. Exhaustion traps with `exception record limit exceeded`. An escaping exception returns `Error::UncaughtException` with the original input index. Provider start exceptions stop initialization.
+Exception handling supports tags, `try_table`, `throw`, `throw_ref`, `catch`, `catch_ref`, `catch_all`, and `catch_all_ref`. Calls propagate exceptions to the nearest matching handler. Tail calls remove the caller’s handlers. Traps cannot be caught. Exception references can be kept in locals, globals, or tables and rethrown. Each lane has capacity for 64 live immutable exception records by default; `KernelLimits::exception_records` changes this limit. Allocation reclaims unreachable records and mixed GC/exception cycles before reporting `exception record limit exceeded`. Live records retain their slot and payload. An escaping exception returns `Error::UncaughtException` with the original input index. Provider start exceptions stop initialization.
 
 GC supports `anyref`, `eqref`, `i31ref`, structs, arrays, `ref.eq`, packed fields, all core struct and array instructions, and both external/any conversions. Arrays can initialize from passive data and element segments. GC constructors also work in constant expressions. Each lane has a nonmoving heap shared by its linked modules. Its default capacity is 1,024 64-bit words (8 KiB), including object headers. `KernelLimits::gc_heap_words` changes this bound. Allocation performs mark-sweep collection before reporting `GC resource limit exceeded`. Roots include live caller values, globals, tables, passive elements, and exception payloads. The collector handles cycles and coalesces adjacent free blocks. It does not compact live objects, so fragmentation can exhaust the heap. Larger heaps and caller root reserves reduce batch size.
 
@@ -75,7 +75,8 @@ against the provider's current memory and table sizes in every lane. Instance
 and reference handles belong to one store. `function_reference(instance, export)`
 and opaque external host values can be used in any lane of that store. Returned
 GC and exception handles retain their live identity and can only be passed back
-to their original lane. GC handles root their objects until the store is dropped.
+to their original lane. Public handles root their objects until explicitly released
+or the store is dropped.
 The matching reference conversion, kind, and exception payload methods are also
 available on `Store`.
 
@@ -90,19 +91,57 @@ Other submitted lanes may also have completed. A failed start does not return an
 instance handle; its resources remain internally retained because references
 can have escaped into a provider. A failed Metal command makes the store unusable.
 
-Persistent resources must fit the device's Metal buffer limit. Exception capacity
-is a bound over each persistent lane's lifetime; handled records are retained.
-Host reference records also remain retained until store drop. There is no execution
-timeout. `Kernel` continues to provide fresh independent instances and GC snapshots
-for each invocation.
+`Store::release_reference(value)` ends the active host lease for an external,
+GC, or exception reference. All copied handles and external/any conversion aliases
+of that lease become invalid. Wasm globals, tables, live element segments, GC
+fields, and retained exception payloads keep reachable objects alive. Reading a
+still-live object later returns a new valid handle; stale handles never become
+valid again. Null references and `i31` values need no storage and release is a
+no-op. Scalars and non-null function references cannot be released. Function identities
+remain valid for the store's lifetime.
+
+`Store::collect_garbage()` reclaims unreachable GC objects and exception records
+and releases unreachable Rust host values. Collection also runs at dispatch
+boundaries and after host reference release. It does not run start functions.
+Dropping a copied handle alone does not release its lease. An `Arc<T>` obtained
+through `external_reference_value` remains valid under normal Rust ownership.
+Persistent resources must fit the device's Metal buffer limit. `Kernel` continues
+to provide fresh independent instances and GC snapshots for each invocation;
+its host records remain retained until kernel drop.
+
+## Execution budgets
+
+`KernelLimits::fuel` defaults to `Some(1_000_000)` per lane and dispatch. A function
+entry and an executed loop iteration each consume one unit. Direct, indirect,
+reference, and tail calls share the lane's budget across linked modules. In a
+fresh `Kernel` invocation, starts and the exported call share the budget. In a
+`Store`, instantiation and each call get a fresh budget. Exhaustion returns
+`Error::Trap { input_index, reason: "fuel exhausted" }`; Wasm exception handlers
+cannot catch it. Persistent writes before the trap survive.
+
+Set `fuel: None` for trusted workloads that need no metering. Fuel bounds Wasm
+control flow. It is not a wall-clock timeout or a count of Wasm instructions:
+bulk operations and collection still depend on the configured resource reserves.
 
 ## Compatibility checks
 
-Run `cargo run --example compat -- MODULE.wasm EXPORT I32_INPUT ...` with chosen inputs to check an exported `(i32) -> i32` function against fresh Wasmtime instances. It reports an unsupported module or signature with the reason, accepts matching traps and uncaught exceptions, and fails if Metal and Wasmtime disagree. For example, `cargo run --example compat -- tests/corpus/memory.wasm calculate 0 1 42` checks a compiled Rust memory workload. Run only terminating functions; the GPU runner has no execution timeout.
+Run `cargo run --example compat -- MODULE.wasm EXPORT I32_INPUT ...` with chosen inputs to check an exported `(i32) -> i32` function against fresh Wasmtime instances. It reports an unsupported module or signature with the reason, accepts matching traps and uncaught exceptions, and fails if Metal and Wasmtime disagree. For example, `cargo run --example compat -- tests/corpus/memory.wasm calculate 0 1 42` checks a compiled Rust memory workload. Use terminating functions: the GPU has a fuel budget, while this CPU comparison does not.
 
 `cargo test --test compiled_corpus` checks two supported compiled Rust modules against Wasmtime and checks that a third compiled module reports its unsupported host import. `cargo test --test persistent_runtime` also compares a compiled Rust static with persistent Wasmtime instances and checks lane state, linking, traps, live references, and collection. Sources, binaries, and build commands are in `tests/corpus/`. `cargo test --test spec_runtime` checks pinned official scalar, SIMD, typed function reference, exception, tail-call, extended-constant, multiple-memory, memory64, and complete GC scripts. It uses actual persistent instances for all scripts, including actions after traps, named invocations, registrations, global reads, and module definitions. Whole initialization, linking, growth, and bulk-operation scripts extend coverage; see `tests/spec/README.md`. These checks do not establish full Wasm conformance.
 
 ## Performance comparison
+
+Run `cargo run --release --example compare -- --lifetime` for repeated exception
+and GC reclamation. Each lane makes 16 calls; each call creates, catches, and
+discards 64 node/exception cycles. Metal uses an eight-record exception arena and
+a 64-word heap, so it must reclaim within a call. Paired rows run the same code
+with default fuel and with `fuel: None`. The benchmark checks every final digest
+against Wasmtime and optimized native Rust. Wasmi lacks these features and is
+omitted. Native Rust computes the same state updates with local values; it does
+not allocate Wasm objects or run a collector. `count` means lanes. Compilation,
+instantiation, reset, warmup, and verification are outside timing. Metal total
+includes dispatch handling and collection between calls; GPU time includes
+shader collection. The workload also runs in `--suite`.
 
 Run `cargo run --release --example compare -- --persistent` to compare Metal,
 Wasmtime, Wasmi, and native Rust with persistent state. At 1, 1,000, 4,096, and
@@ -122,11 +161,14 @@ Run `cargo run --release --example compare -- --mix` for a compute-heavy compari
 
 Run `cargo run --release --example compare -- --control` for the same counts with a 32-iteration Wasm loop and an `if`/`else` in every iteration. The `grouped` pattern places even inputs before odd inputs in groups of 32, so neighboring lanes usually take the same branch. The `mixed` pattern interleaves those same even and odd values, so neighboring lanes disagree. Both patterns execute the same arithmetic and number of iterations overall; only input order changes. Each path runs on Metal, Wasmtime, Wasmi, and native Rust, with the CPU Wasm engines omitted at 100,000,000 inputs. This mode uses three samples and checks every result. The `pattern` column identifies the input pattern; `metal_gpu_us` includes GPU buffer access and kernel execution.
 
-Run `cargo run --release --example compare -- --suite` for fourteen workloads. `persistent_state` uses repeated calls against live per-lane state, as described above. `gc_graph` runs 64 rounds of struct and array allocation, mutation, and reclamation in each lane; run `cargo run --release --example compare -- --gc` to measure it alone. Its 2,560 allocated words per invocation exceed the default 1,024-word heap, so it exercises collection. It uses counts 1, 1,000, 10,000, and 100,000. The original `dispatch_i64`, `float_f64`, and `stateful_memory` cases remain. `bulk_start` uses a start function and bulk memory operations; `recursive_calls` uses variable-depth recursion; `mutable_table` uses passive elements, table updates, and indirect calls; `imported_calls` links a separate Wasm provider module; `linked_resources` imports and mutates provider memory, a global, and a table. `simd_i32x4` runs 32 rounds of four-lane integer arithmetic and a lane reduction. `reference_casts` runs 32 rounds of cast branches, typed dispatch, exception table capture and rethrow, and external-null tests. It measures GPU reference operations; public exception serialization and non-null external host values are covered by integration tests. `typed_exceptions` runs 32 rounds of typed function dispatch, divergent branches, and payload throws and catches. `tail_multi_resource` combines tail calls, extended constants, two memories, a 64-bit memory, and a 64-bit table. Run `cargo run --release --example compare -- --simd`, `--tail-multi-resource`, `--typed-exceptions`, or `--reference-casts` to measure one workload. Their definitions are in `examples/workloads/`. Each workload is checked against optimized native Rust and Wasmtime; Wasmi is omitted for the SIMD and new feature workloads because this version does not support their Wasm features. This mode reports the median of three single-run samples at 1, 1,000, 100,000, and 1,000,000 invocations, except the four memory workloads, which use 1, 1,000, 4,096, and 10,000 to exercise bounded dispatches.
+Run `cargo run --release --example compare -- --suite` for fifteen workloads. `persistent_state` uses repeated calls against live per-lane state, as described above. `gc_graph` runs 64 rounds of struct and array allocation, mutation, and reclamation in each lane; run `cargo run --release --example compare -- --gc` to measure it alone. Its 2,560 allocated words per invocation exceed the default 1,024-word heap, so it exercises collection. It uses counts 1, 1,000, 10,000, and 100,000. The original `dispatch_i64`, `float_f64`, and `stateful_memory` cases remain. `bulk_start` uses a start function and bulk memory operations; `recursive_calls` uses variable-depth recursion; `mutable_table` uses passive elements, table updates, and indirect calls; `imported_calls` links a separate Wasm provider module; `linked_resources` imports and mutates provider memory, a global, and a table. `simd_i32x4` runs 32 rounds of four-lane integer arithmetic and a lane reduction. `reference_casts` runs 32 rounds of cast branches, typed dispatch, exception table capture and rethrow, and external-null tests. It measures GPU reference operations; public exception serialization and non-null external host values are covered by integration tests. `typed_exceptions` runs 32 rounds of typed function dispatch, divergent branches, and payload throws and catches. `tail_multi_resource` combines tail calls, extended constants, two memories, a 64-bit memory, and a 64-bit table. Run `cargo run --release --example compare -- --simd`, `--tail-multi-resource`, `--typed-exceptions`, or `--reference-casts` to measure one workload. Their definitions are in `examples/workloads/`. Each workload is checked against optimized native Rust and Wasmtime; Wasmi is omitted for the SIMD and new feature workloads because this version does not support their Wasm features. This mode reports the median of three single-run samples at 1, 1,000, 100,000, and 1,000,000 invocations, except the four memory workloads, which use 1, 1,000, 4,096, and 10,000 to exercise bounded dispatches.
 
 The timed region includes result allocation and execution. Metal also includes per-lane state initialization, input transfer, command submission, and result transfer. Module compilation, CPU engine instantiation, warmup, input generation, and result verification are outside the timed region. Wasmtime and Wasmi reuse one instance per module and make one typed host call per input; the stateful and linked-resource workloads reset their touched state for each call. Metal batches one or more dispatches and runs each start function per lane. Thus `bulk_start` includes per-lane start work on Metal, while CPU start work occurs outside the timed region. These figures compare these APIs for these workloads, not peak engine or GPU throughput.
 
 ## Recorded benchmark results
+
+The earlier persistent and full-suite measurements below predate default fuel
+and explicit reference release.
 
 The [persistent results](examples/persistent-benchmark-results.csv) were measured
 on 2026-09-30 with an Apple M1 Max, 64 GB RAM, macOS 27.0, and a release build.

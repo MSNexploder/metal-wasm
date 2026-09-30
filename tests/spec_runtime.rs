@@ -255,6 +255,8 @@ fn check_script(source: &str, minimum_assertions: usize) {
         source,
         minimum_assertions,
         KernelLimits {
+            // Official tail-call scripts include one million calls plus entry/exit.
+            fuel: Some(2_000_000),
             memory_growth_pages: 8,
             call_depth: 32,
             table_growth_elements: 65_536,
@@ -946,6 +948,7 @@ fn spec_persistent_memory_grow() {
             memory_growth_pages: 1024,
             table_growth_elements: 65_536,
             call_depth: 256,
+            fuel: Some(1_000_000),
             exception_records: 512,
             gc_heap_words: 4096,
         },

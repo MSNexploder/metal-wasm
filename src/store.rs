@@ -100,13 +100,29 @@ pub(super) struct MetadataLayout {
     fields: Vec<(String, u64)>,
     module_ranges: Vec<Range<usize>>,
     exceptions: Option<(usize, usize)>,
+    global_roots: Vec<(usize, usize, RefType)>,
+    table_roots: Vec<(usize, usize, RefType)>,
+    element_roots: Vec<(usize, usize, usize, RefType)>,
 }
 impl MetadataLayout {
     pub(super) fn new(modules: &[ParsedModule<'_>], exceptions: Option<(usize, usize)>) -> Self {
         let mut fields = Vec::new();
+        let mut global_roots = Vec::new();
+        let mut table_roots = Vec::new();
+        let mut element_roots = Vec::new();
         let mut module_ranges = Vec::new();
         for (m, module) in modules.iter().enumerate() {
             let start = fields.len();
+            let imported = module.global_types.len() - module.local_global_slots.len();
+            for (i, &slot) in module.local_global_slots.iter().enumerate() {
+                if let ValType::Ref(r) = module.global_types[imported + i].content_type {
+                    global_roots.push((m, slot, r));
+                }
+            }
+            let imported = module.table_types.len() - module.instance.tables.len();
+            for i in 0..module.instance.tables.len() {
+                table_roots.push((m, i, module.table_types[imported + i].element_type));
+            }
             for (t, table) in module.instance.tables.iter().enumerate() {
                 fields.push((
                     format!("states[{m}].table_size[{t}]"),
@@ -123,6 +139,12 @@ impl MetadataLayout {
             }
             for (i, values) in module.instance.element_info.elements.iter().enumerate() {
                 if module.dynamic_elements.iter().any(|(s, _, _)| *s == i) {
+                    element_roots.push((
+                        fields.len(),
+                        start + module.instance.tables.len() + i,
+                        values.len(),
+                        module.instance.element_info.element_types[i],
+                    ));
                     for (j, &value) in values.iter().enumerate() {
                         fields.push((format!("states[{m}].element_values[{i}][{j}]"), value));
                     }
@@ -134,6 +156,9 @@ impl MetadataLayout {
             fields,
             module_ranges,
             exceptions,
+            global_roots,
+            table_roots,
+            element_roots,
         }
     }
     fn stride(&self) -> usize {
@@ -185,12 +210,66 @@ enum LiveException {
     Host(ExceptionRecord),
 }
 
+// The lease generation belongs to the public handle. The stored identity stays
+// available to Wasm and other retained graphs after that public lease is released.
+#[derive(Clone)]
+struct Lease<T> {
+    generation: u64,
+    retained: bool,
+    value: Option<T>,
+}
+impl<T> Lease<T> {
+    fn valid(&self, generation: u64) -> bool {
+        self.retained && self.generation == generation && self.value.is_some()
+    }
+    fn release(&mut self, generation: u64) -> Result<(), Error> {
+        if !self.valid(generation) {
+            return Err(Error::Unsupported(
+                "invalid or released reference for this store".into(),
+            ));
+        }
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Unsupported("reference generation exhausted".into()))?;
+        self.retained = false;
+        Ok(())
+    }
+}
+fn lease_insert<T>(values: &mut Vec<Lease<T>>, value: T) -> Result<usize, Error> {
+    if let Some(index) = values.iter().position(|v| v.value.is_none()) {
+        values[index].value = Some(value);
+        values[index].retained = true;
+        return Ok(index);
+    }
+    if values.len() >= u32::MAX as usize {
+        return Err(Error::Unsupported("too many retained references".into()));
+    }
+    values.push(Lease {
+        generation: 1,
+        retained: true,
+        value: Some(value),
+    });
+    Ok(values.len() - 1)
+}
+#[derive(Default)]
+struct Reachable {
+    gc: HashSet<(usize, u64)>,
+    exceptions: HashSet<(usize, usize)>,
+    host_exceptions: HashSet<usize>,
+    externals: HashSet<usize>,
+}
+enum TraceReference {
+    Host(Value),
+    Guest(usize, RefType, u64),
+}
+
 /// A fixed collection of lanes with persistent WebAssembly state.
 /// Calls, initialization, and traps retain memory, table, global, and heap writes.
 /// GC and exception handles obtained from a lane can only be passed to that lane.
 /// Host values and function handles are shared by all lanes in the same store.
-/// Host handles retain their objects until the store is dropped. Exception records
-/// consume the configured per-lane capacity across the lifetime of the store.
+/// Host handles retain their graphs until explicitly released. Copied handles and
+/// conversion aliases share one lease. Collection preserves all reachable Wasm state.
 /// A failed Metal command makes the store unusable.
 pub struct Store {
     id: u64,
@@ -204,10 +283,10 @@ pub struct Store {
     metadata: MetadataLayout,
     metadata_buffer: Option<metal::Buffer>,
     heap: Option<(metal::Buffer, usize)>,
-    gc_values: Mutex<Vec<LiveGc>>,
-    exceptions: Mutex<Vec<LiveException>>,
+    gc_values: Mutex<Vec<Lease<LiveGc>>>,
+    exceptions: Mutex<Vec<Lease<LiveException>>>,
     host_exception_slots: HashMap<(usize, u32), usize>,
-    externals: Mutex<Vec<Arc<dyn Any + Send + Sync>>>,
+    externals: Mutex<Vec<Lease<Arc<dyn Any + Send + Sync>>>>,
     function_types: Vec<RefType>,
     reference_types: ReferenceTypes,
     gc_types: Vec<GcType>,
@@ -250,6 +329,9 @@ impl Store {
                 fields: Vec::new(),
                 module_ranges: Vec::new(),
                 exceptions: None,
+                global_roots: Vec::new(),
+                table_roots: Vec::new(),
+                element_roots: Vec::new(),
             },
             metadata_buffer: None,
             heap: None,
@@ -671,7 +753,9 @@ impl Store {
         let fast = kernel.params == [ValType::I32] && kernel.results == [ValType::I32];
         let mut input = Vec::new();
         let mut metadata = self.metadata_words().to_vec();
+        let retained = self.trace_references(false, &metadata, &self.host_exception_slots)?;
         let mut host_slots = self.host_exception_slots.clone();
+        host_slots.retain(|&(_, id), _| retained.host_exceptions.contains(&(id as usize - 1)));
         for (lane, row) in inputs.iter().enumerate() {
             for &value in row {
                 let words = self.encode(value, lane, &mut metadata, &mut host_slots)?;
@@ -689,7 +773,8 @@ impl Store {
             (6, self.metadata_buffer.as_ref().unwrap().clone()),
         ]];
         if let Some(gc) = kernel.gc {
-            let stride = gc.heap_words + gc.root_words + gc.heap_words + 1;
+            let host_capacity = gc.heap_words + self.limits.exception_records;
+            let stride = gc.heap_words + gc.root_words + host_capacity + 1;
             let needs_allocation = self
                 .heap
                 .as_ref()
@@ -715,15 +800,21 @@ impl Store {
                 self.heap = Some((buffer, stride));
             }
             let (heap, _) = self.heap.as_ref().unwrap();
-            let objects = self.gc_values.lock().unwrap();
+            let retained = self.trace_references(false, &metadata, &host_slots)?;
             for lane in 0..self.lanes {
-                let roots: Vec<_> = objects
-                    .iter()
-                    .filter(|r| r.lane == lane)
-                    .map(|r| r.word)
-                    .collect();
-                if roots.len() > gc.heap_words {
-                    return Err(Error::Unsupported("too many retained GC roots".into()));
+                let roots =
+                    retained
+                        .gc
+                        .iter()
+                        .filter_map(|&(l, word)| (l == lane).then_some(word))
+                        .chain(retained.exceptions.iter().filter_map(|&(l, slot)| {
+                            (l == lane).then_some(0x400000000 | slot as u64)
+                        }))
+                        .collect::<Vec<_>>();
+                if roots.len() > host_capacity {
+                    return Err(Error::Unsupported(
+                        "too many retained reference roots".into(),
+                    ));
                 }
                 unsafe {
                     let ptr = heap
@@ -731,7 +822,7 @@ impl Store {
                         .cast::<u64>()
                         .add(lane * stride + gc.heap_words + gc.root_words);
                     std::ptr::copy_nonoverlapping(roots.as_ptr(), ptr, roots.len());
-                    *ptr.add(gc.heap_words) = roots.len() as u64;
+                    *ptr.add(host_capacity) = roots.len() as u64;
                 }
             }
             buffers.push(vec![(5, heap.clone())]);
@@ -762,6 +853,8 @@ impl Store {
             Err(e) => {
                 if matches!(&e, Error::Metal(_)) {
                     self.poisoned = true;
+                } else {
+                    self.collect_garbage()?;
                 }
                 return Err(e);
             }
@@ -790,6 +883,7 @@ impl Store {
             }
             rows.push(row);
         }
+        self.collect_garbage()?;
         Ok((rows, time))
     }
     pub fn get_global(&self, instance: Instance, export: &str) -> Result<Vec<Value>, Error> {
@@ -909,15 +1003,11 @@ impl Store {
     pub fn external_reference<T: Any + Send + Sync>(&self, value: T) -> Result<ExternalRef, Error> {
         self.check()?;
         let mut values = self.externals.lock().unwrap();
-        let index = values
-            .len()
-            .checked_add(1)
-            .filter(|&n| n <= u32::MAX as usize)
-            .ok_or_else(|| Error::Unsupported("too many external references".into()))?;
-        values.push(Arc::new(value));
+        let index = lease_insert(&mut values, Arc::new(value) as Arc<dyn Any + Send + Sync>)?;
         Ok(ExternalRef {
             kernel: self.id,
-            index: index as u64,
+            index: index as u64 + 1,
+            generation: values[index].generation,
         })
     }
     pub fn external_reference_value<T: Any + Send + Sync>(
@@ -925,18 +1015,18 @@ impl Store {
         reference: ExternalRef,
     ) -> Result<Arc<T>, Error> {
         self.check()?;
-        if reference.kernel != self.id || reference.index >> 32 != 0 || reference.index == 0 {
+        if reference.index >> 32 != 0 || !self.valid_external(reference, 0) {
             return Err(Error::Unsupported(
                 "invalid external reference for this store".into(),
             ));
         }
-        self.externals
-            .lock()
+        self.externals.lock().unwrap()[reference.index as usize - 1]
+            .value
+            .as_ref()
             .unwrap()
-            .get(reference.index as usize - 1)
-            .cloned()
-            .and_then(|v| v.downcast::<T>().ok())
-            .ok_or_else(|| Error::Unsupported("external reference has the wrong host type".into()))
+            .clone()
+            .downcast::<T>()
+            .map_err(|_| Error::Unsupported("external reference has the wrong host type".into()))
     }
     fn gc_record(&self, r: GcRef) -> Option<LiveGc> {
         if r.kernel != self.id || r.index >> 32 != 3 || r.index as u32 == 0 {
@@ -946,23 +1036,109 @@ impl Store {
             .lock()
             .unwrap()
             .get(r.index as u32 as usize - 1)
-            .copied()
+            .filter(|v| v.valid(r.generation))
+            .and_then(|v| v.value)
     }
     fn valid_external(&self, r: ExternalRef, lane: usize) -> bool {
         r.kernel == self.id
             && match r.index >> 32 {
-                0 => r.index > 0 && r.index as usize <= self.externals.lock().unwrap().len(),
-                1 => r.index & 0x80000000 == 0,
+                0 => self
+                    .externals
+                    .lock()
+                    .unwrap()
+                    .get((r.index as usize).wrapping_sub(1))
+                    .is_some_and(|v| v.valid(r.generation)),
+                1 => r.generation == 0 && r.index & 0x80000000 == 0,
                 3 => self
                     .gc_values
                     .lock()
                     .unwrap()
                     .get((r.index as u32).wrapping_sub(1) as usize)
-                    .is_some_and(|r| r.lane == lane),
+                    .is_some_and(|v| {
+                        v.valid(r.generation) && v.value.as_ref().is_some_and(|r| r.lane == lane)
+                    }),
                 _ => false,
             }
     }
+    fn exception_record(&self, r: ExceptionRef) -> Option<LiveException> {
+        if r.kernel != self.id || r.index == 0 {
+            return None;
+        }
+        self.exceptions
+            .lock()
+            .unwrap()
+            .get(r.index as usize - 1)
+            .filter(|v| v.valid(r.generation))
+            .and_then(|v| v.value.clone())
+    }
+    // Internal graph edges remain valid after their public lease is released.
+    // Extraction renews the current lease without changing guest identity.
+    fn refresh_value(&self, mut value: Value, retain: bool) -> Result<Value, Error> {
+        let invalid = || Error::Metal("missing retained reference graph node".into());
+        match &mut value {
+            Value::GcRef(Some(r)) if r.index >> 32 == 3 => {
+                let mut values = self.gc_values.lock().unwrap();
+                let v = values
+                    .get_mut((r.index as u32).wrapping_sub(1) as usize)
+                    .filter(|v| v.value.is_some())
+                    .ok_or_else(invalid)?;
+                v.retained |= retain;
+                r.generation = v.generation;
+            }
+            Value::ExternRef(Some(r)) if r.index >> 32 == 3 => {
+                let mut values = self.gc_values.lock().unwrap();
+                let v = values
+                    .get_mut((r.index as u32).wrapping_sub(1) as usize)
+                    .filter(|v| v.value.is_some())
+                    .ok_or_else(invalid)?;
+                v.retained |= retain;
+                r.generation = v.generation;
+            }
+            Value::GcRef(Some(r)) if r.index >> 32 == 2 => {
+                let mut values = self.externals.lock().unwrap();
+                let v = values
+                    .get_mut((r.index as u32).wrapping_sub(1) as usize)
+                    .filter(|v| v.value.is_some())
+                    .ok_or_else(invalid)?;
+                v.retained |= retain;
+                r.generation = v.generation;
+            }
+            Value::ExternRef(Some(r)) if r.index >> 32 == 0 => {
+                let mut values = self.externals.lock().unwrap();
+                let v = values
+                    .get_mut((r.index as usize).wrapping_sub(1))
+                    .filter(|v| v.value.is_some())
+                    .ok_or_else(invalid)?;
+                v.retained |= retain;
+                r.generation = v.generation;
+            }
+            Value::ExnRef(Some(r)) => {
+                let mut values = self.exceptions.lock().unwrap();
+                let v = values
+                    .get_mut((r.index as usize).wrapping_sub(1))
+                    .filter(|v| v.value.is_some())
+                    .ok_or_else(invalid)?;
+                v.retained |= retain;
+                r.generation = v.generation;
+            }
+            _ => {}
+        }
+        Ok(value)
+    }
     fn accepts(&self, value: Value, expected: ValType, lane: usize) -> bool {
+        self.accepts_value(value, expected, lane, false)
+    }
+    fn accepts_value(&self, value: Value, expected: ValType, lane: usize, internal: bool) -> bool {
+        // Public inputs must own an active lease. Parent payloads use their
+        // internal identity, which is checked against the live registry instead.
+        let value = if internal {
+            match self.refresh_value(value, false) {
+                Ok(v) => v,
+                Err(_) => return false,
+            }
+        } else {
+            value
+        };
         match (value, expected) {
             (Value::FuncRef(None), ValType::Ref(t)) => {
                 t.is_nullable() && is_function_ref_in(t, &self.reference_types)
@@ -979,28 +1155,37 @@ impl Store {
                     && ref_subtype(r.ty, t, &self.reference_types)
             }
             (Value::ExternRef(Some(r)), ValType::Ref(t)) => {
-                self.valid_external(r, lane)
+                self.external_exists(r, lane, internal)
                     && ref_subtype(RefType::EXTERNREF.as_non_null(), t, &self.reference_types)
             }
             (Value::GcRef(Some(r)), ValType::Ref(t)) => {
                 r.kernel == self.id
                     && ref_subtype(r.ty, t, &self.reference_types)
                     && if r.index >> 32 == 2 {
-                        self.valid_external(
+                        self.external_exists(
                             ExternalRef {
                                 kernel: r.kernel,
                                 index: r.index as u32 as u64,
+                                generation: r.generation,
                             },
                             lane,
+                            internal,
                         )
                     } else {
-                        self.gc_record(r).is_some_and(|r| r.lane == lane)
+                        self.gc_values
+                            .lock()
+                            .unwrap()
+                            .get((r.index as u32).wrapping_sub(1) as usize)
+                            .is_some_and(|v| {
+                                (internal || v.valid(r.generation))
+                                    && v.value.is_some_and(|r| r.lane == lane)
+                            })
                     }
             }
             (Value::ExnRef(Some(r)), ValType::Ref(t)) => {
                 if r.kernel != self.id
-                    || !ref_subtype(RefType::EXNREF.as_non_null(), t, &self.reference_types)
                     || r.index == 0
+                    || !ref_subtype(RefType::EXNREF.as_non_null(), t, &self.reference_types)
                 {
                     return false;
                 }
@@ -1009,14 +1194,15 @@ impl Store {
                     .lock()
                     .unwrap()
                     .get(r.index as usize - 1)
-                    .cloned();
+                    .filter(|v| internal || v.valid(r.generation))
+                    .and_then(|v| v.value.clone());
                 match record {
                     Some(LiveException::Lane { lane: owner, .. }) => lane == owner,
                     Some(LiveException::Host(record)) => record
                         .payload
                         .iter()
                         .zip(&self.tag_types[record.tag as usize])
-                        .all(|(&v, &t)| self.accepts(v, t, lane)),
+                        .all(|(&v, &t)| self.accepts_value(v, t, lane, true)),
                     None => false,
                 }
             }
@@ -1026,6 +1212,28 @@ impl Store {
             _ => value.ty() == expected,
         }
     }
+    fn external_exists(&self, r: ExternalRef, lane: usize, internal: bool) -> bool {
+        if !internal {
+            return self.valid_external(r, lane);
+        }
+        r.kernel == self.id
+            && match r.index >> 32 {
+                0 => self
+                    .externals
+                    .lock()
+                    .unwrap()
+                    .get((r.index as usize).wrapping_sub(1))
+                    .is_some_and(|v| v.value.is_some()),
+                1 => r.index & 0x80000000 == 0,
+                3 => self
+                    .gc_values
+                    .lock()
+                    .unwrap()
+                    .get((r.index as u32).wrapping_sub(1) as usize)
+                    .is_some_and(|v| v.value.is_some_and(|r| r.lane == lane)),
+                _ => false,
+            }
+    }
     fn encode(
         &self,
         value: Value,
@@ -1034,12 +1242,23 @@ impl Store {
         host_slots: &mut HashMap<(usize, u32), usize>,
     ) -> Result<Vec<u64>, Error> {
         Ok(match value {
-            Value::GcRef(Some(r)) if r.index >> 32 == 3 => vec![self.gc_record(r).unwrap().word],
-            Value::ExternRef(Some(r)) if r.index >> 32 == 3 => {
-                vec![self.gc_values.lock().unwrap()[r.index as u32 as usize - 1].word]
-            }
+            Value::GcRef(Some(r)) if r.index >> 32 == 3 => vec![
+                self.gc_values.lock().unwrap()[r.index as u32 as usize - 1]
+                    .value
+                    .unwrap()
+                    .word,
+            ],
+            Value::ExternRef(Some(r)) if r.index >> 32 == 3 => vec![
+                self.gc_values.lock().unwrap()[r.index as u32 as usize - 1]
+                    .value
+                    .unwrap()
+                    .word,
+            ],
             Value::ExnRef(Some(r)) => {
-                let record = self.exceptions.lock().unwrap()[r.index as usize - 1].clone();
+                let record = self.exceptions.lock().unwrap()[r.index as usize - 1]
+                    .value
+                    .clone()
+                    .unwrap();
                 let slot = match record {
                     LiveException::Lane { slot, .. } => slot,
                     LiveException::Host(record) => {
@@ -1057,19 +1276,23 @@ impl Store {
                                 payload.extend(self.encode(value, lane, metadata, host_slots)?);
                             }
                             let count = metadata[base] as usize;
-                            if count >= capacity {
+                            let index = (0..count)
+                                .find(|&i| metadata[base + 1 + i * (width + 1)] == 0)
+                                .unwrap_or(count);
+                            if index >= capacity {
                                 return Err(Error::Trap {
                                     input_index: lane,
                                     reason: "exception record limit exceeded",
                                 });
                             }
-                            let start = base + 1 + count * (width + 1);
+                            let start = base + 1 + index * (width + 1);
+                            metadata[start..start + width + 1].fill(0);
                             metadata[start] = record.tag as u64;
                             metadata[start + 1..start + 1 + payload.len()]
                                 .copy_from_slice(&payload);
-                            metadata[base] += 1;
-                            host_slots.insert((lane, r.index), count + 1);
-                            count + 1
+                            metadata[base] = count.max(index + 1) as u64;
+                            host_slots.insert((lane, r.index), index + 1);
+                            index + 1
                         }
                     }
                 };
@@ -1098,22 +1321,21 @@ impl Store {
             .ok_or_else(|| Error::Metal("invalid GC object type".into()))?
             .reference;
         let mut objects = self.gc_values.lock().unwrap();
-        let index = if let Some(index) = objects
+        let index = if let Some(i) = objects
             .iter()
-            .position(|r| r.lane == lane && r.word == word)
+            .position(|v| v.value.is_some_and(|r| r.lane == lane && r.word == word))
         {
-            index
+            objects[i].retained = true;
+            objects[i].value = Some(LiveGc { lane, word, ty });
+            i
         } else {
-            objects.push(LiveGc { lane, word, ty });
-            objects.len() - 1
+            lease_insert(&mut objects, LiveGc { lane, word, ty })?
         };
-        if index >= u32::MAX as usize {
-            return Err(Error::Unsupported("too many retained GC objects".into()));
-        }
         Ok(GcRef {
             kernel: self.id,
             index: 0x300000000 | (index as u64 + 1),
             ty,
+            generation: objects[index].generation,
         })
     }
     fn decode(&self, ty: ValType, words: &[u64], lane: usize) -> Result<Value, Error> {
@@ -1143,47 +1365,59 @@ impl Store {
                     })
                 })
             }
-            ValType::Ref(t) if is_external_ref(t) => Value::ExternRef(if word == 0 {
-                None
-            } else {
-                Some(ExternalRef {
-                    kernel: self.id,
-                    index: if word >> 32 == 3 {
-                        self.retain_gc(lane, word)?.index
-                    } else {
-                        word
-                    },
-                })
-            }),
-            ValType::Ref(t) if is_exception_ref(t) => Value::ExnRef(if word == 0 {
-                None
-            } else {
-                if let Some((&(_, index), _)) = self
-                    .host_exception_slots
-                    .iter()
-                    .find(|&(&(l, _), &slot)| l == lane && slot == word as usize)
-                {
-                    Some(ExceptionRef {
+            ValType::Ref(t) if is_external_ref(t) => {
+                if word == 0 {
+                    Value::ExternRef(None)
+                } else if word >> 32 == 3 {
+                    let r = self.retain_gc(lane, word)?;
+                    Value::ExternRef(Some(ExternalRef {
                         kernel: self.id,
-                        index,
-                    })
+                        index: r.index,
+                        generation: r.generation,
+                    }))
                 } else {
+                    self.refresh_value(
+                        Value::ExternRef(Some(ExternalRef {
+                            kernel: self.id,
+                            index: word,
+                            generation: 0,
+                        })),
+                        true,
+                    )?
+                }
+            }
+            ValType::Ref(t) if is_exception_ref(t) => {
+                if word == 0 {
+                    Value::ExnRef(None)
+                } else {
+                    let mapped =
+                        self.host_exception_slots
+                            .iter()
+                            .find_map(|(&(l, index), &slot)| {
+                                (l == lane && slot == word as usize).then_some(index as usize - 1)
+                            });
                     let mut records = self.exceptions.lock().unwrap();
-                    let index=records.iter().position(|r|matches!(r,LiveException::Lane{lane:l,slot} if *l==lane&&*slot==word as usize)).unwrap_or_else(||{records.push(LiveException::Lane{lane,slot:word as usize});records.len()-1});
-                    Some(ExceptionRef {
+                    let index=if let Some(i)=mapped {i} else if let Some(i)=records.iter().position(|v|matches!(v.value,Some(LiveException::Lane{lane:l,slot}) if l==lane&&slot==word as usize)) {i} else {lease_insert(&mut records,LiveException::Lane{lane,slot:word as usize})?};
+                    records[index].retained = true;
+                    Value::ExnRef(Some(ExceptionRef {
                         kernel: self.id,
                         index: index as u32 + 1,
-                    })
+                        generation: records[index].generation,
+                    }))
                 }
-            }),
+            }
             ValType::Ref(_) => match word >> 32 {
                 _ if word == 0 => Value::GcRef(None),
                 1 => Value::I31(word as u32 & 0x7fffffff),
-                2 => Value::GcRef(Some(GcRef {
-                    kernel: self.id,
-                    index: word,
-                    ty: RefType::ANYREF.as_non_null(),
-                })),
+                2 => self.refresh_value(
+                    Value::GcRef(Some(GcRef {
+                        kernel: self.id,
+                        index: word,
+                        ty: RefType::ANYREF.as_non_null(),
+                        generation: 0,
+                    })),
+                    true,
+                )?,
                 3 => Value::GcRef(Some(self.retain_gc(lane, word)?)),
                 _ => return Err(Error::Metal("invalid GC reference tag".into())),
             },
@@ -1191,12 +1425,12 @@ impl Store {
     }
     pub fn gc_reference_kind(&self, reference: GcRef) -> Result<AbstractHeapType, Error> {
         self.check()?;
-        if reference.kernel == self.id
-            && reference.index >> 32 == 2
+        if reference.index >> 32 == 2
             && self.valid_external(
                 ExternalRef {
-                    kernel: self.id,
+                    kernel: reference.kernel,
                     index: reference.index as u32 as u64,
+                    generation: reference.generation,
                 },
                 0,
             )
@@ -1216,32 +1450,36 @@ impl Store {
     }
     pub fn internalize_reference(&self, reference: Option<ExternalRef>) -> Result<Value, Error> {
         self.check()?;
-        let Some(reference) = reference else {
+        let Some(r) = reference else {
             return Ok(Value::GcRef(None));
         };
-        if reference.kernel != self.id {
+        if r.kernel != self.id {
             return Err(Error::Unsupported(
                 "invalid external reference for this store".into(),
             ));
         }
-        Ok(match reference.index >> 32 {
-            0 if self.valid_external(reference, 0) => Value::GcRef(Some(GcRef {
+        Ok(match r.index >> 32 {
+            0 if self.valid_external(r, 0) => Value::GcRef(Some(GcRef {
                 kernel: self.id,
-                index: 0x200000000 | reference.index,
+                index: 0x200000000 | r.index,
                 ty: RefType::ANYREF.as_non_null(),
+                generation: r.generation,
             })),
-            1 if self.valid_external(reference, 0) => Value::I31(reference.index as u32),
+            1 if self.valid_external(r, 0) => Value::I31(r.index as u32),
             3 => {
-                let records = self.gc_values.lock().unwrap();
-                let r = records
-                    .get((reference.index as u32).wrapping_sub(1) as usize)
+                let values = self.gc_values.lock().unwrap();
+                let value = values
+                    .get((r.index as u32).wrapping_sub(1) as usize)
+                    .filter(|v| v.valid(r.generation))
+                    .and_then(|v| v.value)
                     .ok_or_else(|| {
                         Error::Unsupported("invalid external reference for this store".into())
                     })?;
                 Value::GcRef(Some(GcRef {
                     kernel: self.id,
-                    index: reference.index,
-                    ty: r.ty,
+                    index: r.index,
+                    ty: value.ty,
+                    generation: r.generation,
                 }))
             }
             _ => {
@@ -1253,21 +1491,22 @@ impl Store {
     }
     pub fn externalize_reference(&self, value: Value) -> Result<Option<ExternalRef>, Error> {
         self.check()?;
-        let index = match value {
+        let (index, generation) = match value {
             Value::GcRef(None) => return Ok(None),
-            Value::I31(v) => 0x100000000 | u64::from(v & 0x7fffffff),
+            Value::I31(v) => (0x100000000 | u64::from(v & 0x7fffffff), 0),
             Value::GcRef(Some(r)) if r.kernel == self.id => match r.index >> 32 {
                 2 if self.valid_external(
                     ExternalRef {
-                        kernel: self.id,
+                        kernel: r.kernel,
                         index: r.index as u32 as u64,
+                        generation: r.generation,
                     },
                     0,
                 ) =>
                 {
-                    r.index as u32 as u64
+                    (r.index as u32 as u64, r.generation)
                 }
-                3 if self.gc_record(r).is_some() => r.index,
+                3 if self.gc_record(r).is_some() => (r.index, r.generation),
                 _ => {
                     return Err(Error::Unsupported(
                         "invalid GC reference for this store".into(),
@@ -1283,6 +1522,7 @@ impl Store {
         Ok(Some(ExternalRef {
             kernel: self.id,
             index,
+            generation,
         }))
     }
     pub fn exception_reference(
@@ -1305,36 +1545,30 @@ impl Store {
             ));
         }
         let mut records = self.exceptions.lock().unwrap();
-        if records.len() >= u32::MAX as usize {
-            return Err(Error::Unsupported("too many exception references".into()));
-        }
-        records.push(LiveException::Host(ExceptionRecord {
-            tag,
-            payload: payload.to_vec(),
-        }));
+        let index = lease_insert(
+            &mut records,
+            LiveException::Host(ExceptionRecord {
+                tag,
+                payload: payload.to_vec(),
+            }),
+        )?;
         Ok(ExceptionRef {
             kernel: self.id,
-            index: records.len() as u32,
+            index: index as u32 + 1,
+            generation: records[index].generation,
         })
     }
     pub fn exception_payload(&self, reference: ExceptionRef) -> Result<Vec<Value>, Error> {
         self.check()?;
-        if reference.kernel != self.id || reference.index == 0 {
-            return Err(Error::Unsupported(
-                "invalid exception reference for this store".into(),
-            ));
-        }
-        let record = self
-            .exceptions
-            .lock()
-            .unwrap()
-            .get(reference.index as usize - 1)
-            .cloned()
-            .ok_or_else(|| {
-                Error::Unsupported("invalid exception reference for this store".into())
-            })?;
+        let record = self.exception_record(reference).ok_or_else(|| {
+            Error::Unsupported("invalid exception reference for this store".into())
+        })?;
         match record {
-            LiveException::Host(record) => Ok(record.payload),
+            LiveException::Host(record) => record
+                .payload
+                .into_iter()
+                .map(|v| self.refresh_value(v, true))
+                .collect(),
             LiveException::Lane { lane, slot } => {
                 let (_, width) = self.metadata.exceptions.unwrap();
                 let offset = lane * self.metadata.stride()
@@ -1352,6 +1586,389 @@ impl Store {
                 Ok(result)
             }
         }
+    }
+    /// Release the shared lease for a reference and all its copied or converted
+    /// aliases. Wasm state and other retained graphs can still keep it alive.
+    /// Null references and i31 values require no release. Scalars and non-null
+    /// functions are rejected. Releasing a stale handle is an error.
+    pub fn release_reference(&mut self, value: Value) -> Result<(), Error> {
+        self.check()?;
+        let invalid = || Error::Unsupported("invalid or released reference for this store".into());
+        match value {
+            Value::GcRef(None)
+            | Value::ExternRef(None)
+            | Value::ExnRef(None)
+            | Value::FuncRef(None)
+            | Value::I31(_) => return Ok(()),
+            Value::GcRef(Some(r)) if r.kernel == self.id && r.index >> 32 == 3 => self
+                .gc_values
+                .lock()
+                .unwrap()
+                .get_mut((r.index as u32).wrapping_sub(1) as usize)
+                .ok_or_else(invalid)?
+                .release(r.generation)?,
+            Value::GcRef(Some(r)) if r.kernel == self.id && r.index >> 32 == 2 => self
+                .externals
+                .lock()
+                .unwrap()
+                .get_mut((r.index as u32).wrapping_sub(1) as usize)
+                .ok_or_else(invalid)?
+                .release(r.generation)?,
+            Value::ExternRef(Some(r)) if r.kernel == self.id => match r.index >> 32 {
+                0 => self
+                    .externals
+                    .lock()
+                    .unwrap()
+                    .get_mut((r.index as usize).wrapping_sub(1))
+                    .ok_or_else(invalid)?
+                    .release(r.generation)?,
+                1 if self.valid_external(r, 0) => return Ok(()),
+                3 => self
+                    .gc_values
+                    .lock()
+                    .unwrap()
+                    .get_mut((r.index as u32).wrapping_sub(1) as usize)
+                    .ok_or_else(invalid)?
+                    .release(r.generation)?,
+                _ => return Err(invalid()),
+            },
+            Value::ExnRef(Some(r)) if r.kernel == self.id => self
+                .exceptions
+                .lock()
+                .unwrap()
+                .get_mut((r.index as usize).wrapping_sub(1))
+                .ok_or_else(invalid)?
+                .release(r.generation)?,
+            _ => return Err(invalid()),
+        }
+        self.collect_garbage()
+    }
+    fn trace_references(
+        &self,
+        state: bool,
+        metadata: &[u64],
+        host_slots: &HashMap<(usize, u32), usize>,
+    ) -> Result<Reachable, Error> {
+        let mut reached = Reachable::default();
+        let mut pending = Vec::new();
+        for lease in self.gc_values.lock().unwrap().iter().filter(|v| v.retained) {
+            if let Some(r) = lease.value {
+                pending.push(TraceReference::Guest(r.lane, r.ty, r.word));
+            }
+        }
+        for (i, lease) in self
+            .externals
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.retained && v.value.is_some())
+        {
+            let _ = lease;
+            reached.externals.insert(i);
+        }
+        for (i, lease) in self
+            .exceptions
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.retained && v.value.is_some())
+        {
+            pending.push(TraceReference::Host(Value::ExnRef(Some(ExceptionRef {
+                kernel: self.id,
+                index: i as u32 + 1,
+                generation: lease.generation,
+            }))));
+        }
+        if state {
+            for &(m, slot, ty) in &self.metadata.global_roots {
+                let r = self.resource(m, "globals");
+                let bytes = self.bytes(r);
+                for lane in 0..self.lanes {
+                    let offset = lane * r.size + slot * 8;
+                    pending.push(TraceReference::Guest(
+                        lane,
+                        ty,
+                        u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap()),
+                    ));
+                }
+            }
+            for &(m, table, ty) in &self.metadata.table_roots {
+                let r = self.resource(m, &format!("table{table}"));
+                let bytes = self.bytes(r);
+                for lane in 0..self.lanes {
+                    for i in 0..self.table_size(m, table, lane) {
+                        let offset = lane * r.size + i * 8;
+                        pending.push(TraceReference::Guest(
+                            lane,
+                            ty,
+                            u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap()),
+                        ));
+                    }
+                }
+            }
+            for &(start, length, capacity, ty) in &self.metadata.element_roots {
+                for lane in 0..self.lanes {
+                    let base = lane * self.metadata.stride();
+                    for i in 0..(metadata[base + length] as usize).min(capacity) {
+                        pending.push(TraceReference::Guest(lane, ty, metadata[base + start + i]));
+                    }
+                }
+            }
+        }
+        while let Some(reference) = pending.pop() {
+            match reference {
+                TraceReference::Host(value) => match value {
+                    Value::ExnRef(Some(r)) => {
+                        let index = r.index as usize - 1;
+                        if !reached.host_exceptions.insert(index) {
+                            continue;
+                        }
+                        let record = self
+                            .exceptions
+                            .lock()
+                            .unwrap()
+                            .get(index)
+                            .and_then(|v| v.value.clone())
+                            .ok_or_else(|| Error::Metal("missing exception graph node".into()))?;
+                        match record {
+                            LiveException::Lane { lane, slot } => pending
+                                .push(TraceReference::Guest(lane, RefType::EXNREF, slot as u64)),
+                            LiveException::Host(record) => {
+                                pending
+                                    .extend(record.payload.into_iter().map(TraceReference::Host));
+                                for (&(lane, id), &slot) in host_slots {
+                                    if id == r.index {
+                                        pending.push(TraceReference::Guest(
+                                            lane,
+                                            RefType::EXNREF,
+                                            slot as u64,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Value::GcRef(Some(r)) if r.index >> 32 == 3 => {
+                        let object = self
+                            .gc_values
+                            .lock()
+                            .unwrap()
+                            .get(r.index as u32 as usize - 1)
+                            .and_then(|v| v.value)
+                            .ok_or_else(|| Error::Metal("missing GC graph node".into()))?;
+                        pending.push(TraceReference::Guest(object.lane, object.ty, object.word));
+                    }
+                    Value::ExternRef(Some(r)) if r.index >> 32 == 3 => {
+                        let object = self
+                            .gc_values
+                            .lock()
+                            .unwrap()
+                            .get(r.index as u32 as usize - 1)
+                            .and_then(|v| v.value)
+                            .ok_or_else(|| Error::Metal("missing GC graph node".into()))?;
+                        pending.push(TraceReference::Guest(object.lane, object.ty, object.word));
+                    }
+                    Value::GcRef(Some(r)) if r.index >> 32 == 2 => {
+                        reached.externals.insert(r.index as u32 as usize - 1);
+                    }
+                    Value::ExternRef(Some(r)) if r.index >> 32 == 0 => {
+                        reached.externals.insert(r.index as usize - 1);
+                    }
+                    _ => {}
+                },
+                TraceReference::Guest(lane, ty, word) => {
+                    if word == 0 || is_function_ref_in(ty, &self.reference_types) {
+                        continue;
+                    }
+                    if is_exception_ref(ty) {
+                        let slot = word as usize;
+                        if !reached.exceptions.insert((lane, slot)) {
+                            continue;
+                        }
+                        let (capacity, width) = self
+                            .metadata
+                            .exceptions
+                            .ok_or_else(|| Error::Metal("missing exception arena".into()))?;
+                        let base = lane * self.metadata.stride() + self.metadata.fields.len();
+                        if slot == 0 || slot > capacity || slot > metadata[base] as usize {
+                            return Err(Error::Metal("invalid live exception slot".into()));
+                        }
+                        let offset = base + 1 + (slot - 1) * (width + 1);
+                        let tag = metadata[offset] as usize;
+                        let types = self
+                            .tag_types
+                            .get(tag)
+                            .filter(|_| tag != 0)
+                            .ok_or_else(|| Error::Metal("invalid live exception tag".into()))?;
+                        let mut offset = offset + 1;
+                        for &ty in types {
+                            if let ValType::Ref(r) = ty {
+                                pending.push(TraceReference::Guest(lane, r, metadata[offset]));
+                            }
+                            offset += value_words(ty);
+                        }
+                        for (&(l, id), &mapped) in host_slots {
+                            if l == lane && mapped == slot {
+                                pending.push(TraceReference::Host(Value::ExnRef(Some(
+                                    ExceptionRef {
+                                        kernel: self.id,
+                                        index: id,
+                                        generation: 0,
+                                    },
+                                ))));
+                            }
+                        }
+                    } else if word >> 32 == 3 {
+                        if !reached.gc.insert((lane, word)) {
+                            continue;
+                        }
+                        let (heap, stride) = self
+                            .heap
+                            .as_ref()
+                            .ok_or_else(|| Error::Metal("missing GC heap".into()))?;
+                        let offset = (word as u32)
+                            .checked_sub(1)
+                            .ok_or_else(|| Error::Metal("invalid GC graph offset".into()))?
+                            as usize;
+                        if offset + 3 > self.limits.gc_heap_words {
+                            return Err(Error::Metal("invalid GC graph offset".into()));
+                        }
+                        let words = unsafe {
+                            std::slice::from_raw_parts(
+                                heap.contents().cast::<u64>().add(lane * stride),
+                                self.limits.gc_heap_words,
+                            )
+                        };
+                        let size = words[offset] as u32 as usize;
+                        if words[offset] & (1 << 63) == 0 || size < 3 || size > words.len() - offset
+                        {
+                            return Err(Error::Metal("invalid GC graph block".into()));
+                        }
+                        let ty = self
+                            .gc_types
+                            .get((words[offset + 1] as usize).wrapping_sub(1))
+                            .ok_or_else(|| Error::Metal("invalid GC graph type".into()))?;
+                        let length = words[offset + 2] as usize;
+                        let fields = if ty.array { length } else { ty.fields.len() };
+                        let mut at = offset + 3;
+                        for index in 0..fields {
+                            let field = ty.fields[if ty.array { 0 } else { index }];
+                            if at + storage_words(&field) > offset + size {
+                                return Err(Error::Metal("invalid GC graph size".into()));
+                            }
+                            if let StorageType::Val(ValType::Ref(r)) = field {
+                                pending.push(TraceReference::Guest(lane, r, words[at]));
+                            }
+                            at += storage_words(&field);
+                        }
+                    } else if (is_external_ref(ty) && word >> 32 == 0) || word >> 32 == 2 {
+                        reached.externals.insert(word as u32 as usize - 1);
+                    }
+                }
+            }
+        }
+        Ok(reached)
+    }
+    /// Reclaim unreachable lane objects, exception slots, and host values.
+    /// Collection runs between calls, never invokes Wasm, and preserves state.
+    pub fn collect_garbage(&mut self) -> Result<(), Error> {
+        self.check()?;
+        let metadata = if self.metadata_buffer.is_some() {
+            self.metadata_words()
+        } else {
+            &[]
+        };
+        let reached = self.trace_references(true, metadata, &self.host_exception_slots)?;
+        if let Some((heap, stride)) = &self.heap {
+            for lane in 0..self.lanes {
+                let words = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        heap.contents().cast::<u64>().add(lane * stride),
+                        self.limits.gc_heap_words,
+                    )
+                };
+                let mut offset = 0;
+                let mut previous_free = None;
+                while offset < words.len() {
+                    let size = words[offset] as u32 as usize;
+                    if size < 3 || size > words.len() - offset {
+                        self.poisoned = true;
+                        return Err(Error::Metal("invalid persistent GC heap".into()));
+                    }
+                    if reached
+                        .gc
+                        .contains(&(lane, 0x300000000 | (offset as u64 + 1)))
+                    {
+                        words[offset] = size as u64 | (1 << 63);
+                        previous_free = None;
+                    } else {
+                        words[offset] = size as u64;
+                        if let Some(prior) = previous_free {
+                            words[prior] += size as u64;
+                        } else {
+                            previous_free = Some(offset);
+                        }
+                    }
+                    offset += size;
+                }
+            }
+        }
+        if let Some((_, width)) = self.metadata.exceptions {
+            let words = unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.metadata_buffer
+                        .as_ref()
+                        .unwrap()
+                        .contents()
+                        .cast::<u64>(),
+                    self.metadata.stride() * self.lanes,
+                )
+            };
+            for lane in 0..self.lanes {
+                let base = lane * self.metadata.stride() + self.metadata.fields.len();
+                for slot in 1..=words[base] as usize {
+                    if !reached.exceptions.contains(&(lane, slot)) {
+                        let offset = base + 1 + (slot - 1) * (width + 1);
+                        words[offset..offset + width + 1].fill(0);
+                    }
+                }
+            }
+        }
+        for lease in self.gc_values.lock().unwrap().iter_mut() {
+            if lease
+                .value
+                .is_some_and(|r| !reached.gc.contains(&(r.lane, r.word)))
+            {
+                debug_assert!(!lease.retained);
+                lease.value = None;
+            }
+        }
+        for (index, lease) in self.exceptions.lock().unwrap().iter_mut().enumerate() {
+            let live = match &lease.value {
+                Some(LiveException::Lane { lane, slot }) => {
+                    reached.exceptions.contains(&(*lane, *slot))
+                }
+                Some(LiveException::Host(_)) => reached.host_exceptions.contains(&index),
+                None => false,
+            };
+            if !live {
+                debug_assert!(!lease.retained);
+                lease.value = None;
+            }
+        }
+        for (index, lease) in self.externals.lock().unwrap().iter_mut().enumerate() {
+            if !reached.externals.contains(&index) {
+                debug_assert!(!lease.retained);
+                lease.value = None;
+            }
+        }
+        self.host_exception_slots.retain(|&(lane, id), slot| {
+            reached.exceptions.contains(&(lane, *slot))
+                && reached.host_exceptions.contains(&(id as usize - 1))
+        });
+        Ok(())
     }
 }
 

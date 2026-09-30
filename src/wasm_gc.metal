@@ -21,7 +21,11 @@ struct GcState {
 
 // Generated from the module types and instance state, after ModuleState is
 // defined. Field indices count payload words, including both words of v128.
-inline bool gc_ref_word(uint type, uint payload_index);
+inline uint gc_ref_word(uint type, uint payload_index);
+inline void gc_mark_exception(thread GcState&, ulong);
+inline void gc_reset_exceptions(thread GcState&);
+inline bool gc_scan_exceptions(thread GcState&);
+inline void gc_sweep_exceptions(thread GcState&);
 inline void gc_mark_state(thread GcState& gc);
 
 inline uint gc_block_size(ulong header) {
@@ -50,8 +54,8 @@ struct GcRootFrame {
     }
 };
 
-// Operand stack roots can contain scalar words. A matching tag alone must not
-// cause an interior pointer, a free block, or an out-of-range value to be traced.
+// Check block boundaries as well as tags before following a heap reference.
+// A malformed or interior pointer must never become an object header.
 inline uint gc_object_offset(thread GcState& gc, ulong reference) {
     if ((reference >> 32u) != (GC_OBJECT_TAG >> 32u) || uint(reference) == 0u)
         return gc.capacity;
@@ -70,11 +74,13 @@ inline uint gc_object_offset(thread GcState& gc, ulong reference) {
 }
 
 inline void gc_mark(thread GcState& gc, ulong reference) {
+    if ((reference >> 32u) == 4ul) { gc_mark_exception(gc, ulong(uint(reference))); return; }
     uint offset = gc_object_offset(gc, reference);
     if (offset != gc.capacity) gc.heap[offset] |= GC_MARKED;
 }
 
 inline void gc_collect(thread GcState& gc) {
+    gc_reset_exceptions(gc);
     for (uint offset = 0u; offset < gc.capacity;) {
         ulong header = gc.heap[offset];
         gc.heap[offset] = header & ~(GC_MARKED | GC_SCANNED);
@@ -88,7 +94,7 @@ inline void gc_collect(thread GcState& gc) {
     // blocks that will be visited in the next scan.
     bool visited;
     do {
-        visited = false;
+        visited = gc_scan_exceptions(gc);
         for (uint offset = 0u; offset < gc.capacity;) {
             ulong header = gc.heap[offset];
             uint words = gc_block_size(header);
@@ -97,13 +103,18 @@ inline void gc_collect(thread GcState& gc) {
                 gc.heap[offset] = header | GC_SCANNED;
                 uint type = uint(gc.heap[offset + 1u]);
                 for (uint i = 0u; i < words - 3u; ++i) {
-                    if (gc_ref_word(type, i)) gc_mark(gc, gc.heap[offset + 3u + i]);
+                    uint kind = gc_ref_word(type, i);
+                    ulong ref = gc.heap[offset + 3u + i];
+                    if (kind == 2u) gc_mark_exception(gc, ref);
+                    else if (kind == 1u) gc_mark(gc, ref);
                 }
                 visited = true;
             }
             offset += words;
         }
     } while (visited);
+
+    gc_sweep_exceptions(gc);
 
     // Free unreachable blocks and join adjacent free blocks in the same pass.
     uint previous_free = gc.capacity;
