@@ -32,7 +32,15 @@ struct SuiteWorkload {
     wasmi: bool,
 }
 
-const SUITE_WORKLOADS: [SuiteWorkload; 12] = [
+const SUITE_WORKLOADS: [SuiteWorkload; 13] = [
+    SuiteWorkload {
+        name: "gc_graph",
+        wat: include_str!("workloads/gc_graph.wat"),
+        provider: None,
+        native: gc_graph_native,
+        counts: &[1, 1_000, 10_000, 100_000],
+        wasmi: false,
+    },
     SuiteWorkload {
         name: "reference_casts",
         wat: include_str!("workloads/reference_casts.wat"),
@@ -136,6 +144,7 @@ fn main() -> Result<()> {
         Some("--mix") => return compare_compute(false),
         Some("--control") => return compare_compute(true),
         Some("--suite") => return compare_suite(None),
+        Some("--gc") => return compare_suite(Some("gc_graph")),
         Some("--reference-casts") => return compare_suite(Some("reference_casts")),
         Some("--typed-exceptions") => return compare_suite(Some("typed_exceptions")),
         Some("--simd") => return compare_suite(Some("simd_i32x4")),
@@ -680,6 +689,36 @@ fn linked_resources_native(input: u32) -> u32 {
         global = value.rotate_left(13);
     }
     value ^ global
+}
+
+#[inline(always)]
+fn gc_graph_native(input: u32) -> u32 {
+    struct Node {
+        values: [u32; 32],
+        accumulator: u32,
+    }
+
+    let mut value = input;
+    for round in 0..64 {
+        let mut node = Node {
+            values: [value ^ round; 32],
+            accumulator: value,
+        };
+        for index in 0..32 {
+            let mut next = (node.values[index] ^ index as u32)
+                .wrapping_mul(MIX_MULTIPLIER)
+                .wrapping_add(round);
+            next = if (input ^ index as u32) & 1 == 0 {
+                next.rotate_left(5)
+            } else {
+                next ^ OTHER_MULTIPLIER
+            };
+            node.values[index] = next;
+            node.accumulator = node.accumulator.wrapping_add(next).rotate_left(3);
+        }
+        value = node.accumulator ^ node.values[(input.wrapping_add(round) & 31) as usize];
+    }
+    value
 }
 
 #[inline(always)]
