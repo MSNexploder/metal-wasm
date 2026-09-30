@@ -1,7 +1,7 @@
 //! Execute a supported WebAssembly function once per Metal thread.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::ffi::CStr;
 use std::fmt;
@@ -5266,20 +5266,27 @@ impl Compiler<'_> {
                     }
                     Operator::BrTable { targets } => {
                         let index = pop(stack)?;
+                        // Group identical destinations. A long chain of nested
+                        // conditionals can exhaust the Metal compiler's stack.
+                        let mut cases: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
                         for (case, depth) in targets.targets().enumerate() {
-                            self.source.push_str(&format!(
-                                "{}if ({index} == {case}u) {{\n",
-                                if case == 0 { "" } else { "else " }
-                            ));
-                            self.emit_branch(depth?, stack, None)?;
-                            self.source.push_str("} ");
+                            let depth = depth?;
+                            if depth != targets.default() {
+                                cases.entry(depth).or_default().push(case);
+                            }
                         }
-                        if !targets.is_empty() {
-                            self.source.push_str("else ");
+                        self.source
+                            .push_str(&format!("switch (uint({index})) {{\n"));
+                        for (depth, indices) in cases {
+                            for case in indices {
+                                self.source.push_str(&format!("case {case}u:\n"));
+                            }
+                            self.emit_branch(depth, stack, None)?;
+                            self.source.push_str("break;\n");
                         }
-                        self.source.push_str("{\n");
+                        self.source.push_str("default:\n");
                         self.emit_branch(targets.default(), stack, None)?;
-                        self.source.push_str("}\n");
+                        self.source.push_str("break;\n}\n");
                         reachable = false;
                         break;
                     }
