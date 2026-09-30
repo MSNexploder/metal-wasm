@@ -60,3 +60,15 @@ module/validation cases all run. `wide_arithmetic.rs` also compares 10,368
 inputs across Metal lanes with Rust `u128`/`i128` and Wasmtime, including carry,
 borrow, wraparound, signed extrema, and deterministic random inputs. The same
 WebAssembly Apache-2.0 license applies.
+
+The four scripts under `custom-page-sizes/` come unchanged from the
+[official custom page size tree](https://github.com/WebAssembly/custom-page-sizes/tree/61c873a1860acad2772539164f284cc5110f1b1b/test/core/custom-page-sizes),
+pinned at `61c873a1860acad2772539164f284cc5110f1b1b`. They include
+`custom-page-sizes.wast`, `custom-page-sizes-invalid.wast`, `memory_max.wast`,
+and `memory_max_i64.wast`. All 31 runtime and 47 module/validation cases run,
+including page size validation, growth, mixed-page copying, import matching,
+and 32-bit and 64-bit memory maximum definitions. The runtime script reserves
+131,072 growth pages for its two 65,536-byte grows of a one-byte-page memory.
+`custom_pages.rs` also checks multiple lanes, byte quotas shared by imported
+memories, SIMD boundaries, active and passive data, trap state, and host memory
+I/O through `Kernel` and `Store`. The same WebAssembly Apache-2.0 license applies.

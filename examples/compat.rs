@@ -58,7 +58,11 @@ fn check_invocations(wasm: &[u8], export: &str, inputs: &[u32]) -> Result<(), Bo
         Err(error) => return Err(error.into()),
     };
 
-    let engine = wasmtime::Engine::default();
+    let mut config = wasmtime::Config::new();
+    config
+        .wasm_wide_arithmetic(true)
+        .wasm_custom_page_sizes(true);
+    let engine = wasmtime::Engine::new(&config)?;
     let module = wasmtime::Module::new(&engine, wasm)?;
     let mut first_failure = None;
     let mut trap_count = 0;

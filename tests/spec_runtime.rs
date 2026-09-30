@@ -329,7 +329,12 @@ fn check_script_with_limits(source: &str, minimum_assertions: usize, limits: Ker
             WastDirective::ModuleDefinition(mut wat) => {
                 let name = wat.name().map(|id| id.name().to_owned());
                 let bytes = wat.encode().unwrap();
-                wasmparser::Validator::new().validate_all(&bytes).unwrap();
+                wasmparser::Validator::new_with_features(
+                    wasmparser::WasmFeatures::default()
+                        | wasmparser::WasmFeatures::CUSTOM_PAGE_SIZES,
+                )
+                .validate_all(&bytes)
+                .unwrap();
                 if let Some(name) = name {
                     state.definitions.insert(name, bytes.clone());
                 }
@@ -1389,3 +1394,51 @@ new_feature_spec!(
 );
 
 new_feature_spec!(spec_wide_arithmetic, "spec/wide-arithmetic.wast", 99);
+
+#[test]
+fn spec_custom_pages_custom_page_sizes_invalid() {
+    check_script_with_limits(
+        include_str!("spec/custom-page-sizes/custom-page-sizes-invalid.wast"),
+        0,
+        KernelLimits {
+            memory_growth_pages: 65_536,
+            ..script_limits()
+        },
+    );
+}
+
+#[test]
+fn spec_custom_pages_custom_page_sizes() {
+    check_script_with_limits(
+        include_str!("spec/custom-page-sizes/custom-page-sizes.wast"),
+        31,
+        KernelLimits {
+            memory_growth_pages: 131_072,
+            ..script_limits()
+        },
+    );
+}
+
+#[test]
+fn spec_custom_pages_memory_max() {
+    check_script_with_limits(
+        include_str!("spec/custom-page-sizes/memory_max.wast"),
+        0,
+        KernelLimits {
+            memory_growth_pages: 65_536,
+            ..script_limits()
+        },
+    );
+}
+
+#[test]
+fn spec_custom_pages_memory_max_i64() {
+    check_script_with_limits(
+        include_str!("spec/custom-page-sizes/memory_max_i64.wast"),
+        0,
+        KernelLimits {
+            memory_growth_pages: 65_536,
+            ..script_limits()
+        },
+    );
+}

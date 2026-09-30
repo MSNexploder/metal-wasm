@@ -13,6 +13,7 @@ struct Module {
     visible: bool,
     exports: HashMap<String, (ExternalKind, usize)>,
     memories: Vec<Option<(usize, usize)>>,
+    memory_page_sizes: Vec<usize>,
     tables: Vec<Option<(usize, usize)>>,
     globals: Vec<(usize, usize)>,
     global_types: Vec<GlobalType>,
@@ -59,7 +60,7 @@ fn resources<'a>(templates: impl Iterator<Item = &'a InstanceTemplate>) -> Vec<V
             };
             for (i, memory) in t.memories.iter().enumerate() {
                 add(format!("memory{i}"), "uchar", memory.capacity.max(1), false);
-                add(format!("pages{i}"), "uint", 4, false);
+                add(format!("pages{i}"), "ulong", 8, false);
             }
             for (i, table) in t.tables.iter().enumerate() {
                 add(
@@ -304,8 +305,7 @@ impl Store {
                 "store lane count must be between 1 and u32::MAX".into(),
             ));
         }
-        if !limits.memory_bytes.is_multiple_of(65536)
-            || limits.memory_bytes / 65536 > 65536
+        if limits.memory_bytes as u64 > (1u64 << 32)
             || limits.exception_records == 0
             || limits.exception_records > u32::MAX as usize
             || limits.gc_heap_words < 4
@@ -395,7 +395,7 @@ impl Store {
                 if let Some((owner, index)) = modules[i].memory_bindings[local] {
                     if owner < self.resources.len() {
                         modules[i].memory_types[local].initial =
-                            self.memory_pages(owner, index).into_iter().min().unwrap() as u64;
+                            self.memory_pages(owner, index).into_iter().min().unwrap();
                     }
                 }
             }
@@ -456,6 +456,7 @@ impl Store {
             visible: false,
             exports: HashMap::new(),
             memories: Vec::new(),
+            memory_page_sizes: Vec::new(),
             tables: Vec::new(),
             globals: Vec::new(),
             global_types: Vec::new(),
@@ -467,6 +468,11 @@ impl Store {
             let info = (
                 module.exports.clone(),
                 module.memory_bindings.clone(),
+                module
+                    .memory_types
+                    .iter()
+                    .map(|ty| ty.page_size() as usize)
+                    .collect(),
                 module.table_bindings.clone(),
                 module.global_bindings.clone(),
                 module.global_types.clone(),
@@ -490,6 +496,7 @@ impl Store {
         (
             module.exports,
             module.memories,
+            module.memory_page_sizes,
             module.tables,
             module.globals,
             module.global_types,
@@ -527,10 +534,10 @@ impl Store {
             )
         }
     }
-    fn memory_pages(&self, module: usize, index: usize) -> Vec<u32> {
+    fn memory_pages(&self, module: usize, index: usize) -> Vec<u64> {
         self.bytes(self.resource(module, &format!("pages{index}")))
-            .chunks_exact(4)
-            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+            .chunks_exact(8)
+            .map(|b| u64::from_ne_bytes(b.try_into().unwrap()))
             .collect()
     }
     fn metadata_words(&self) -> &[u64] {
@@ -611,7 +618,7 @@ impl Store {
                 write(&format!("memory{i}"), &memory.bytes);
                 write(
                     &format!("pages{i}"),
-                    &(memory.bytes.len() as u32 / 65536).to_ne_bytes(),
+                    &((memory.bytes.len() / memory.page_size) as u64).to_ne_bytes(),
                 );
             }
             for (i, table) in t.tables.iter().enumerate() {
@@ -918,7 +925,7 @@ impl Store {
             || self
                 .memory_pages(owner, index)
                 .iter()
-                .any(|&n| range.end > n as usize * 65536)
+                .any(|&n| range.end > n as usize * self.modules[m].memory_page_sizes[i])
         {
             return Err(Error::Unsupported(
                 "memory range exceeds current memory size".into(),
@@ -948,7 +955,7 @@ impl Store {
         if rows.iter().enumerate().any(|(lane, row)| {
             offset
                 .checked_add(row.len())
-                .is_none_or(|end| end > pages[lane] as usize * 65536)
+                .is_none_or(|end| end > pages[lane] as usize * self.modules[m].memory_page_sizes[i])
         }) {
             return Err(Error::Unsupported(
                 "memory range exceeds current memory size".into(),

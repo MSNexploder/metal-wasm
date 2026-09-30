@@ -24,7 +24,7 @@ use wasmparser::{
     AbstractHeapType, BlockType, Catch, CompositeInnerType, ConstExpr, DataKind, ElementItems,
     ElementKind, ExternalKind, FuncType, FunctionBody, GlobalType, HeapType, MemoryType, Operator,
     Parser, Payload, RefType, StorageType, TableInit, TableType, TryTable, TypeRef, UnpackedIndex,
-    ValType, Validator,
+    ValType, Validator, WasmFeatures,
 };
 
 mod store;
@@ -49,7 +49,9 @@ const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 /// Per-lane resource limits reserved when compiling a kernel.
 #[derive(Clone, Copy, Debug)]
 pub struct KernelLimits {
+    /// Total bytes in memories owned by each module instance, up to 4 GiB.
     pub memory_bytes: usize,
+    /// Growth reserve per memory, counted in its declared page size.
     pub memory_growth_pages: usize,
     pub table_growth_elements: usize,
     pub call_depth: usize,
@@ -240,6 +242,7 @@ struct InstanceTemplate {
 }
 
 struct MemoryTemplate {
+    page_size: usize,
     bytes: Vec<u8>,
     capacity: usize,
     max_pages: Option<u64>,
@@ -328,8 +331,7 @@ impl Kernel {
         providers: &[(&str, &[u8])],
         limits: KernelLimits,
     ) -> Result<Self, Error> {
-        if !limits.memory_bytes.is_multiple_of(65536)
-            || limits.memory_bytes / 65536 > 65536
+        if limits.memory_bytes as u64 > (1u64 << 32)
             || limits.exception_records == 0
             || limits.exception_records > u32::MAX as usize
             || limits.gc_heap_words < 4
@@ -1138,7 +1140,7 @@ impl Kernel {
                     std::slice::from_raw_parts(
                         buffer(instance.slots.memories[*resource].1)
                             .contents()
-                            .cast::<u32>(),
+                            .cast::<u64>(),
                         end - start,
                     )
                 };
@@ -1152,7 +1154,9 @@ impl Kernel {
                     )
                 };
                 for (lane, &page_count) in pages.iter().enumerate() {
-                    if range.end > page_count as usize * 65536 {
+                    if range.end
+                        > page_count as usize * instance.template.memories[*resource].page_size
+                    {
                         return Err(Error::Unsupported(format!(
                             "memory range exceeds memory size at input {}",
                             start + lane
@@ -1192,7 +1196,7 @@ impl Kernel {
             let template = &instance.template;
             for memory in &template.memories {
                 include(memory.capacity.max(1))?;
-                include(size_of::<u32>())?;
+                include(size_of::<u64>())?;
             }
             if instance.slots.globals.is_some() {
                 include(template.globals_template.len() * size_of::<u64>())?;
@@ -1479,7 +1483,12 @@ impl InstanceBuffers {
             buffers.push((slot, lane_buffer(device, initial, memory.capacity, count)?));
             buffers.push((
                 pages,
-                lane_buffer(device, &[initial.len() as u32 / 65536], 1, count)?,
+                lane_buffer(
+                    device,
+                    &[(initial.len() / memory.page_size) as u64],
+                    1,
+                    count,
+                )?,
             ));
         }
         if let Some(slot) = self.slots.globals {
@@ -1513,7 +1522,12 @@ impl InstanceBuffers {
         for (memory, &(slot, pages)) in template.memories.iter().zip(&self.slots.memories) {
             let initial = &memory.bytes;
             reset_lane_buffer(buffer(slot), initial, memory.capacity, count);
-            reset_lane_buffer(buffer(pages), &[initial.len() as u32 / 65536], 1, count);
+            reset_lane_buffer(
+                buffer(pages),
+                &[(initial.len() / memory.page_size) as u64],
+                1,
+                count,
+            );
         }
         if let Some(slot) = self.slots.globals {
             reset_lane_buffer(
@@ -1564,10 +1578,20 @@ impl From<wasmparser::BinaryReaderError> for Error {
 
 // Reuse the validator's canonical interner across providers. Recursive group
 // identity and declared function subtyping must survive module-local indices.
-#[derive(Default)]
 struct TypeContext {
     validator: Validator,
     next_tag: u32,
+}
+
+impl Default for TypeContext {
+    fn default() -> Self {
+        Self {
+            validator: Validator::new_with_features(
+                WasmFeatures::default() | WasmFeatures::CUSTOM_PAGE_SIZES,
+            ),
+            next_tag: 0,
+        }
+    }
 }
 
 fn normalize_ref(ty: RefType, ids: &[CoreTypeId]) -> RefType {
@@ -1926,9 +1950,9 @@ fn parse_module<'a>(
                             imports.push((import.module.to_owned(), import.name.to_owned()));
                         }
                         TypeRef::Memory(ty) => {
-                            if ty.shared || ty.page_size_log2() != 16 {
+                            if ty.shared {
                                 return Err(Error::Unsupported(
-                                    "only unshared 64 KiB page memories are supported".into(),
+                                    "only unshared memories are supported".into(),
                                 ));
                             }
                             memory_types.push(ty);
@@ -2019,14 +2043,14 @@ fn parse_module<'a>(
             Payload::MemorySection(section) => {
                 for memory in section {
                     let memory = memory?;
-                    if memory.shared || memory.page_size_log2() != 16 {
+                    if memory.shared {
                         return Err(Error::Unsupported(
-                            "only unshared 64 KiB page memories are supported".into(),
+                            "only unshared memories are supported".into(),
                         ));
                     }
                     let bytes = memory
                         .initial
-                        .checked_mul(65536)
+                        .checked_mul(u64::from(memory.page_size()))
                         .and_then(|bytes| usize::try_from(bytes).ok())
                         .ok_or_else(|| Error::Unsupported("memory size overflow".into()))?;
                     if bytes > limits.memory_bytes
@@ -2043,9 +2067,15 @@ fn parse_module<'a>(
                     memory_types.push(memory);
                     memory_bindings.push(None);
                     memories.push(MemoryTemplate {
+                        page_size: memory.page_size() as usize,
                         bytes: vec![0; bytes],
                         capacity: 0,
-                        max_pages: memory.maximum,
+                        max_pages: Some(memory.maximum.unwrap_or_else(|| {
+                            // Addresses and page counts must fit the index type.
+                            let address_space = 1u128 << if memory.memory64 { 64 } else { 32 };
+                            let pages = address_space / u128::from(memory.page_size());
+                            pages.min(address_space - 1) as u64
+                        })),
                     });
                 }
             }
@@ -3036,9 +3066,9 @@ fn translate_modules(
             .iter()
             .map(|memory| memory.bytes.len())
             .sum();
-        let growth_budget_pages = (limits.memory_bytes - initial_total) / 65536;
+        let growth_budget_bytes = limits.memory_bytes - initial_total;
         for (memory_index, memory) in instance.memories.iter_mut().enumerate() {
-            let initial_pages = memory.bytes.len() / 65536;
+            let initial_pages = memory.bytes.len() / memory.page_size;
             let wanted = initial_pages.saturating_add(
                 if persistent || uses_growth[module_index][memory_index] {
                     limits.memory_growth_pages
@@ -3050,8 +3080,8 @@ fn translate_modules(
             let extra_pages = wanted
                 .min(max_pages)
                 .saturating_sub(initial_pages)
-                .min(growth_budget_pages);
-            memory.capacity = memory.bytes.len() + extra_pages * 65536;
+                .min(growth_budget_bytes / memory.page_size);
+            memory.capacity = memory.bytes.len() + extra_pages * memory.page_size;
         }
         let mut allocate = |needed: bool| {
             needed.then(|| {
@@ -3190,7 +3220,7 @@ fn translate_modules(
     } else {
         ""
     };
-    source.push_str(&format!("struct ModuleState {{ {fuel_field} {exception_field} {gc_field} device uchar* memory[{max_memories}]; device uint* pages[{max_memories}]; device ulong* globals; device ulong* table[{max_tables}]; device const uchar* passive_data; uint table_size[{max_tables}]; thread uint* element_lengths; thread uint* data_lengths; thread ulong* element_values[{max_elements}]; }};\n"));
+    source.push_str(&format!("struct ModuleState {{ {fuel_field} {exception_field} {gc_field} device uchar* memory[{max_memories}]; device ulong* pages[{max_memories}]; device ulong* globals; device ulong* table[{max_tables}]; device const uchar* passive_data; uint table_size[{max_tables}]; thread uint* element_lengths; thread uint* data_lengths; thread ulong* element_values[{max_elements}]; }};\n"));
     if uses_gc {
         source.push_str(&gc_type_source(&gc_types, &modules, persistent));
     }
@@ -3295,7 +3325,7 @@ fn translate_modules(
     } else {
         for (module_index, slot) in slots.iter().enumerate() {
             for (index, &(memory, pages)) in slot.memories.iter().enumerate() {
-                source.push_str(&format!(", device uchar* m{module_index}_memory{index} [[buffer({memory})]], device uint* m{module_index}_pages{index} [[buffer({pages})]]"));
+                source.push_str(&format!(", device uchar* m{module_index}_memory{index} [[buffer({memory})]], device ulong* m{module_index}_pages{index} [[buffer({pages})]]"));
             }
             for (index, &table) in slot.tables.iter().enumerate() {
                 source.push_str(&format!(
@@ -3532,12 +3562,13 @@ fn translate_modules(
         for (memory_index, expr, data_offset, count) in &module.active_data {
             let offset = const_source(expr, module, uses_gc)?;
             let (owner, local) = module.memory_bindings[*memory_index].unwrap();
+            let page_size = modules[owner].instance.memories[local].page_size;
             let offset = if module.memory_types[*memory_index].memory64 {
                 format!("ulong({offset})")
             } else {
                 format!("ulong(uint({offset}))")
             };
-            source.push_str(&format!("if ({ready}) {{ ulong offset = {offset}; ulong size = ulong(states[{owner}].pages[{local}][0]) * 65536ul; if (offset > size || {count}ul > size - offset) trap = 4u; else {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{owner}].memory[{local}][offset + j] = states[{module_index}].passive_data[{data_offset}ul + j]; }} }}\n"));
+            source.push_str(&format!("if ({ready}) {{ ulong offset = {offset}; ulong size = ulong(states[{owner}].pages[{local}][0]) * {page_size}ul; if (offset > size || {count}ul > size - offset) trap = 4u; else {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{owner}].memory[{local}][offset + j] = states[{module_index}].passive_data[{data_offset}ul + j]; }} }}\n"));
         }
         if uses_gc {
             for (segment, values) in module.instance.element_info.elements.iter().enumerate() {
@@ -4352,7 +4383,13 @@ fn translate_body(
                 owner,
                 local,
                 capacity: memory.capacity,
-                owner_count: modules[owner].instance.memories.len(),
+                page_size: memory.page_size,
+                owner_page_sizes: modules[owner]
+                    .instance
+                    .memories
+                    .iter()
+                    .map(|m| m.page_size)
+                    .collect(),
                 is64: module.memory_types[index].memory64,
             }
         })
@@ -4393,7 +4430,7 @@ fn translate_body(
         ));
     }
     if !memories.is_empty() {
-        source.push_str("device uchar* memory = nullptr; device uint* pages = nullptr;\n");
+        source.push_str("device uchar* memory = nullptr; device ulong* pages = nullptr;\n");
     }
     if !tables.is_empty() {
         source.push_str("device ulong* table = nullptr; thread uint* table_size = nullptr;\n");
@@ -4499,7 +4536,7 @@ fn translate_body(
         types,
         function_types,
         memories,
-        memory_limit_pages: memory_bytes / 65536,
+        memory_limit_bytes: memory_bytes,
         globals_mutable,
         global_value_types: &module.global_types,
         global_bindings: &module.global_bindings,
@@ -4614,7 +4651,8 @@ struct MemoryState {
     owner: usize,
     local: usize,
     capacity: usize,
-    owner_count: usize,
+    page_size: usize,
+    owner_page_sizes: Vec<usize>,
     is64: bool,
 }
 
@@ -4653,7 +4691,7 @@ struct Compiler<'a> {
     types: &'a [FuncType],
     function_types: &'a [u32],
     memories: Vec<MemoryState>,
-    memory_limit_pages: usize,
+    memory_limit_bytes: usize,
     globals_mutable: &'a [bool],
     global_value_types: &'a [GlobalType],
     global_bindings: &'a [(usize, usize)],
@@ -5033,7 +5071,9 @@ impl Compiler<'_> {
         memarg: &wasmparser::MemArg,
         width: usize,
     ) -> Result<String, Error> {
-        let is64 = self.select_memory(memarg.memory)?.is64;
+        let memory = self.select_memory(memarg.memory)?;
+        let is64 = memory.is64;
+        let page_size = memory.page_size;
         let index = self.fresh_value();
         let address = if is64 {
             format!("ulong({address})")
@@ -5041,7 +5081,7 @@ impl Compiler<'_> {
             format!("ulong(uint({address}))")
         };
         self.source.push_str(&format!(
-            "if ({address} > ulong(pages[0]) * 65536ul || {}ul > ulong(pages[0]) * 65536ul - {address} || {width}ul > ulong(pages[0]) * 65536ul - {address} - {}ul) {{ trap = 4u; return; }}\n",
+            "if ({address} > ulong(pages[0]) * {page_size}ul || {}ul > ulong(pages[0]) * {page_size}ul - {address} || {width}ul > ulong(pages[0]) * {page_size}ul - {address} - {}ul) {{ trap = 4u; return; }}\n",
             memarg.offset, memarg.offset,
         ));
         self.source
@@ -5797,7 +5837,8 @@ impl Compiler<'_> {
                 let memory = self.select_memory(*mem)?;
                 let capacity = memory.capacity;
                 let owner = memory.owner;
-                let owner_count = memory.owner_count;
+                let page_size = memory.page_size;
+                let owner_page_sizes = memory.owner_page_sizes.clone();
                 let failure = if memory.is64 {
                     "0xfffffffffffffffful"
                 } else {
@@ -5806,26 +5847,28 @@ impl Compiler<'_> {
                 let delta = pop(stack)?;
                 let prior = self.fresh_value();
                 let total = self.fresh_value();
-                let pages = (0..owner_count)
-                    .map(|index| format!("ulong(states[{owner}].pages[{index}][0])"))
+                let bytes = owner_page_sizes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, size)| format!("states[{owner}].pages[{index}][0] * {size}ul"))
                     .collect::<Vec<_>>()
                     .join(" + ");
                 self.source.push_str(&format!(
-                    "{prior} = pages[0];\n{total} = {pages};\nif ({delta} <= ulong({}u - pages[0]) && {total} <= {}ul && {delta} <= {}ul - {total}) pages[0] += uint({delta}); else {prior} = {failure};\n",
-                    capacity / 65536,
-                    self.memory_limit_pages,
-                    self.memory_limit_pages
+                    "{prior} = pages[0];\n{total} = {bytes};\nif ({delta} <= {}ul - pages[0] && {total} <= {}ul && {delta} <= ({}ul - {total}) / {page_size}ul) pages[0] += {delta}; else {prior} = {failure};\n",
+                    capacity / page_size,
+                    self.memory_limit_bytes,
+                    self.memory_limit_bytes
                 ));
                 stack.push(prior);
             }
             Operator::MemoryFill { mem } => {
-                self.select_memory(*mem)?;
+                let page_size = self.select_memory(*mem)?.page_size;
                 let length = pop(stack)?;
                 let value = pop(stack)?;
                 let destination = pop(stack)?;
                 let offset = self.fresh_value();
                 self.source.push_str(&format!(
-                    "if (ulong({destination}) > ulong(pages[0]) * 65536ul || ulong({length}) > ulong(pages[0]) * 65536ul - ulong({destination})) {{ trap = 4u; return; }}\nfor ({offset} = 0ul; {offset} < ulong({length}); ++{offset}) memory[ulong({destination}) + {offset}] = uchar({value});\n"
+                    "if (ulong({destination}) > ulong(pages[0]) * {page_size}ul || ulong({length}) > ulong(pages[0]) * {page_size}ul - ulong({destination})) {{ trap = 4u; return; }}\nfor ({offset} = 0ul; {offset} < ulong({length}); ++{offset}) memory[ulong({destination}) + {offset}] = uchar({value});\n"
                 ));
             }
             Operator::MemoryCopy { dst_mem, src_mem } => {
@@ -5835,22 +5878,24 @@ impl Compiler<'_> {
                     .ok_or_else(|| Error::Unsupported("memory is missing".into()))?;
                 let dst_ptr = format!("states[{}].memory[{}]", dst.owner, dst.local);
                 let dst_pages = format!("states[{}].pages[{}][0]", dst.owner, dst.local);
+                let dst_page_size = dst.page_size;
                 let src = self
                     .memories
                     .get(*src_mem as usize)
                     .ok_or_else(|| Error::Unsupported("memory is missing".into()))?;
                 let src_ptr = format!("states[{}].memory[{}]", src.owner, src.local);
                 let src_pages = format!("states[{}].pages[{}][0]", src.owner, src.local);
+                let src_page_size = src.page_size;
                 let length = pop(stack)?;
                 let source = pop(stack)?;
                 let destination = pop(stack)?;
                 let offset = self.fresh_value();
                 self.source.push_str(&format!(
-                    "if (ulong({destination}) > ulong({dst_pages}) * 65536ul || ulong({length}) > ulong({dst_pages}) * 65536ul - ulong({destination}) || ulong({source}) > ulong({src_pages}) * 65536ul || ulong({length}) > ulong({src_pages}) * 65536ul - ulong({source})) {{ trap = 4u; return; }}\nif ({dst_ptr} == {src_ptr} && {destination} > {source}) {{\nfor ({offset} = ulong({length}); {offset} > 0ul; --{offset}) {dst_ptr}[ulong({destination}) + {offset} - 1ul] = {src_ptr}[ulong({source}) + {offset} - 1ul];\n}} else {{\nfor ({offset} = 0ul; {offset} < ulong({length}); ++{offset}) {dst_ptr}[ulong({destination}) + {offset}] = {src_ptr}[ulong({source}) + {offset}];\n}}\n"
+                    "if (ulong({destination}) > ulong({dst_pages}) * {dst_page_size}ul || ulong({length}) > ulong({dst_pages}) * {dst_page_size}ul - ulong({destination}) || ulong({source}) > ulong({src_pages}) * {src_page_size}ul || ulong({length}) > ulong({src_pages}) * {src_page_size}ul - ulong({source})) {{ trap = 4u; return; }}\nif ({dst_ptr} == {src_ptr} && {destination} > {source}) {{\nfor ({offset} = ulong({length}); {offset} > 0ul; --{offset}) {dst_ptr}[ulong({destination}) + {offset} - 1ul] = {src_ptr}[ulong({source}) + {offset} - 1ul];\n}} else {{\nfor ({offset} = 0ul; {offset} < ulong({length}); ++{offset}) {dst_ptr}[ulong({destination}) + {offset}] = {src_ptr}[ulong({source}) + {offset}];\n}}\n"
                 ));
             }
             Operator::MemoryInit { data_index, mem } => {
-                self.select_memory(*mem)?;
+                let page_size = self.select_memory(*mem)?.page_size;
                 let offset = *self.data_offsets.get(*data_index as usize).ok_or_else(|| {
                     Error::Unsupported("data segment index is out of range".into())
                 })?;
@@ -5859,7 +5904,7 @@ impl Compiler<'_> {
                 let destination = pop(stack)?;
                 let byte = self.fresh_value();
                 self.source.push_str(&format!(
-                    "if (ulong({destination}) > ulong(pages[0]) * 65536ul || ulong({length}) > ulong(pages[0]) * 65536ul - ulong({destination}) || ulong({source}) > ulong(data_lengths[{data_index}u]) || ulong({length}) > ulong(data_lengths[{data_index}u]) - ulong({source})) {{ trap = 4u; return; }}\nfor ({byte} = 0ul; {byte} < ulong({length}); ++{byte}) memory[ulong({destination}) + {byte}] = passive_data[{offset}ul + ulong({source}) + {byte}];\n"
+                    "if (ulong({destination}) > ulong(pages[0]) * {page_size}ul || ulong({length}) > ulong(pages[0]) * {page_size}ul - ulong({destination}) || ulong({source}) > ulong(data_lengths[{data_index}u]) || ulong({length}) > ulong(data_lengths[{data_index}u]) - ulong({source})) {{ trap = 4u; return; }}\nfor ({byte} = 0ul; {byte} < ulong({length}); ++{byte}) memory[ulong({destination}) + {byte}] = passive_data[{offset}ul + ulong({source}) + {byte}];\n"
                 ));
             }
             Operator::DataDrop { data_index } => {
