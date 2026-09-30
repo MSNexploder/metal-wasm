@@ -111,6 +111,12 @@ struct ExceptionRecord {
     payload: Vec<Value>,
 }
 
+struct EncodedExceptions {
+    arguments: Vec<u64>,
+    arena: Vec<u64>,
+    handles: Vec<ExceptionRef>,
+}
+
 #[derive(Clone, Copy)]
 struct ExceptionIo {
     records: usize,
@@ -209,6 +215,9 @@ impl LaneError {
 
 /// One lane's returned values or Wasm execution failure.
 pub type LaneResult = Result<Vec<Value>, LaneError>;
+
+/// Returned values and exported memory bytes, with one row per invocation.
+pub type MemoryResults = (Vec<Vec<Value>>, Vec<Vec<u8>>);
 
 fn lane_failure(traps: &Option<metal::Buffer>, lane: usize) -> Option<LaneError> {
     let code = traps.as_ref().map_or(0, |buffer| unsafe {
@@ -962,7 +971,7 @@ impl Kernel {
         inputs: &[Vec<Value>],
         memory_export: &str,
         range: Range<usize>,
-    ) -> Result<(Vec<Vec<Value>>, Vec<Vec<u8>>), Error> {
+    ) -> Result<MemoryResults, Error> {
         let owner = *self.memory_exports.get(memory_export).ok_or_else(|| {
             Error::Unsupported(format!("export {memory_export:?} is not a memory"))
         })?;
@@ -984,7 +993,7 @@ impl Kernel {
         input_offset: usize,
         memory_inputs: &[Vec<u8>],
         output_range: Range<usize>,
-    ) -> Result<(Vec<Vec<Value>>, Vec<Vec<u8>>), Error> {
+    ) -> Result<MemoryResults, Error> {
         let owner = *self.memory_exports.get(memory_export).ok_or_else(|| {
             Error::Unsupported(format!("export {memory_export:?} is not a memory"))
         })?;
@@ -1028,7 +1037,7 @@ impl Kernel {
         &self,
         row: &[Value],
         io: ExceptionIo,
-    ) -> Result<(Vec<u64>, Vec<u64>, Vec<ExceptionRef>), Error> {
+    ) -> Result<EncodedExceptions, Error> {
         let records = self
             .exception_values
             .lock()
@@ -1094,7 +1103,11 @@ impl Kernel {
                 index,
             })
             .collect();
-        Ok((arguments, arena, handles))
+        Ok(EncodedExceptions {
+            arguments,
+            arena,
+            handles,
+        })
     }
 
     fn decode_value(
@@ -1243,7 +1256,7 @@ impl Kernel {
         inputs: &[Vec<Value>],
         capture: Option<((usize, usize), Range<usize>)>,
         memory_input: Option<MemoryInput<'_>>,
-    ) -> Result<(Vec<Vec<Value>>, Vec<Vec<u8>>), Error> {
+    ) -> Result<MemoryResults, Error> {
         let (rows, memory) = self.run_values_lanes_impl(inputs, capture, memory_input, true)?;
         let rows = rows
             .into_iter()
@@ -1391,12 +1404,12 @@ impl Kernel {
                 } else if let Some(io) = self.exception_io.filter(|io| io.input) {
                     let mut arguments = Vec::new();
                     for (index, row) in inputs[start..end].iter().enumerate() {
-                        let (args, arena, handles) = self
+                        let encoded = self
                             .encode_exceptions(row, io)
                             .map_err(|error| shift_trap(error, start + index))?;
-                        arguments.extend(args);
-                        exception_arenas.extend(arena);
-                        exception_handles.push(handles);
+                        arguments.extend(encoded.arguments);
+                        exception_arenas.extend(encoded.arena);
+                        exception_handles.push(encoded.handles);
                     }
                     encoded64 = arguments;
                 } else {
@@ -1572,8 +1585,8 @@ impl Kernel {
                     "single invocation exceeds the Metal buffer limit".into(),
                 ));
             }
-            if stride != 0 {
-                limit = limit.min(max_buffer / stride);
+            if let Some(capacity) = max_buffer.checked_div(stride) {
+                limit = limit.min(capacity);
                 per_lane = per_lane.saturating_add(stride);
             }
             Ok(())
@@ -2769,17 +2782,21 @@ fn parse_module<'a>(
     })
 }
 
+struct DependencyState {
+    namespaces: HashMap<String, usize>,
+    visiting: Vec<bool>,
+    postorder: Vec<usize>,
+}
+
 fn load_dependencies<'a>(
     index: usize,
     modules: &mut Vec<ParsedModule<'a>>,
     providers: &HashMap<&str, &'a [u8]>,
-    namespaces: &mut HashMap<String, usize>,
-    visiting: &mut Vec<bool>,
-    postorder: &mut Vec<usize>,
+    state: &mut DependencyState,
     limits: KernelLimits,
     context: &mut TypeContext,
 ) -> Result<(), Error> {
-    visiting[index] = true;
+    state.visiting[index] = true;
     let imported_globals = modules[index]
         .all_imports
         .iter()
@@ -2806,8 +2823,8 @@ fn load_dependencies<'a>(
     let mut table_import = 0;
     let mut tag_import = 0;
     for (namespace, name, ty) in links {
-        let provider = if let Some(&provider) = namespaces.get(&namespace) {
-            if visiting[provider] {
+        let provider = if let Some(&provider) = state.namespaces.get(&namespace) {
+            if state.visiting[provider] {
                 return Err(Error::Unsupported(format!(
                     "cyclic provider dependency through {namespace:?}"
                 )));
@@ -2819,11 +2836,9 @@ fn load_dependencies<'a>(
             })?;
             let provider = modules.len();
             modules.push(parse_module(bytes, limits, context)?);
-            namespaces.insert(namespace.clone(), provider);
-            visiting.push(false);
-            load_dependencies(
-                provider, modules, providers, namespaces, visiting, postorder, limits, context,
-            )?;
+            state.namespaces.insert(namespace.clone(), provider);
+            state.visiting.push(false);
+            load_dependencies(provider, modules, providers, state, limits, context)?;
             provider
         };
         let &(kind, exported) = modules[provider].exports.get(&name).ok_or_else(|| {
@@ -2944,8 +2959,8 @@ fn load_dependencies<'a>(
         }
     }
     debug_assert_eq!(global_import, imported_globals);
-    visiting[index] = false;
-    postorder.push(index);
+    state.visiting[index] = false;
+    state.postorder.push(index);
     Ok(())
 }
 
@@ -2988,20 +3003,22 @@ fn translate_with_limits(
     }
     let mut context = TypeContext::default();
     let mut modules = vec![parse_module(wasm, limits, &mut context)?];
-    let mut postorder = Vec::new();
+    let mut dependencies = DependencyState {
+        namespaces: HashMap::new(),
+        visiting: vec![false],
+        postorder: Vec::new(),
+    };
     load_dependencies(
         0,
         &mut modules,
         &provider_map,
-        &mut HashMap::new(),
-        &mut vec![false],
-        &mut postorder,
+        &mut dependencies,
         limits,
         &mut context,
     )?;
     translate_modules(
         modules,
-        postorder,
+        dependencies.postorder,
         context.next_tag as usize + 1,
         0,
         Some(export_name),
@@ -3289,26 +3306,11 @@ fn translate_modules(
     // A newly reachable table mutation can expose more indirect call targets.
     // Repeat reachability until those targets no longer change.
     loop {
-        let mut reachable = vec![0u8; functions.len()];
-        let mut ignored_order = Vec::new();
-        let mut ignored_traps = false;
-        let mut ignored_growth: Vec<Vec<bool>> = modules
-            .iter()
-            .map(|module| vec![false; module.instance.memories.len()])
-            .collect();
-        let mut ignored_recursion = false;
+        let mut analysis = FunctionAnalysis::new(&modules, functions.len());
         for function in index.iter().chain(&starts) {
-            visit_function(
-                *function,
-                &modules,
-                &functions,
-                &mut reachable,
-                &mut ignored_order,
-                &mut ignored_traps,
-                &mut ignored_growth,
-                &mut ignored_recursion,
-            )?;
+            visit_function(*function, &modules, &functions, &mut analysis)?;
         }
+        let reachable = analysis.state;
         let mut mutates: Vec<Vec<bool>> = modules
             .iter()
             .map(|module| vec![false; module.instance.tables.len()])
@@ -3392,34 +3394,26 @@ fn translate_modules(
             break;
         }
     }
-    let mut recursive = false;
-    let mut order = Vec::new();
-    let mut visit_state = vec![0u8; functions.len()];
-    let mut can_trap = limits.fuel.is_some()
+    let mut analysis = FunctionAnalysis::new(&modules, functions.len());
+    analysis.can_trap = limits.fuel.is_some()
         || modules.iter().any(|m| {
             !m.instance.memories.is_empty()
                 || !m.active_data.is_empty()
                 || !m.active_elements.is_empty()
         });
-    let mut uses_growth: Vec<Vec<bool>> = modules
-        .iter()
-        .map(|module| vec![false; module.instance.memories.len()])
-        .collect();
     // Persisted resources have whole-instance capacities, while a pipeline only
     // needs this entry and its possible callees. Provider starts already ran.
     let entries = index.iter().copied().chain(starts.iter().copied());
     for entry in entries {
-        visit_function(
-            entry,
-            &modules,
-            &functions,
-            &mut visit_state,
-            &mut order,
-            &mut can_trap,
-            &mut uses_growth,
-            &mut recursive,
-        )?;
+        visit_function(entry, &modules, &functions, &mut analysis)?;
     }
+    let FunctionAnalysis {
+        order,
+        mut can_trap,
+        uses_growth,
+        mut recursive,
+        ..
+    } = analysis;
     let tail_calls = order.iter().any(|&function| {
         let (module_index, local) = functions[function];
         modules[module_index].bodies[local - modules[module_index].imports.len()]
@@ -3512,10 +3506,8 @@ fn translate_modules(
     if persistent {
         can_trap = true;
     }
-    if persistent {
-        if let Some(gc) = &mut gc {
-            gc.slot = 5;
-        }
+    if persistent && let Some(gc) = &mut gc {
+        gc.slot = 5;
     }
     if !persistent && next_slot > 31 {
         return Err(Error::Unsupported(
@@ -3649,22 +3641,18 @@ fn translate_modules(
         source.push_str(";\n");
     }
     let mut max_gc_roots = 1;
+    let body_context = BodyTranslation {
+        modules: &modules,
+        global_types: &global_types,
+        order: &order,
+        limits,
+        recursive,
+        tail_calls,
+        uses_gc,
+    };
     for &function in &order {
         let (module_index, local) = functions[function];
-        let (body_source, roots) = translate_body(
-            &modules,
-            module_index,
-            function,
-            local,
-            &global_types,
-            recursive,
-            tail_calls,
-            limits.call_depth,
-            limits.memory_bytes,
-            &order,
-            uses_gc,
-            limits.fuel.is_some(),
-        )?;
+        let (body_source, roots) = translate_body(&body_context, module_index, function, local)?;
         source.push_str(&body_source);
         max_gc_roots = max_gc_roots.max(roots);
     }
@@ -4055,10 +4043,8 @@ fn translate_modules(
     let memory_exports = modules[root]
         .exports
         .iter()
-        .filter_map(|(name, &(kind, index))| {
-            (kind == ExternalKind::Memory)
-                .then(|| (name.clone(), modules[root].memory_bindings[index].unwrap()))
-        })
+        .filter(|(_, (kind, _))| *kind == ExternalKind::Memory)
+        .map(|(name, &(_, index))| (name.clone(), modules[root].memory_bindings[index].unwrap()))
         .collect();
     let function_reference_types = functions
         .iter()
@@ -4075,13 +4061,12 @@ fn translate_modules(
     let exported_functions = modules[root]
         .exports
         .iter()
-        .filter_map(|(name, &(kind, local))| {
-            (kind == ExternalKind::Func).then(|| {
-                (
-                    name.clone(),
-                    modules[root].resolved_functions[local] as u32 + 1,
-                )
-            })
+        .filter(|(_, (kind, _))| *kind == ExternalKind::Func)
+        .map(|(name, &(_, local))| {
+            (
+                name.clone(),
+                modules[root].resolved_functions[local] as u32 + 1,
+            )
         })
         .collect();
     let reference_supertypes = modules
@@ -4091,9 +4076,8 @@ fn translate_modules(
     let exception_tags = modules[root]
         .exports
         .iter()
-        .filter_map(|(name, &(kind, local))| {
-            (kind == ExternalKind::Tag).then(|| (name.clone(), modules[root].tag_bindings[local]))
-        })
+        .filter(|(_, (kind, _))| *kind == ExternalKind::Tag)
+        .map(|(name, &(_, local))| (name.clone(), modules[root].tag_bindings[local]))
         .collect();
     let mut tag_payload_types = vec![Vec::new(); tag_count];
     for module in &modules {
@@ -4481,26 +4465,45 @@ fn eval_v128_const(
     Ok(value)
 }
 
+struct FunctionAnalysis {
+    state: Vec<u8>,
+    order: Vec<usize>,
+    can_trap: bool,
+    uses_growth: Vec<Vec<bool>>,
+    recursive: bool,
+}
+
+impl FunctionAnalysis {
+    fn new(modules: &[ParsedModule<'_>], function_count: usize) -> Self {
+        Self {
+            state: vec![0; function_count],
+            order: Vec::new(),
+            can_trap: false,
+            uses_growth: modules
+                .iter()
+                .map(|module| vec![false; module.instance.memories.len()])
+                .collect(),
+            recursive: false,
+        }
+    }
+}
+
 fn visit_function(
     index: usize,
     modules: &[ParsedModule<'_>],
     functions: &[(usize, usize)],
-    state: &mut [u8],
-    order: &mut Vec<usize>,
-    can_trap: &mut bool,
-    uses_growth: &mut [Vec<bool>],
-    recursive: &mut bool,
+    analysis: &mut FunctionAnalysis,
 ) -> Result<(), Error> {
-    match state.get(index).copied() {
+    match analysis.state.get(index).copied() {
         Some(2) => return Ok(()),
         Some(1) => {
-            *recursive = true;
+            analysis.recursive = true;
             return Ok(());
         }
         Some(0) => {}
         _ => return Err(Error::Unsupported("function index is out of range".into())),
     }
-    state[index] = 1;
+    analysis.state[index] = 1;
     let (module_index, local) = functions[index];
     let module = &modules[module_index];
     let mut previous_constant = None;
@@ -4537,11 +4540,7 @@ fn visit_function(
                     module.resolved_functions[function_index as usize],
                     modules,
                     functions,
-                    state,
-                    order,
-                    can_trap,
-                    uses_growth,
-                    recursive,
+                    analysis,
                 )?;
             }
             Operator::CallIndirect {
@@ -4554,7 +4553,7 @@ fn visit_function(
             }
             | Operator::CallRef { type_index }
             | Operator::ReturnCallRef { type_index } => {
-                *can_trap = true;
+                analysis.can_trap = true;
                 let expected = type_index as usize;
                 let targets: Vec<usize> = match operator {
                     Operator::CallRef { .. } | Operator::ReturnCallRef { .. } => {
@@ -4586,32 +4585,18 @@ fn visit_function(
                             operator,
                             Operator::CallRef { .. } | Operator::ReturnCallRef { .. }
                         )
+                        && !owner.info.mutable
+                        && let Some(slot) = previous_constant
+                        && owner.values.get(slot as usize).copied() != Some(target as u64 + 1)
                     {
-                        if !owner.info.mutable {
-                            if let Some(slot) = previous_constant {
-                                if owner.values.get(slot as usize).copied()
-                                    != Some(target as u64 + 1)
-                                {
-                                    continue;
-                                }
-                            }
-                        }
+                        continue;
                     }
                     if module.accepts_function(
                         expected,
                         &modules[functions[target].0],
                         functions[target].1,
                     ) {
-                        visit_function(
-                            target,
-                            modules,
-                            functions,
-                            state,
-                            order,
-                            can_trap,
-                            uses_growth,
-                            recursive,
-                        )?;
+                        visit_function(target, modules, functions, analysis)?;
                     }
                 }
             }
@@ -4619,10 +4604,10 @@ fn visit_function(
             | Operator::TableSet { .. }
             | Operator::TableFill { .. }
             | Operator::TableCopy { .. }
-            | Operator::TableInit { .. } => *can_trap = true,
+            | Operator::TableInit { .. } => analysis.can_trap = true,
             Operator::MemoryGrow { mem } => {
                 let (owner, local) = module.memory_bindings[mem as usize].unwrap();
-                uses_growth[owner][local] = true;
+                analysis.uses_growth[owner][local] = true;
             }
             Operator::I32DivS
             | Operator::I32DivU
@@ -4646,14 +4631,14 @@ fn visit_function(
             | Operator::Throw { .. }
             | Operator::ThrowRef
             | Operator::TryTable { .. }
-            | Operator::Unreachable => *can_trap = true,
+            | Operator::Unreachable => analysis.can_trap = true,
             _ => {}
         }
         previous_constant = current_constant;
         previous_reference = current_reference;
     }
-    state[index] = 2;
-    order.push(index);
+    analysis.state[index] = 2;
+    analysis.order.push(index);
     Ok(())
 }
 
@@ -4709,20 +4694,34 @@ fn function_signature(
     Ok(format!("void f{index}({})", args.join(", ")))
 }
 
+struct BodyTranslation<'a, 'wasm> {
+    modules: &'a [ParsedModule<'wasm>],
+    global_types: &'a [FuncType],
+    order: &'a [usize],
+    limits: KernelLimits,
+    recursive: bool,
+    tail_calls: bool,
+    uses_gc: bool,
+}
+
 fn translate_body(
-    modules: &[ParsedModule<'_>],
+    context: &BodyTranslation<'_, '_>,
     module_index: usize,
     function_index: usize,
     local_function: usize,
-    global_types: &[FuncType],
-    recursive: bool,
-    tail_calls: bool,
-    call_depth: usize,
-    memory_bytes: usize,
-    order: &[usize],
-    uses_gc: bool,
-    metered: bool,
 ) -> Result<(String, usize), Error> {
+    let &BodyTranslation {
+        modules,
+        global_types,
+        order,
+        limits,
+        recursive,
+        tail_calls,
+        uses_gc,
+    } = context;
+    let call_depth = limits.call_depth;
+    let memory_bytes = limits.memory_bytes;
+    let metered = limits.fuel.is_some();
     let module = &modules[module_index];
     let body = &module.bodies[local_function - module.imports.len()];
     let ty = module.function_type(local_function)?;
@@ -4943,7 +4942,7 @@ fn translate_body(
     let mut stack = Vec::new();
     let reachable = compiler.emit_instructions(&instructions, &mut stack)?;
     let results = compiler.frames[0].results.clone();
-    compiler.finish_path(reachable, &mut stack, 0, &results)?;
+    compiler.finish_path(reachable, &stack, 0, &results)?;
     compiler.source.push_str("}\n");
     compiler
         .source
@@ -5592,7 +5591,7 @@ impl Compiler<'_> {
     fn finish_path(
         &mut self,
         reachable: bool,
-        stack: &mut Vec<String>,
+        stack: &[String],
         base: usize,
         results: &[String],
     ) -> Result<(), Error> {
@@ -5822,7 +5821,7 @@ impl Compiler<'_> {
             self.source.push_str("{\n");
         }
         let reachable = self.emit_instructions(body, &mut inner_stack)?;
-        self.finish_path(reachable, &mut inner_stack, base, &frame.results)?;
+        self.finish_path(reachable, &inner_stack, base, &frame.results)?;
         if loop_label {
             if self.exceptions {
                 self.source
@@ -5859,12 +5858,12 @@ impl Compiler<'_> {
         let mut then_stack = stack.clone();
         then_stack.extend(frame.params.iter().cloned());
         let then_reachable = self.emit_instructions(then_body, &mut then_stack)?;
-        self.finish_path(then_reachable, &mut then_stack, base, &frame.results)?;
+        self.finish_path(then_reachable, &then_stack, base, &frame.results)?;
         self.source.push_str("} else {\n");
         let mut else_stack = stack.clone();
         else_stack.extend(frame.params.iter().cloned());
         let else_reachable = self.emit_instructions(else_body, &mut else_stack)?;
-        self.finish_path(else_reachable, &mut else_stack, base, &frame.results)?;
+        self.finish_path(else_reachable, &else_stack, base, &frame.results)?;
         self.source.push_str("}\n");
         self.source
             .push_str(&format!("if (flow == {}u) flow = 0u;\n", frame.id));
@@ -7653,6 +7652,22 @@ fn pop(stack: &mut Vec<String>) -> Result<String, Error> {
     stack
         .pop()
         .ok_or_else(|| Error::Unsupported("operand stack underflow".into()))
+}
+
+fn expr_uses_gc(expr: &ConstExpr<'_>) -> bool {
+    expr.get_operators_reader().into_iter().any(|op| {
+        matches!(
+            op,
+            Ok(Operator::StructNew { .. }
+                | Operator::StructNewDefault { .. }
+                | Operator::ArrayNew { .. }
+                | Operator::ArrayNewDefault { .. }
+                | Operator::ArrayNewFixed { .. }
+                | Operator::RefI31
+                | Operator::AnyConvertExtern
+                | Operator::ExternConvertAny)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -10259,20 +10274,4 @@ mod tests {
             &[vec![Value::I32(0)], vec![Value::I32(17)]],
         );
     }
-}
-
-fn expr_uses_gc(expr: &ConstExpr<'_>) -> bool {
-    expr.get_operators_reader().into_iter().any(|op| {
-        matches!(
-            op,
-            Ok(Operator::StructNew { .. }
-                | Operator::StructNewDefault { .. }
-                | Operator::ArrayNew { .. }
-                | Operator::ArrayNewDefault { .. }
-                | Operator::ArrayNewFixed { .. }
-                | Operator::RefI31
-                | Operator::AnyConvertExtern
-                | Operator::ExternConvertAny)
-        )
-    })
 }

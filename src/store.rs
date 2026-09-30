@@ -355,21 +355,21 @@ impl Store {
             link_module(i, &mut modules, &self.modules[i].imports)?;
             // Import matching uses the smallest current size, so every lane must satisfy it.
             for local in 0..modules[i].memory_types.len() {
-                if let Some((owner, index)) = modules[i].memory_bindings[local] {
-                    if owner < self.resources.len() {
-                        modules[i].memory_types[local].initial =
-                            self.memory_pages(owner, index).into_iter().min().unwrap();
-                    }
+                if let Some((owner, index)) = modules[i].memory_bindings[local]
+                    && owner < self.resources.len()
+                {
+                    modules[i].memory_types[local].initial =
+                        self.memory_pages(owner, index).into_iter().min().unwrap();
                 }
             }
             for local in 0..modules[i].table_types.len() {
-                if let Some((owner, index)) = modules[i].table_bindings[local] {
-                    if owner < self.resources.len() {
-                        modules[i].table_types[local].initial = (0..self.lanes)
-                            .map(|lane| self.lane_table_size(owner, index, lane) as u64)
-                            .min()
-                            .unwrap();
-                    }
+                if let Some((owner, index)) = modules[i].table_bindings[local]
+                    && owner < self.resources.len()
+                {
+                    modules[i].table_types[local].initial = (0..self.lanes)
+                        .map(|lane| self.lane_table_size(owner, index, lane) as u64)
+                        .min()
+                        .unwrap();
                 }
             }
         }
@@ -507,8 +507,10 @@ impl Store {
     }
     fn memory_pages(&self, module: usize, index: usize) -> Vec<u64> {
         self.bytes(self.resource(module, &format!("pages{index}")))
-            .chunks_exact(8)
-            .map(|b| u64::from_ne_bytes(b.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&b| u64::from_ne_bytes(b))
             .collect()
     }
     fn metadata_words(&self) -> &[u64] {
@@ -567,11 +569,11 @@ impl Store {
                 );
             }
         }
-        for m in self.resources.len()..layout.len() {
+        for (m, module_resources) in layout.iter().enumerate().skip(self.resources.len()) {
             let t = &kernel.instances[m].template;
             let write = |field: &str, bytes: &[u8]| {
                 let name = format!("m{m}_{field}");
-                let r = layout[m].iter().find(|r| r.name == name).unwrap();
+                let r = module_resources.iter().find(|r| r.name == name).unwrap();
                 for lane in 0..if r.shared { 1 } else { self.lanes } {
                     unsafe {
                         std::ptr::copy_nonoverlapping(

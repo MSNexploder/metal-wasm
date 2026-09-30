@@ -108,12 +108,12 @@ fn check_invocations(wasm: &[u8], export: &str, inputs: &[u32]) -> Result<(), Bo
         }
         _ => None,
     };
-    if let Some((input_index, reason)) = batch_failure {
-        if first_failure != Some((input_index, reason)) {
-            return Err(format!(
-                "Metal batch failed at input {input_index} with {reason:?}, but individual runs first failed at {first_failure:?}"
-            ).into());
-        }
+    if let Some((input_index, reason)) = batch_failure
+        && first_failure != Some((input_index, reason))
+    {
+        return Err(format!(
+            "Metal batch failed at input {input_index} with {reason:?}, but individual runs first failed at {first_failure:?}"
+        ).into());
     }
     println!(
         "supported: {} independent invocations matched Wasmtime ({trap_count} matching traps, {exception_count} matching exceptions)",

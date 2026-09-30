@@ -341,9 +341,10 @@ impl Kernel {
     ) -> Result<Vec<Value>, Error> {
         // First validate the reachable graph. Register every node before its
         // children so both object cycles and object/exception cycles terminate.
-        let mut objects: HashMap<u32, (usize, Vec<(ValType, Vec<u64>)>)> = HashMap::new();
-        let mut exceptions: HashMap<u32, (u32, Vec<(ValType, Vec<u64>)>)> = HashMap::new();
-        let split = |types: &[ValType], words: &[u64]| -> Result<Vec<(ValType, Vec<u64>)>, Error> {
+        type TransferValues = Vec<(ValType, Vec<u64>)>;
+        let mut objects: HashMap<u32, (usize, TransferValues)> = HashMap::new();
+        let mut exceptions: HashMap<u32, (u32, TransferValues)> = HashMap::new();
+        let split = |types: &[ValType], words: &[u64]| -> Result<TransferValues, Error> {
             let mut offset = 0;
             let mut values = Vec::new();
             for &ty in types {

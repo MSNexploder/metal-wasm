@@ -746,7 +746,10 @@ fn public_exceptions_preserve_vector_and_external_payloads_across_runs() {
         Value::I32(0),
         Value::ExternRef(None),
     ];
-    assert_eq!(kernel.run_values(&[input.clone()]).unwrap()[0], result[0]);
+    assert_eq!(
+        kernel.run_values(std::slice::from_ref(&input)).unwrap()[0],
+        result[0]
+    );
     // Odd memory input widths exercise alignment of the appended exception arena.
     // Enough lanes also force consecutive dispatches with the same retained handle.
     let (returned, memory) = kernel

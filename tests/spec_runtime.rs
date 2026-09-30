@@ -108,37 +108,47 @@ fn matches_core(kernel: &Store, actual: Value, expected: &WastRetCore<'_>) -> bo
         (Value::V128(actual), WastRetCore::V128(pattern)) => match pattern {
             V128Pattern::I8x16(values) => actual.iter().zip(values).all(|(a, b)| *a == *b as u8),
             V128Pattern::I16x8(values) => actual
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .zip(values)
-                .all(|(a, b)| a == b.to_le_bytes()),
+                .all(|(a, b)| *a == b.to_le_bytes()),
             V128Pattern::I32x4(values) => actual
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .zip(values)
-                .all(|(a, b)| a == b.to_le_bytes()),
+                .all(|(a, b)| *a == b.to_le_bytes()),
             V128Pattern::I64x2(values) => actual
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .zip(values)
-                .all(|(a, b)| a == b.to_le_bytes()),
-            V128Pattern::F32x4(values) => actual.chunks_exact(4).zip(values).all(|(a, b)| {
-                let bits = u32::from_le_bytes(a.try_into().unwrap());
-                match b {
-                    NanPattern::Value(v) => bits == v.bits,
-                    NanPattern::CanonicalNan => bits & 0x7fff_ffff == 0x7fc0_0000,
-                    NanPattern::ArithmeticNan => bits & 0x7fc0_0000 == 0x7fc0_0000,
-                }
-            }),
-            V128Pattern::F64x2(values) => actual.chunks_exact(8).zip(values).all(|(a, b)| {
-                let bits = u64::from_le_bytes(a.try_into().unwrap());
-                match b {
-                    NanPattern::Value(v) => bits == v.bits,
-                    NanPattern::CanonicalNan => {
-                        bits & 0x7fff_ffff_ffff_ffff == 0x7ff8_0000_0000_0000
+                .all(|(a, b)| *a == b.to_le_bytes()),
+            V128Pattern::F32x4(values) => {
+                actual.as_chunks::<4>().0.iter().zip(values).all(|(a, b)| {
+                    let bits = u32::from_le_bytes(*a);
+                    match b {
+                        NanPattern::Value(v) => bits == v.bits,
+                        NanPattern::CanonicalNan => bits & 0x7fff_ffff == 0x7fc0_0000,
+                        NanPattern::ArithmeticNan => bits & 0x7fc0_0000 == 0x7fc0_0000,
                     }
-                    NanPattern::ArithmeticNan => {
-                        bits & 0x7ff8_0000_0000_0000 == 0x7ff8_0000_0000_0000
+                })
+            }
+            V128Pattern::F64x2(values) => {
+                actual.as_chunks::<8>().0.iter().zip(values).all(|(a, b)| {
+                    let bits = u64::from_le_bytes(*a);
+                    match b {
+                        NanPattern::Value(v) => bits == v.bits,
+                        NanPattern::CanonicalNan => {
+                            bits & 0x7fff_ffff_ffff_ffff == 0x7ff8_0000_0000_0000
+                        }
+                        NanPattern::ArithmeticNan => {
+                            bits & 0x7ff8_0000_0000_0000 == 0x7ff8_0000_0000_0000
+                        }
                     }
-                }
-            }),
+                })
+            }
         },
         other => panic!("unexpected spec result: {other:?}"),
     }
