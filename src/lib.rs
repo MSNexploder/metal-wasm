@@ -27,6 +27,9 @@ use wasmparser::{
     ValType, Validator,
 };
 
+mod store;
+pub use store::{Instance, Store};
+
 mod gc;
 mod gc_translate;
 use gc::GcRecord;
@@ -49,7 +52,8 @@ pub struct KernelLimits {
     pub memory_growth_pages: usize,
     pub table_growth_elements: usize,
     pub call_depth: usize,
-    /// Maximum immutable exception records allocated during one lane invocation.
+    /// Maximum immutable exception records per lane: one invocation for Kernel,
+    /// or the lifetime of a Store.
     pub exception_records: usize,
     /// Bounded GC heap size in 64-bit words per lane.
     pub gc_heap_words: usize,
@@ -68,8 +72,8 @@ impl Default for KernelLimits {
     }
 }
 
-/// An opaque function identity owned by one compiled kernel.
-/// Handles can be passed back to that kernel, but cannot cross kernel boundaries.
+/// An opaque function identity owned by one kernel or store.
+/// Handles cannot cross owner boundaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FunctionRef {
     kernel: u64,
@@ -77,7 +81,7 @@ pub struct FunctionRef {
     ty: RefType,
 }
 
-/// An opaque host value retained by its kernel until the kernel is dropped.
+/// An opaque host value retained until its kernel or store is dropped.
 /// Metal carries the identity, but cannot access the host value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExternalRef {
@@ -85,7 +89,7 @@ pub struct ExternalRef {
     index: u64,
 }
 
-/// An immutable exception retained by its kernel until the kernel is dropped.
+/// An immutable exception retained until its kernel or store is dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExceptionRef {
     kernel: u64,
@@ -124,13 +128,13 @@ pub enum Value {
     F32(u32),
     F64(u64),
     V128([u8; 16]),
-    /// A nullable function reference obtained from this kernel.
+    /// A nullable function reference obtained from its kernel or store.
     FuncRef(Option<FunctionRef>),
     ExternRef(Option<ExternalRef>),
     ExnRef(Option<ExceptionRef>),
     /// An unboxed 31-bit signed integer reference.
     I31(u32),
-    /// A nullable GC graph snapshot owned by this kernel.
+    /// A nullable kernel snapshot or live store reference.
     GcRef(Option<GcRef>),
 }
 
@@ -200,6 +204,7 @@ pub struct Kernel {
 }
 
 struct Translation {
+    persistent_metadata: Option<store::MetadataLayout>,
     exception_tags: HashMap<String, u32>,
     tag_payload_types: Vec<Vec<ValType>>,
     exception_io: Option<ExceptionIo>,
@@ -327,6 +332,10 @@ impl Kernel {
             return Err(Error::Unsupported("invalid kernel resource limits".into()));
         }
         let translation = translate_with_limits(wasm, export, providers, limits)?;
+        Self::from_translation(translation, limits)
+    }
+
+    fn from_translation(translation: Translation, limits: KernelLimits) -> Result<Self, Error> {
         let device = Device::system_default()
             .ok_or_else(|| Error::Metal("no Metal device is available".into()))?;
         let options = CompileOptions::new();
@@ -2412,12 +2421,11 @@ fn load_dependencies<'a>(
                 modules[index].resolved_imports.push((provider, exported));
             }
             TypeRef::Memory(expected) if kind == ExternalKind::Memory => {
-                let actual = *modules[provider]
-                    .memory_types
-                    .get(exported)
-                    .ok_or_else(|| {
-                        Error::Unsupported("provider memory export is out of range".into())
-                    })?;
+                let (owner, local) = modules[provider].memory_bindings[exported]
+                    .expect("resolved memory definition");
+                let owner = &modules[owner];
+                let imported = owner.memory_types.len() - owner.instance.memories.len();
+                let actual = owner.memory_types[imported + local];
                 if !limits_match(
                     actual.initial,
                     actual.maximum,
@@ -2436,9 +2444,11 @@ fn load_dependencies<'a>(
                 memory_import += 1;
             }
             TypeRef::Table(expected) if kind == ExternalKind::Table => {
-                let actual = *modules[provider].table_types.get(exported).ok_or_else(|| {
-                    Error::Unsupported("provider table export is out of range".into())
-                })?;
+                let (owner, local) =
+                    modules[provider].table_bindings[exported].expect("resolved table definition");
+                let owner = &modules[owner];
+                let imported = owner.table_types.len() - owner.instance.tables.len();
+                let actual = owner.table_types[imported + local];
                 if !limits_match(
                     actual.initial,
                     actual.maximum,
@@ -2562,8 +2572,27 @@ fn translate_with_limits(
         limits,
         &mut context,
     )?;
+    translate_modules(
+        modules,
+        postorder,
+        context.next_tag as usize + 1,
+        0,
+        Some(export_name),
+        limits,
+        false,
+    )
+}
+
+fn translate_modules(
+    mut modules: Vec<ParsedModule<'_>>,
+    postorder: Vec<usize>,
+    tag_count: usize,
+    root: usize,
+    export_name: Option<&str>,
+    limits: KernelLimits,
+    persistent: bool,
+) -> Result<Translation, Error> {
     let mut functions = Vec::new();
-    let tag_count = context.next_tag as usize + 1;
     let mut global_types = Vec::new();
     for (module_index, module) in modules.iter_mut().enumerate() {
         module.resolved_functions = vec![usize::MAX; module.function_types.len()];
@@ -2639,17 +2668,22 @@ fn translate_with_limits(
                             })
                 })
         });
-    let &(kind, local_export) = modules[0]
-        .exports
-        .get(export_name)
-        .ok_or_else(|| Error::Unsupported(format!("export {export_name:?} is not a function")))?;
-    if kind != ExternalKind::Func {
-        return Err(Error::Unsupported(format!(
-            "export {export_name:?} is not a function"
-        )));
-    }
-    let index = modules[0].resolved_functions[local_export];
-    let ty = &global_types[index];
+    let index = if let Some(export_name) = export_name {
+        let &(kind, local) = modules[root].exports.get(export_name).ok_or_else(|| {
+            Error::Unsupported(format!("export {export_name:?} is not a function"))
+        })?;
+        if kind != ExternalKind::Func {
+            return Err(Error::Unsupported(format!(
+                "export {export_name:?} is not a function"
+            )));
+        }
+        Some(modules[root].resolved_functions[local])
+    } else {
+        None
+    };
+    let ty = index
+        .map(|i| global_types[i].clone())
+        .unwrap_or_else(|| FuncType::new([], []));
     if ty
         .params()
         .iter()
@@ -2676,11 +2710,11 @@ fn translate_with_limits(
                 .flat_map(|&t| module.types[t as usize].params().iter().copied())
         }));
     }
-    for &(kind, local) in modules[0].exports.values() {
+    for &(kind, local) in modules[root].exports.values() {
         if kind != ExternalKind::Func {
             continue;
         }
-        let function = modules[0].resolved_functions[local];
+        let function = modules[root].resolved_functions[local];
         let (owner, local) = functions[function];
         let actual = &modules[owner];
         let reference = RefType::new(
@@ -2694,6 +2728,7 @@ fn translate_with_limits(
             referenced.push(function);
         }
     }
+    let wasm_reference_start = referenced.len();
     for module in &mut modules {
         let instance = &mut module.instance;
         for table in &mut instance.tables {
@@ -2757,11 +2792,49 @@ fn translate_with_limits(
             }
         }
     }
+    let mut wasm_referenced = referenced[wasm_reference_start..].to_vec();
+    wasm_referenced.sort_unstable();
+    wasm_referenced.dedup();
+    let mut private_tables: Vec<Vec<bool>> = modules
+        .iter()
+        .map(|module| vec![persistent; module.instance.tables.len()])
+        .collect();
+    if persistent {
+        // An unexported table cannot acquire a new alias in a later instance.
+        // Check every body, including currently unreachable functions, before
+        // excluding host-injected identities from its possible callees.
+        for module in &modules {
+            for &(kind, index) in module.exports.values() {
+                if kind == ExternalKind::Table {
+                    let (owner, local) = module.table_bindings[index].unwrap();
+                    private_tables[owner][local] = false;
+                }
+            }
+            for body in &module.bodies {
+                for operator in body.get_operators_reader()? {
+                    let table = match operator? {
+                        Operator::TableSet { table }
+                        | Operator::TableFill { table }
+                        | Operator::TableInit { table, .. }
+                        | Operator::TableGrow { table } => table,
+                        Operator::TableCopy { dst_table, .. } => dst_table,
+                        _ => continue,
+                    };
+                    let (owner, local) = module.table_bindings[table as usize].unwrap();
+                    private_tables[owner][local] = false;
+                }
+            }
+        }
+        referenced.extend(0..functions.len());
+    }
     referenced.sort_unstable();
     referenced.dedup();
     let starts: Vec<_> = postorder
         .iter()
         .filter_map(|&module| {
+            if persistent && (export_name.is_some() || module != root) {
+                return None;
+            }
             modules[module]
                 .start_index
                 .map(|local| modules[module].resolved_functions[local])
@@ -2796,7 +2869,7 @@ fn translate_with_limits(
             .map(|module| vec![false; module.instance.memories.len()])
             .collect();
         let mut ignored_recursion = false;
-        for function in std::iter::once(&index).chain(&starts) {
+        for function in index.iter().chain(&starts) {
             visit_function(
                 *function,
                 &modules,
@@ -2813,6 +2886,14 @@ fn translate_with_limits(
             .map(|module| vec![false; module.instance.tables.len()])
             .collect();
         let mut grows = mutates.clone();
+        if persistent {
+            for row in &mut mutates {
+                row.fill(true);
+            }
+            for row in &mut grows {
+                row.fill(true);
+            }
+        }
         for module in &modules {
             for &(_, table_index, _) in &module.active_elements {
                 let (owner, local) = module.table_bindings[table_index].unwrap();
@@ -2860,7 +2941,13 @@ fn translate_with_limits(
                 if mutates[module_index][table_index] && !table.info.mutable {
                     table.info.mutable = true;
                     if table.function_refs {
-                        table.targets = referenced.clone();
+                        // Lane storage stays mutable. A private table with no
+                        // Wasm writes can only contain initializer references.
+                        table.targets = if private_tables[module_index][table_index] {
+                            wasm_referenced.clone()
+                        } else {
+                            referenced.clone()
+                        };
                     }
                     changed = true;
                 }
@@ -2889,19 +2976,12 @@ fn translate_with_limits(
         .iter()
         .map(|module| vec![false; module.instance.memories.len()])
         .collect();
-    visit_function(
-        index,
-        &modules,
-        &functions,
-        &mut visit_state,
-        &mut order,
-        &mut can_trap,
-        &mut uses_growth,
-        &mut recursive,
-    )?;
-    for &start in &starts {
+    // Persisted resources have whole-instance capacities, while a pipeline only
+    // needs this entry and its possible callees. Provider starts already ran.
+    let entries = index.iter().copied().chain(starts.iter().copied());
+    for entry in entries {
         visit_function(
-            start,
+            entry,
             &modules,
             &functions,
             &mut visit_state,
@@ -2940,11 +3020,13 @@ fn translate_with_limits(
         let growth_budget_pages = (limits.memory_bytes - initial_total) / 65536;
         for (memory_index, memory) in instance.memories.iter_mut().enumerate() {
             let initial_pages = memory.bytes.len() / 65536;
-            let wanted = initial_pages.saturating_add(if uses_growth[module_index][memory_index] {
-                limits.memory_growth_pages
-            } else {
-                0
-            });
+            let wanted = initial_pages.saturating_add(
+                if persistent || uses_growth[module_index][memory_index] {
+                    limits.memory_growth_pages
+                } else {
+                    0
+                },
+            );
             let max_pages = memory.max_pages.unwrap_or(u64::MAX).min(usize::MAX as u64) as usize;
             let extra_pages = wanted
                 .min(max_pages)
@@ -2997,7 +3079,16 @@ fn translate_with_limits(
         next_slot += 1;
         can_trap = true;
     }
-    if next_slot > 31 {
+    let persistent_slot = persistent.then_some(6);
+    if persistent {
+        can_trap = true;
+    }
+    if persistent {
+        if let Some(gc) = &mut gc {
+            gc.slot = 5;
+        }
+    }
+    if !persistent && next_slot > 31 {
         return Err(Error::Unsupported(
             "linked module state exceeds Metal's 31 buffer slots".into(),
         ));
@@ -3058,12 +3149,13 @@ fn translate_with_limits(
             .results()
             .iter()
             .any(|ty| matches!(ty, ValType::Ref(ty) if is_exception_ref(*ty)));
-    let exception_io = (needs_exception_input || needs_exception_output).then_some(ExceptionIo {
-        records: limits.exception_records,
-        payload_words: exception_payload_words,
-        input: needs_exception_input,
-        output: needs_exception_output,
-    });
+    let exception_io = (!persistent && (needs_exception_input || needs_exception_output))
+        .then_some(ExceptionIo {
+            records: limits.exception_records,
+            payload_words: exception_payload_words,
+            input: needs_exception_input,
+            output: needs_exception_output,
+        });
     if exceptions {
         let words = exception_payload_words;
         source.push_str(&format!("constant uint EXCEPTION_RECORDS = {}u; constant uint EXCEPTION_WORDS = {words}u;\nstruct ExceptionState {{ uint pending; uint count; uint tags[{}]; ulong values[{}]; }};\n", limits.exception_records, limits.exception_records, limits.exception_records.checked_mul(words).ok_or_else(|| Error::Unsupported("exception arena size overflow".into()))?));
@@ -3076,7 +3168,7 @@ fn translate_with_limits(
     };
     source.push_str(&format!("struct ModuleState {{ {exception_field} {gc_field} device uchar* memory[{max_memories}]; device uint* pages[{max_memories}]; device ulong* globals; device ulong* table[{max_tables}]; device const uchar* passive_data; uint table_size[{max_tables}]; thread uint* element_lengths; thread uint* data_lengths; thread ulong* element_values[{max_elements}]; }};\n"));
     if uses_gc {
-        source.push_str(&gc_type_source(&gc_types, &modules));
+        source.push_str(&gc_type_source(&gc_types, &modules, persistent));
     }
     if tail_calls {
         let max_args = order
@@ -3173,23 +3265,27 @@ fn translate_with_limits(
     if can_trap {
         source.push_str(", device uint* traps [[buffer(3)]]");
     }
-    for (module_index, slot) in slots.iter().enumerate() {
-        for (index, &(memory, pages)) in slot.memories.iter().enumerate() {
-            source.push_str(&format!(", device uchar* m{module_index}_memory{index} [[buffer({memory})]], device uint* m{module_index}_pages{index} [[buffer({pages})]]"));
-        }
-        for (index, &table) in slot.tables.iter().enumerate() {
-            source.push_str(&format!(
-                ", device ulong* m{module_index}_table{index} [[buffer({table})]]"
-            ));
-        }
-        for (slot, ty, field) in [
-            (slot.globals, "ulong", "globals"),
-            (slot.passive_data, "const uchar", "passive_data"),
-        ] {
-            if let Some(slot) = slot {
+    if persistent {
+        source.push_str(", device uchar* resource_buffer [[buffer(4)]]");
+    } else {
+        for (module_index, slot) in slots.iter().enumerate() {
+            for (index, &(memory, pages)) in slot.memories.iter().enumerate() {
+                source.push_str(&format!(", device uchar* m{module_index}_memory{index} [[buffer({memory})]], device uint* m{module_index}_pages{index} [[buffer({pages})]]"));
+            }
+            for (index, &table) in slot.tables.iter().enumerate() {
                 source.push_str(&format!(
-                    ", device {ty}* m{module_index}_{field} [[buffer({slot})]]"
+                    ", device ulong* m{module_index}_table{index} [[buffer({table})]]"
                 ));
+            }
+            for (slot, ty, field) in [
+                (slot.globals, "ulong", "globals"),
+                (slot.passive_data, "const uchar", "passive_data"),
+            ] {
+                if let Some(slot) = slot {
+                    source.push_str(&format!(
+                        ", device {ty}* m{module_index}_{field} [[buffer({slot})]]"
+                    ));
+                }
             }
         }
     }
@@ -3199,13 +3295,26 @@ fn translate_with_limits(
             layout.slot
         ));
     }
+    if let Some(slot) = persistent_slot {
+        source.push_str(&format!(
+            ", device ulong* persistent_state [[buffer({slot})]]"
+        ));
+    }
     source.push_str(
         ", uint id [[thread_position_in_grid]]) {\nulong count = config[0];\nif (id >= count) return;\nuint trap = 0u;\n",
     );
+    if persistent {
+        source.push_str(&store::resource_source(&modules));
+    }
     source.push_str(&format!("ModuleState states[{}] = {{}};\n", modules.len()));
     if let Some(layout) = gc {
-        let stride = layout.heap_words + layout.root_words;
-        source.push_str(&format!("GcState gc = {{ gc_buffer + ulong(id) * {stride}ul, {}u, gc_buffer + ulong(id) * {stride}ul + {}ul, {}u, 0u, states }};\nGcRootFrame init_frame(gc, {init_roots}u, trap);\n", layout.heap_words, layout.heap_words, layout.root_words));
+        let stride = layout.heap_words
+            + layout.root_words
+            + if persistent { layout.heap_words + 1 } else { 0 };
+        source.push_str(&format!("GcState gc = {{ gc_buffer + ulong(id) * {stride}ul, {}u, gc_buffer + ulong(id) * {stride}ul + {}ul, {}u, 0u, states, nullptr, 0u }};\nGcRootFrame init_frame(gc, {init_roots}u, trap);\n", layout.heap_words, layout.heap_words, layout.root_words));
+        if persistent {
+            source.push_str(&format!("gc.host_roots = gc_buffer + ulong(id)*{stride}ul + {}ul; gc.host_count = uint(gc.host_roots[{}]);\n", layout.heap_words + layout.root_words, layout.heap_words));
+        }
         for m in 0..modules.len() {
             source.push_str(&format!("states[{m}].gc = &gc;\n"));
         }
@@ -3263,6 +3372,15 @@ fn translate_with_limits(
             ));
         }
     }
+    let metadata = persistent.then(|| {
+        store::MetadataLayout::new(
+            &modules,
+            exceptions.then_some((limits.exception_records, exception_payload_words)),
+        )
+    });
+    if let Some(layout) = &metadata {
+        source.push_str(&layout.load_source());
+    }
     let mut args = Vec::new();
     let param_words: usize = ty.params().iter().map(|ty| value_words(*ty)).sum();
     let result_words: usize = ty.results().iter().map(|ty| value_words(*ty)).sum();
@@ -3318,6 +3436,9 @@ fn translate_with_limits(
         }
     }
     for &module_index in &postorder {
+        if persistent && (export_name.is_some() || module_index != root) {
+            continue;
+        }
         let module = &modules[module_index];
         for (slot, ty, expr) in &module.dynamic_globals {
             let value = const_source(expr, module, uses_gc)?;
@@ -3394,50 +3515,55 @@ fn translate_with_limits(
             "for(uint j=0u;j<{init_roots}u;++j) gc.roots[j]=0ul;\n"
         ));
     }
-    if !modules[0].memory_bindings.is_empty() {
+    if !modules[root].memory_bindings.is_empty() {
         let argument_bytes = param_words * if fast_i32 { 4 } else { 8 };
         source.push_str(&format!("if (config[2] != 0ul && {ready}) {{\n device const uchar* memory_input = reinterpret_cast<device const uchar*>(input) + count * {argument_bytes}ul + ulong(id) * config[2];\n"));
-        for (owner, local) in modules[0].memory_bindings.iter().flatten() {
+        for (owner, local) in modules[root].memory_bindings.iter().flatten() {
             source.push_str(&format!("if (config[3] == {owner}ul && config[4] == {local}ul) for (ulong j = 0ul; j < config[2]; ++j) states[{owner}].memory[{local}][config[1] + j] = memory_input[j];\n"));
         }
         source.push_str("}\n");
     }
-    if tail_calls {
-        source.push_str(&format!(
-            "ulong top_args[{}] = {{}}; ulong top_results[{}] = {{}};\n",
-            param_words.max(1),
-            result_words.max(1)
-        ));
-        let mut word = 0;
-        for (arg, ty) in args.iter().take(ty.params().len()).zip(ty.params()) {
-            if *ty == ValType::V128 {
-                source.push_str(&format!(
-                    "top_args[{word}] = ({arg}).x; top_args[{}] = ({arg}).y;\n",
-                    word + 1
-                ));
-            } else {
-                source.push_str(&format!("top_args[{word}] = {arg};\n"));
+    if let Some(index) = index {
+        if tail_calls {
+            source.push_str(&format!(
+                "ulong top_args[{}] = {{}}; ulong top_results[{}] = {{}};\n",
+                param_words.max(1),
+                result_words.max(1)
+            ));
+            let mut word = 0;
+            for (arg, ty) in args.iter().take(ty.params().len()).zip(ty.params()) {
+                if *ty == ValType::V128 {
+                    source.push_str(&format!(
+                        "top_args[{word}] = ({arg}).x; top_args[{}] = ({arg}).y;\n",
+                        word + 1
+                    ));
+                } else {
+                    source.push_str(&format!("top_args[{word}] = {arg};\n"));
+                }
+                word += value_words(*ty);
             }
-            word += value_words(*ty);
-        }
-        source.push_str(&format!(
-            "if ({ready}) invoke({index}u, top_args, top_results, states, trap, 0u);\n"
-        ));
-        let mut word = 0;
-        for (result, ty) in ty.results().iter().enumerate() {
-            if *ty == ValType::V128 {
-                source.push_str(&format!(
-                    "result{result} = ulong2(top_results[{word}], top_results[{}]);\n",
-                    word + 1
-                ));
-            } else {
-                source.push_str(&format!("result{result} = top_results[{word}];\n"));
+            source.push_str(&format!(
+                "if ({ready}) invoke({index}u, top_args, top_results, states, trap, 0u);\n"
+            ));
+            let mut word = 0;
+            for (result, ty) in ty.results().iter().enumerate() {
+                if *ty == ValType::V128 {
+                    source.push_str(&format!(
+                        "result{result} = ulong2(top_results[{word}], top_results[{}]);\n",
+                        word + 1
+                    ));
+                } else {
+                    source.push_str(&format!("result{result} = top_results[{word}];\n"));
+                }
+                word += value_words(*ty);
             }
-            word += value_words(*ty);
+        } else {
+            args.push(context.into());
+            source.push_str(&format!("if ({ready}) f{index}({});\n", args.join(", ")));
         }
-    } else {
-        args.push(context.into());
-        source.push_str(&format!("if ({ready}) f{index}({});\n", args.join(", ")));
+    }
+    if let Some(layout) = &metadata {
+        source.push_str(&layout.save_source());
     }
     if exceptions {
         source.push_str("if (trap == 0u && exceptions.pending != 0u) trap = 11u;\n");
@@ -3465,12 +3591,12 @@ fn translate_with_limits(
         source.push_str(&format!("device ulong* exception_output = output + count * {result_words}ul + ulong(id) * {stride}ul;\nexception_output[0] = exceptions.count;\nfor (uint j = 0u; j < exceptions.count; ++j) {{ exception_output[1ul + ulong(j) * {record_words}ul] = exceptions.tags[j]; for (uint k = 0u; k < EXCEPTION_WORDS; ++k) exception_output[2ul + ulong(j) * {record_words}ul + k] = exceptions.values[j * EXCEPTION_WORDS + k]; }}\n"));
     }
     source.push_str("}\n");
-    let memory_exports = modules[0]
+    let memory_exports = modules[root]
         .exports
         .iter()
         .filter_map(|(name, &(kind, index))| {
             (kind == ExternalKind::Memory)
-                .then(|| (name.clone(), modules[0].memory_bindings[index].unwrap()))
+                .then(|| (name.clone(), modules[root].memory_bindings[index].unwrap()))
         })
         .collect();
     let function_reference_types = functions
@@ -3485,14 +3611,14 @@ fn translate_with_limits(
             .unwrap()
         })
         .collect();
-    let exported_functions = modules[0]
+    let exported_functions = modules[root]
         .exports
         .iter()
         .filter_map(|(name, &(kind, local))| {
             (kind == ExternalKind::Func).then(|| {
                 (
                     name.clone(),
-                    modules[0].resolved_functions[local] as u32 + 1,
+                    modules[root].resolved_functions[local] as u32 + 1,
                 )
             })
         })
@@ -3501,11 +3627,11 @@ fn translate_with_limits(
         .iter()
         .flat_map(|m| m.supertypes.iter().map(|(&id, &parent)| (id, parent)))
         .collect();
-    let exception_tags = modules[0]
+    let exception_tags = modules[root]
         .exports
         .iter()
         .filter_map(|(name, &(kind, local))| {
-            (kind == ExternalKind::Tag).then(|| (name.clone(), modules[0].tag_bindings[local]))
+            (kind == ExternalKind::Tag).then(|| (name.clone(), modules[root].tag_bindings[local]))
         })
         .collect();
     let mut tag_payload_types = vec![Vec::new(); tag_count];
@@ -3515,6 +3641,7 @@ fn translate_with_limits(
         }
     }
     Ok(Translation {
+        persistent_metadata: metadata,
         exception_tags,
         tag_payload_types,
         exception_io,

@@ -15,6 +15,8 @@ struct GcState {
     uint root_capacity;
     uint root_top;
     thread ModuleState* states;
+    device ulong* host_roots;
+    uint host_count;
 };
 
 // Generated from the module types and instance state, after ModuleState is

@@ -6,8 +6,9 @@ const FOREIGN_TAG: u64 = 0x200000000;
 const OBJECT_TAG: u64 = 0x300000000;
 const ALLOCATED: u64 = 1 << 63;
 
-/// A kernel-owned snapshot of a GC reference. Passing it into an invocation
-/// copies its reachable object graph into that lane, preserving aliases and cycles.
+/// A GC reference owned by one kernel or store.
+/// Kernel invocations copy the retained graph, preserving aliases and cycles.
+/// Store references retain the live object and belong to the originating lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GcRef {
     pub(super) kernel: u64,

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use metal_wasm::{Error, Kernel, KernelLimits, Value};
+use metal_wasm::{Error, ExternalRef, Instance, KernelLimits, Store, Value};
 use wast::core::{NanPattern, V128Pattern, WastArgCore, WastRetCore};
 use wast::lexer::{Lexer, TokenKind};
 use wast::parser::{self, ParseBuffer};
@@ -51,14 +51,14 @@ fn arg(value: &WastArg<'_>) -> SpecArg {
     SpecArg::Value(value)
 }
 
-fn matches_result(kernel: &Kernel, actual: Value, expected: &WastRet<'_>) -> bool {
+fn matches_result(kernel: &Store, actual: Value, expected: &WastRet<'_>) -> bool {
     match expected {
         WastRet::Core(expected) => matches_core(kernel, actual, expected),
         other => panic!("unexpected spec result: {other:?}"),
     }
 }
 
-fn matches_core(kernel: &Kernel, actual: Value, expected: &WastRetCore<'_>) -> bool {
+fn matches_core(kernel: &Store, actual: Value, expected: &WastRetCore<'_>) -> bool {
     match (actual, expected) {
         (
             Value::FuncRef(None)
@@ -144,231 +144,125 @@ fn matches_core(kernel: &Kernel, actual: Value, expected: &WastRetCore<'_>) -> b
     }
 }
 
-fn invoke(
-    call: WastInvoke<'_>,
-    module: &[u8],
-    kernels: &mut HashMap<String, Kernel>,
-    providers: &HashMap<String, Vec<u8>>,
-    sequence: Option<(&str, &[(String, Vec<SpecArg>)])>,
-) -> Result<Vec<Vec<Value>>, Error> {
-    assert!(
-        call.module.is_none(),
-        "named invocations require a module cache key"
-    );
-    let mut wrapped = None;
-    let (export, inputs) = if let Some((text, history)) = sequence {
-        let (bytes, inputs) = sequence_module(text, module, history, &call);
-        wrapped = Some(bytes);
-        kernels.clear();
-        ("__spec_sequence", inputs)
-    } else {
-        (call.name, call.args.iter().map(arg).collect())
-    };
-    let module = wrapped.as_deref().unwrap_or(module);
-    if !kernels.contains_key(export) {
-        let imports = spec_imports(providers);
-        let kernel = Kernel::new_with_imports_and_limits(
-            module,
-            export,
-            &imports,
-            KernelLimits {
-                call_depth: 256,
-                table_growth_elements: 65_536,
-                ..KernelLimits::default()
-            },
-        )?;
-        kernels.insert(export.to_owned(), kernel);
-    }
-    let kernel = &kernels[export];
-    let mut external = HashMap::new();
-    let inputs: Result<Vec<_>, Error> = inputs
-        .into_iter()
-        .map(|arg| match arg {
-            SpecArg::Value(value) => Ok(value),
-            SpecArg::External(id) | SpecArg::Host(id) => {
-                let handle = if let Some(handle) = external.get(&id) {
-                    *handle
-                } else {
-                    let handle = kernel.external_reference(id)?;
-                    external.insert(id, handle);
-                    handle
-                };
-                if matches!(arg, SpecArg::Host(_)) {
-                    kernel.internalize_reference(Some(handle))
-                } else {
-                    Ok(Value::ExternRef(Some(handle)))
-                }
-            }
-        })
-        .collect();
-    kernel.run_values(&[inputs?])
+// Script identities and resources belong to one persistent Store. Registrations
+// retain the actual instance, including its state after trapping actions.
+struct ScriptState {
+    store: Store,
+    current: Option<Instance>,
+    named: HashMap<String, Instance>,
+    definitions: HashMap<String, Vec<u8>>,
+    last_definition: Option<Vec<u8>>,
+    providers: HashMap<String, Instance>,
+    external: HashMap<u32, ExternalRef>,
 }
 
-// Replay successful actions in one lane to test scripts with persistent state.
-// The production API continues to create independent instances per invocation.
-fn module_text(source: &str, offset: usize) -> &str {
-    let start = source[..=offset].rfind('(').unwrap();
-    let mut depth = 0;
-    for token in Lexer::new(source).iter(start) {
-        let token = token.unwrap();
-        match token.kind {
-            TokenKind::LParen => depth += 1,
-            TokenKind::RParen => {
-                depth -= 1;
-                if depth == 0 {
-                    return &source[start..token.offset + token.len as usize];
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unterminated module");
-}
-
-fn sequence_module(
-    text: &str,
-    bytes: &[u8],
-    history: &[(String, Vec<SpecArg>)],
-    call: &WastInvoke<'_>,
-) -> (Vec<u8>, Vec<SpecArg>) {
-    use wasmparser::{
-        CompositeInnerType, ExternalKind, HeapType, Parser, Payload, ValType, Validator,
-    };
-    let validated = Validator::new().validate_all(bytes).unwrap();
-    let validated = validated.as_ref();
-    let mut exports = HashMap::new();
-    for payload in Parser::new(0).parse_all(bytes) {
-        if let Payload::ExportSection(section) = payload.unwrap() {
-            for export in section {
-                let export = export.unwrap();
-                if export.kind == ExternalKind::Func {
-                    exports.insert(export.name, export.index);
-                }
-            }
-        }
-    }
-    let result_types = |name: &str| match &validated[validated.core_function_at(exports[name])]
-        .composite_type
-        .inner
-    {
-        CompositeInnerType::Func(ty) => ty.results().to_vec(),
-        _ => unreachable!(),
-    };
-    let results = result_types(call.name);
-    let mut source = text[..text.len() - 1].to_owned();
-    source.push_str(" (func (export \"__spec_sequence\")");
-    let actions: Vec<_> = history
-        .iter()
-        .map(|(name, args)| (name.as_str(), args.clone(), true))
-        .chain(std::iter::once((
-            call.name,
-            call.args.iter().map(arg).collect(),
-            false,
-        )))
-        .collect();
-    let mut external = HashMap::new();
-    let mut inputs = Vec::new();
-    for (_, args, _) in &actions {
-        for arg in args {
-            if let SpecArg::External(id) | SpecArg::Host(id) = arg {
-                external.entry(*id).or_insert_with(|| {
-                    let index = inputs.len();
-                    inputs.push(SpecArg::External(*id));
-                    source.push_str(" (param (ref extern))");
-                    index
-                });
-            }
+impl ScriptState {
+    fn new(limits: KernelLimits) -> Self {
+        let mut store = Store::new_with_limits(1, limits).unwrap();
+        let spectest = SPECTEST.get_or_init(|| {
+            wat::parse_str(
+                r#"(module
+            (func (export "print"))
+            (func (export "print_i32") (param i32))
+            (func (export "print_i64") (param i64))
+            (func (export "print_f32") (param f32))
+            (func (export "print_f64") (param f64))
+            (func (export "print_i32_f32") (param i32 f32))
+            (func (export "print_f64_f64") (param f64 f64))
+            (global (export "global_i32") i32 (i32.const 666))
+            (global (export "global_i64") i64 (i64.const 666))
+            (global (export "global_f32") f32 (f32.const 666.6))
+            (global (export "global_f64") f64 (f64.const 666.6))
+            (table (export "table") 10 20 funcref)
+            (table (export "table64") i64 10 20 funcref)
+            (memory (export "memory") 1 2))"#,
+            )
+            .unwrap()
+        });
+        let provider = store.instantiate(spectest, &[]).unwrap();
+        Self {
+            store,
+            current: None,
+            named: HashMap::new(),
+            definitions: HashMap::new(),
+            last_definition: None,
+            providers: HashMap::from([("spectest".into(), provider)]),
+            external: HashMap::new(),
         }
     }
 
-    if !results.is_empty() {
-        source.push_str(&format!(
-            " (result {})",
-            results
-                .iter()
-                .map(|ty| match ty {
-                    ValType::Ref(reference) => match reference.heap_type() {
-                        HeapType::Concrete(id) => {
-                            let module_index = (0..validated.core_type_count_in_module())
-                                .find(|index| {
-                                    validated.core_type_at_in_module(*index)
-                                        == id.as_core_type_id().unwrap()
-                                })
-                                .unwrap();
-                            format!(
-                                "(ref {}{module_index})",
-                                if reference.is_nullable() { "null " } else { "" }
-                            )
-                        }
-                        _ => ty.to_string(),
-                    },
-                    _ => ty.to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        ));
+    fn selected(&self, name: Option<wast::token::Id<'_>>) -> Instance {
+        name.map(|id| *self.named.get(id.name()).expect("unknown instance"))
+            .unwrap_or_else(|| self.current.expect("no current instance"))
     }
-    for (name, args, discard) in actions {
-        for value in args {
-            source.push_str(&match value {
-                SpecArg::External(id) => format!(" local.get {}", external[&id]),
-                SpecArg::Host(id) => {
-                    format!(" local.get {} any.convert_extern", external[&id])
-                }
-                SpecArg::Value(Value::I32(bits)) => format!(" i32.const {}", bits as i32),
-                SpecArg::Value(Value::I64(bits)) => format!(" i64.const {}", bits as i64),
-                SpecArg::Value(Value::F32(bits)) => {
-                    format!(" i32.const {} f32.reinterpret_i32", bits as i32)
-                }
-                SpecArg::Value(Value::F64(bits)) => {
-                    format!(" i64.const {} f64.reinterpret_i64", bits as i64)
-                }
-                SpecArg::Value(Value::FuncRef(None)) => " ref.null nofunc".into(),
-                SpecArg::Value(Value::ExternRef(None)) => " ref.null noextern".into(),
-                SpecArg::Value(Value::ExnRef(None)) => " ref.null noexn".into(),
-                SpecArg::Value(Value::GcRef(None)) => " ref.null none".into(),
-                _ => {
-                    panic!("sequence arguments must be scalar numbers or null function references")
+
+    fn instantiate(&mut self, bytes: &[u8]) -> Result<Instance, Error> {
+        let imports: Vec<_> = self
+            .providers
+            .iter()
+            .map(|(name, &instance)| (name.as_str(), instance))
+            .collect();
+        self.store.instantiate(bytes, &imports)
+    }
+
+    fn invoke(&mut self, call: WastInvoke<'_>) -> Result<Vec<Vec<Value>>, Error> {
+        let instance = self.selected(call.module);
+        let mut inputs = Vec::new();
+        for argument in &call.args {
+            inputs.push(match arg(argument) {
+                SpecArg::Value(value) => value,
+                SpecArg::External(id) | SpecArg::Host(id) => {
+                    let handle = if let Some(&handle) = self.external.get(&id) {
+                        handle
+                    } else {
+                        let handle = self.store.external_reference(id)?;
+                        self.external.insert(id, handle);
+                        handle
+                    };
+                    if matches!(arg(argument), SpecArg::Host(_)) {
+                        self.store.internalize_reference(Some(handle))?
+                    } else {
+                        Value::ExternRef(Some(handle))
+                    }
                 }
             });
         }
-        source.push_str(&format!(" call {}", exports[name]));
-        if discard {
-            for _ in result_types(name) {
-                source.push_str(" drop");
+        self.store.call(instance, call.name, &[inputs])
+    }
+
+    fn execute(&mut self, action: WastExecute<'_>) -> Result<Vec<Vec<Value>>, Error> {
+        match action {
+            WastExecute::Invoke(call) => self.invoke(call),
+            WastExecute::Get { module, global, .. } => {
+                let instance = self.selected(module);
+                Ok(self
+                    .store
+                    .get_global(instance, global)?
+                    .into_iter()
+                    .map(|v| vec![v])
+                    .collect())
+            }
+            WastExecute::Wat(mut module) => {
+                self.instantiate(&module.encode().unwrap())?;
+                Ok(vec![vec![]])
             }
         }
     }
-    source.push_str("))");
-    (wat::parse_str(source).unwrap(), inputs)
-}
-
-fn spec_imports(providers: &HashMap<String, Vec<u8>>) -> Vec<(&str, &[u8])> {
-    let mut imports: Vec<_> = providers
-        .iter()
-        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
-        .collect();
-    if !providers.contains_key("spectest") {
-        let spectest = SPECTEST.get_or_init(|| wat::parse_str("(module (func (export \"print_i32_f32\") (param i32 f32)) (global (export \"global_i32\") i32 (i32.const 666)) (table (export \"table\") 10 20 funcref) (table (export \"table64\") i64 10 20 funcref))").unwrap());
-        imports.push(("spectest", spectest));
-    }
-    imports
-}
-
-// Translation resolves imports before looking up an export. A missing sentinel
-// export lets module-only directives check validation and linking without a GPU dispatch.
-fn assert_links(bytes: &[u8], providers: &HashMap<String, Vec<u8>>) {
-    let imports = spec_imports(providers);
-    let actual = Kernel::new_with_imports(bytes, "__invalid_spec_export", &imports);
-    assert!(
-        matches!(actual, Err(Error::Unsupported(ref reason)) if reason == "export \"__invalid_spec_export\" is not a function"),
-        "valid module failed validation or linking: {:?}",
-        actual.err()
-    );
 }
 
 fn check_script(source: &str, minimum_assertions: usize) {
-    check_script_mode(source, minimum_assertions, false);
+    check_script_with_limits(
+        source,
+        minimum_assertions,
+        KernelLimits {
+            memory_growth_pages: 8,
+            call_depth: 32,
+            table_growth_elements: 65_536,
+            exception_records: 512,
+            gc_heap_words: 4096,
+            ..KernelLimits::default()
+        },
+    );
 }
 
 // Parse directives separately because some upstream invalid modules use syntax
@@ -400,17 +294,12 @@ fn directive_sources(source: &str) -> Vec<(usize, &str)> {
     directives
 }
 
-fn check_script_mode(source: &str, minimum_assertions: usize, replay: bool) {
+fn check_script_with_limits(source: &str, minimum_assertions: usize, limits: KernelLimits) {
     // Concurrent Metal compilation and execution can exhaust this device's resources.
     let _gpu_lock = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let mut module = None;
-    let mut kernels = HashMap::new();
-    let mut providers = HashMap::new();
-    let mut named_modules = HashMap::new();
+    let mut state = ScriptState::new(limits);
     let mut checked = 0;
     let mut validation_cases = 0;
-    let mut text = None;
-    let mut history: Vec<(String, Vec<SpecArg>)> = Vec::new();
     for (offset, directive_source) in directive_sources(source) {
         let buffer = ParseBuffer::new(directive_source).unwrap();
         let mut script = match parser::parse::<Wast<'_>>(&buffer) {
@@ -427,142 +316,126 @@ fn check_script_mode(source: &str, minimum_assertions: usize, replay: bool) {
         };
         assert_eq!(script.directives.len(), 1);
         let directive = script.directives.pop().unwrap();
+        let line = source[..offset].lines().count() + 1;
+        let context = format!("line {line}: {directive:?}");
         match directive {
             WastDirective::ModuleDefinition(mut wat) => {
+                let name = wat.name().map(|id| id.name().to_owned());
                 let bytes = wat.encode().unwrap();
                 wasmparser::Validator::new().validate_all(&bytes).unwrap();
+                if let Some(name) = name {
+                    state.definitions.insert(name, bytes.clone());
+                }
+                state.last_definition = Some(bytes);
                 validation_cases += 1;
             }
             WastDirective::Module(mut wat) => {
-                kernels.clear();
-                history.clear();
-                text = replay.then(|| module_text(source, offset + wat.span().offset()));
                 let name = wat.name().map(|id| id.name().to_owned());
                 let bytes = wat.encode().unwrap();
-                assert_links(&bytes, &providers);
+                let instance = state
+                    .instantiate(&bytes)
+                    .unwrap_or_else(|error| panic!("{context}: {error}"));
                 if let Some(name) = name {
-                    named_modules.insert(name, bytes.clone());
+                    state.named.insert(name, instance);
                 }
-                module = Some(bytes);
+                state.current = Some(instance);
+                validation_cases += 1;
             }
-            WastDirective::AssertReturn {
-                exec: WastExecute::Invoke(call),
-                results,
-                ..
+            WastDirective::ModuleInstance {
+                instance, module, ..
             } => {
-                let action = (call.name.to_owned(), call.args.iter().map(arg).collect());
-                let export = if replay { "__spec_sequence" } else { call.name };
-                let line = source[..offset].lines().count() + 1;
-                let invocation = format!("line {line}: {call:?}");
-                let actual = invoke(
-                    call,
-                    module.as_deref().unwrap(),
-                    &mut kernels,
-                    &providers,
-                    text.map(|text| (text, history.as_slice())),
-                );
-
-                let actual = actual.unwrap_or_else(|error| panic!("{invocation}: {error}"));
-                assert_eq!(actual.len(), 1);
-                assert_eq!(actual[0].len(), results.len());
+                let bytes = module
+                    .map(|id| state.definitions.get(id.name()).unwrap())
+                    .unwrap_or_else(|| state.last_definition.as_ref().unwrap())
+                    .clone();
+                let handle = state
+                    .instantiate(&bytes)
+                    .unwrap_or_else(|error| panic!("{context}: {error}"));
+                if let Some(instance) = instance {
+                    state.named.insert(instance.name().into(), handle);
+                }
+                state.current = Some(handle);
+                validation_cases += 1;
+            }
+            WastDirective::AssertReturn { exec, results, .. } => {
+                let actual = state
+                    .execute(exec)
+                    .unwrap_or_else(|error| panic!("{context}: {error}"));
+                assert_eq!(actual.len(), 1, "{context}");
+                assert_eq!(actual[0].len(), results.len(), "{context}");
                 for (value, expected) in actual[0].iter().zip(&results) {
                     assert!(
-                        matches_result(&kernels[export], *value, expected),
-                        "{invocation}: expected {expected:?}, got {value:?}"
+                        matches_result(&state.store, *value, expected),
+                        "{context}: expected {expected:?}, got {value:?}"
                     );
-                }
-                if replay {
-                    history.push(action);
                 }
                 checked += 1;
             }
-            WastDirective::AssertTrap {
-                exec: WastExecute::Invoke(call),
-                message,
-                ..
-            } => {
-                let actual = invoke(
-                    call,
-                    module.as_deref().unwrap(),
-                    &mut kernels,
-                    &providers,
-                    text.map(|text| (text, history.as_slice())),
-                );
-
+            WastDirective::AssertTrap { exec, message, .. } => {
+                let actual = state.execute(exec);
                 assert!(
                     matches!(actual, Err(Error::Trap { input_index: 0, reason })
-                        if reason == message || (matches!(message, "null i31 reference" | "null struct reference" | "null structure reference" | "null array reference") && reason == "null reference") || ((message == "unreachable" || message == "unreachable executed") && reason == "unreachable executed") || ((message == "undefined element" || message == "uninitialized element")
-                            && reason == "undefined or uninitialized table element")),
-                    "expected trap {message:?}, got {actual:?}"
+                    if reason == message
+                        || (matches!(message, "null i31 reference" | "null struct reference" | "null structure reference" | "null array reference") && reason == "null reference")
+                        || ((message == "unreachable" || message == "unreachable executed") && reason == "unreachable executed")
+                        || ((message.starts_with("undefined element") || message.starts_with("uninitialized element")) && reason == "undefined or uninitialized table element")),
+                    "{context}: expected trap {message:?}, got {actual:?}"
+                );
+                checked += 1;
+            }
+            WastDirective::AssertExhaustion { call, .. } => {
+                let actual = state.invoke(call);
+                assert!(
+                    matches!(
+                        actual,
+                        Err(Error::Trap {
+                            input_index: 0,
+                            reason: "call depth limit exceeded"
+                        })
+                    ),
+                    "{context}: expected stack exhaustion, got {actual:?}"
                 );
                 checked += 1;
             }
             WastDirective::Invoke(call) => {
-                assert!(replay, "stateful invoke requires replay mode");
-                let action = (call.name.to_owned(), call.args.iter().map(arg).collect());
-                let line = source[..offset].lines().count() + 1;
-                let invocation = format!("line {line}: {call:?}");
-                invoke(
-                    call,
-                    module.as_deref().unwrap(),
-                    &mut kernels,
-                    &providers,
-                    text.map(|text| (text, history.as_slice())),
-                )
-                .unwrap_or_else(|error| panic!("{invocation}: {error}"));
-                history.push(action);
+                state
+                    .invoke(call)
+                    .unwrap_or_else(|error| panic!("{context}: {error}"));
             }
-            WastDirective::Register {
-                name,
-                module: selected,
-                ..
-            } => {
-                let bytes = selected
-                    .map(|id| named_modules.get(id.name()).unwrap())
-                    .unwrap_or_else(|| module.as_ref().unwrap());
-                providers.insert(name.to_owned(), bytes.clone());
-                kernels.clear();
+            WastDirective::Register { name, module, .. } => {
+                state
+                    .providers
+                    .insert(name.to_owned(), state.selected(module));
             }
-            WastDirective::AssertException {
-                exec: WastExecute::Invoke(call),
-                ..
-            } => {
-                let actual = invoke(
-                    call,
-                    module.as_deref().unwrap(),
-                    &mut kernels,
-                    &providers,
-                    text.map(|text| (text, history.as_slice())),
-                );
+            WastDirective::AssertException { exec, .. } => {
+                let actual = state.execute(exec);
                 assert!(
                     matches!(actual, Err(Error::UncaughtException { input_index: 0 })),
-                    "expected exception, got {actual:?}"
+                    "{context}: expected exception, got {actual:?}"
                 );
                 checked += 1;
             }
             WastDirective::AssertUnlinkable { mut module, .. } => {
-                let bytes = module.encode().unwrap();
-                let imports = spec_imports(&providers);
-                let actual = Kernel::new_with_imports(&bytes, "__invalid_spec_export", &imports);
+                let actual = state.instantiate(&module.encode().unwrap());
                 assert!(
-                    matches!(actual, Err(Error::Unsupported(ref reason)) if reason.contains("mismatch")),
-                    "unlinkable module accepted or unexpected error"
+                    matches!(actual, Err(Error::Unsupported(ref reason))
+                    if reason.contains("mismatch") || reason.starts_with("missing Wasm provider")
+                        || reason.contains("has no export") || reason.contains("wrong kind")
+                        || reason.contains("is not a function")),
+                    "{context}: expected linking rejection, got {actual:?}"
                 );
                 validation_cases += 1;
             }
             WastDirective::AssertInvalid { mut module, .. }
             | WastDirective::AssertMalformed { mut module, .. } => {
                 let rejected = match module.encode() {
-                    Ok(bytes) => matches!(
-                        Kernel::new(&bytes, "__invalid_spec_export"),
-                        Err(Error::InvalidWasm(_))
-                    ),
+                    Ok(bytes) => matches!(state.instantiate(&bytes), Err(Error::InvalidWasm(_))),
                     Err(_) => true,
                 };
-                assert!(rejected, "invalid module was accepted: {module:?}");
+                assert!(rejected, "{context}: invalid module was accepted");
                 validation_cases += 1;
             }
-            other => panic!("unhandled spec directive: {other:?}"),
+            other => panic!("{context}: unhandled spec directive: {other:?}"),
         }
     }
     assert!(checked >= minimum_assertions, "only {checked} cases ran");
@@ -834,7 +707,18 @@ fn spec_br_on_non_null() {
 
 #[test]
 fn spec_call_ref() {
-    check_script(include_str!("spec/call_ref.wast"), 20);
+    check_script_with_limits(
+        include_str!("spec/call_ref.wast"),
+        20,
+        KernelLimits {
+            call_depth: 256,
+            memory_growth_pages: 8,
+            table_growth_elements: 65_536,
+            exception_records: 512,
+            gc_heap_words: 4096,
+            ..KernelLimits::default()
+        },
+    );
 }
 
 #[test]
@@ -869,7 +753,7 @@ fn spec_exceptions_try_table() {
 
 #[test]
 fn spec_ref_func() {
-    check_script_mode(include_str!("spec/ref_func.wast"), 8, true);
+    check_script(include_str!("spec/ref_func.wast"), 8);
 }
 
 #[test]
@@ -884,7 +768,7 @@ fn spec_type_recursion() {
 
 #[test]
 fn spec_function_select() {
-    check_script_mode(include_str!("spec/select_functions.wast"), 90, true);
+    check_script(include_str!("spec/select_functions.wast"), 90);
 }
 
 #[test]
@@ -901,7 +785,7 @@ macro_rules! gc_script {
     ($name:ident, $file:literal, $assertions:literal) => {
         #[test]
         fn $name() {
-            check_script_mode(include_str!($file), $assertions, true);
+            check_script(include_str!($file), $assertions);
         }
     };
 }
@@ -926,7 +810,7 @@ gc_script!(spec_gc_binary, "spec/gc_binary-gc.wast", 0);
 
 #[test]
 fn spec_reference_tables() {
-    check_script_mode(include_str!("spec/memory64_table64.wast"), 0, true);
+    check_script(include_str!("spec/memory64_table64.wast"), 0);
     for source in [
         include_str!("spec/table.wast"),
         include_str!("spec/table_get.wast"),
@@ -940,6 +824,130 @@ fn spec_reference_tables() {
         include_str!("spec/memory64_table_grow64.wast"),
         include_str!("spec/memory64_table_fill64.wast"),
     ] {
-        check_script_mode(source, 1, true);
+        check_script(source, 1);
     }
+}
+
+// Whole official scripts for persistent state, linking, and initialization.
+
+#[test]
+fn spec_persistent_data() {
+    check_script(include_str!("spec/data.wast"), 15);
+}
+
+#[test]
+fn spec_persistent_elem() {
+    check_script(include_str!("spec/elem.wast"), 47);
+}
+
+#[test]
+fn spec_persistent_global() {
+    check_script(include_str!("spec/global.wast"), 67);
+}
+
+#[test]
+fn spec_persistent_imports() {
+    check_script(include_str!("spec/imports.wast"), 34);
+}
+
+#[test]
+fn spec_persistent_linking() {
+    check_script(include_str!("spec/linking.wast"), 90);
+}
+
+#[test]
+fn spec_persistent_start() {
+    check_script(include_str!("spec/start.wast"), 7);
+}
+
+#[test]
+fn spec_persistent_instance() {
+    check_script(include_str!("spec/instance.wast"), 12);
+}
+
+#[test]
+fn spec_persistent_memory_size() {
+    check_script(include_str!("spec/memory_size.wast"), 36);
+}
+
+#[test]
+fn spec_persistent_memory_redundancy() {
+    check_script(include_str!("spec/memory_redundancy.wast"), 4);
+}
+
+#[test]
+fn spec_persistent_memory_trap() {
+    check_script(include_str!("spec/memory_trap.wast"), 180);
+}
+
+#[test]
+fn spec_persistent_bulk_memory_table_copy() {
+    check_script(include_str!("spec/bulk_memory_table_copy.wast"), 1649);
+}
+
+#[test]
+fn spec_persistent_bulk_memory_table_sub() {
+    check_script(include_str!("spec/bulk_memory_table-sub.wast"), 0);
+}
+
+#[test]
+fn spec_persistent_bulk_memory_memory_copy() {
+    check_script(include_str!("spec/bulk_memory_memory_copy.wast"), 4338);
+}
+
+#[test]
+fn spec_persistent_bulk_memory_bulk() {
+    check_script(include_str!("spec/bulk_memory_bulk.wast"), 66);
+}
+
+#[test]
+fn spec_persistent_bulk_memory_memory_fill() {
+    check_script(include_str!("spec/bulk_memory_memory_fill.wast"), 20);
+}
+
+#[test]
+fn spec_persistent_bulk_memory_memory_init() {
+    check_script(include_str!("spec/bulk_memory_memory_init.wast"), 142);
+}
+
+#[test]
+fn spec_persistent_bulk_memory_table_init() {
+    check_script(include_str!("spec/bulk_memory_table_init.wast"), 665);
+}
+
+#[test]
+fn spec_persistent_simd_align() {
+    check_script(include_str!("spec/simd_align.wast"), 8);
+}
+
+#[test]
+fn spec_persistent_simd_const() {
+    check_script(include_str!("spec/simd_const.wast"), 265);
+}
+
+#[test]
+fn spec_persistent_simd_linking() {
+    check_script(include_str!("spec/simd_linking.wast"), 0);
+}
+
+#[test]
+fn spec_persistent_simd_memory_multi() {
+    check_script(include_str!("spec/simd_memory-multi.wast"), 0);
+}
+
+#[test]
+fn spec_persistent_memory_grow() {
+    // This official script successfully grows an unbounded memory to 804 pages.
+    check_script_with_limits(
+        include_str!("spec/memory_grow.wast"),
+        87,
+        KernelLimits {
+            memory_bytes: 64 * 1024 * 1024,
+            memory_growth_pages: 1024,
+            table_growth_elements: 65_536,
+            call_depth: 256,
+            exception_records: 512,
+            gc_heap_words: 4096,
+        },
+    );
 }

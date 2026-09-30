@@ -427,7 +427,11 @@ impl Compiler<'_> {
     }
 }
 
-pub(super) fn gc_type_source(types: &[GcType], modules: &[ParsedModule<'_>]) -> String {
+pub(super) fn gc_type_source(
+    types: &[GcType],
+    modules: &[ParsedModule<'_>],
+    persistent: bool,
+) -> String {
     let parents: ReferenceTypes = modules
         .iter()
         .flat_map(|m| m.supertypes.iter().map(|(&id, &p)| (id, p)))
@@ -477,6 +481,9 @@ pub(super) fn gc_type_source(types: &[GcType], modules: &[ParsedModule<'_>]) -> 
         s.push_str(&format!("case {}u: return {condition};\n", i + 1));
     }
     s.push_str("default: return false; } }\ninline void gc_mark_state(thread GcState& gc) {\n");
+    if persistent {
+        s.push_str("for (uint j=0u;j<gc.host_count;++j) gc_mark(gc,gc.host_roots[j]);\n");
+    }
     for (m, module) in modules.iter().enumerate() {
         let imported = module.global_types.len() - module.local_global_slots.len();
         for (i, &slot) in module.local_global_slots.iter().enumerate() {
