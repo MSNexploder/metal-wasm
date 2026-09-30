@@ -210,3 +210,4 @@
 (assert_return (invoke "as-compare-right") (i32.const 1))
 
 (assert_return (invoke "as-memory.grow-size") (i32.const 1))
+
