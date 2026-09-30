@@ -166,7 +166,19 @@ bulk operations and collection still depend on the configured resource reserves.
 
 Run `cargo run --example compat -- MODULE.wasm EXPORT I32_INPUT ...` with chosen inputs to check an exported `(i32) -> i32` function against fresh Wasmtime instances. It reports an unsupported module or signature with the reason, accepts matching traps and uncaught exceptions, and fails if Metal and Wasmtime disagree. For example, `cargo run --example compat -- tests/corpus/memory.wasm calculate 0 1 42` checks a compiled Rust memory workload. Use terminating functions: the GPU has a fuel budget, while this CPU comparison does not.
 
-`cargo test --test compiled_corpus` checks two supported compiled Rust modules against Wasmtime and checks that a third compiled module reports its unsupported host import. `cargo test --test persistent_runtime` also compares a compiled Rust static with persistent Wasmtime instances and checks lane state, linking, traps, live references, and collection. Sources, binaries, and build commands are in `tests/corpus/`. `cargo test --test spec_runtime` runs all 258 scripts from the pinned official core tree, including scalar, control-flow, binary validation, SIMD and relaxed SIMD, references, exceptions, tail calls, multiple memories, memory64/table64, GC, linking, initialization, and bulk operations. No assertions are skipped. It uses actual persistent instances, including actions after traps, named invocations, registrations, global reads, and module definitions; see `tests/spec/README.md` for provenance and test resource limits. The harness also runs the complete wide arithmetic proposal script and four custom page size proposal scripts. These checks do not establish full Wasm conformance.
+`cargo test --test compiled_corpus` checks eight compiled Rust, C, and C++ modules against Wasmtime and checks that a ninth compiled module reports its unsupported host import. The C and C++ fixtures include unoptimized and optimized builds. Tests cover numeric compiler lowering, SIMD, indirect calls, memory, and persistent C++ statics. `cargo test --test persistent_runtime` also compares a compiled Rust static with persistent Wasmtime instances and checks lane state, linking, traps, live references, and collection. Sources, binaries, and build commands are in `tests/corpus/`. `cargo test --test spec_runtime` runs all 258 scripts from the pinned official core tree, including scalar, control-flow, binary validation, SIMD and relaxed SIMD, references, exceptions, tail calls, multiple memories, memory64/table64, GC, linking, initialization, and bulk operations. No assertions are skipped. It uses actual persistent instances, including actions after traps, named invocations, registrations, global reads, and module definitions; see `tests/spec/README.md` for provenance and test resource limits. The harness also runs the complete wide arithmetic proposal script and four custom page size proposal scripts. These checks do not establish full Wasm conformance.
+
+`cargo test --test generated_runtime` compares 24 reproducible generated programs
+with Wasmtime across 2,352 fresh and persistent invocations. Seeds select arithmetic
+sequences and direct, indirect, typed-reference, or tail calls. Programs also combine
+GC chains, SIMD, `f64`, `i64`, two memories with different page sizes, bulk operations,
+and traps or uncaught exceptions. Persistent checks compare returned values,
+failure categories, globals, and memory after every call. This is a bounded,
+deterministic matrix, not unrestricted fuzzing or proof of conformance.
+
+`cargo test --test embedding_runtime --test kernel_references` checks atomic host
+writes, provider aliases, typed tables, lane outcomes, reference release, stale
+handles, retained graphs, and cyclic record reclamation.
 
 ## Performance comparison
 
