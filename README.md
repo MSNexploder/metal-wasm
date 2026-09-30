@@ -131,6 +131,17 @@ Run `cargo run --example compat -- MODULE.wasm EXPORT I32_INPUT ...` with chosen
 
 ## Performance comparison
 
+Run `cargo run --release --example compare -- --wide-arithmetic` or
+`--byte-pages` for the new feature workloads. Both also run in `--suite`.
+`wide_arithmetic` executes 128 dependent rounds of signed and unsigned wide
+multiplication, 128-bit addition, and subtraction. `byte_pages` uses a 261-byte
+memory with one-byte pages, resets it on every call, and executes 128 dependent
+rounds of byte loads, stores, and integer arithmetic. Both compare Metal,
+Wasmtime, Wasmi, and optimized native Rust at 1, 1,000, 100,000, and 1,000,000
+invocations. Each row reports the median of three samples and checks every
+result. Metal reports both total and GPU command time. Compilation, CPU
+instantiation, warmup, and result checks are outside timing.
+
 Run `cargo run --release --example compare -- --lifetime` for repeated exception
 and GC reclamation. Each lane makes 16 calls; each call creates, catches, and
 discards 64 node/exception cycles. Metal uses an eight-record exception arena and
@@ -166,6 +177,24 @@ Run `cargo run --release --example compare -- --suite` for fifteen workloads. `p
 The timed region includes result allocation and execution. Metal also includes per-lane state initialization, input transfer, command submission, and result transfer. Module compilation, CPU engine instantiation, warmup, input generation, and result verification are outside the timed region. Wasmtime and Wasmi reuse one instance per module and make one typed host call per input; the stateful and linked-resource workloads reset their touched state for each call. Metal batches one or more dispatches and runs each start function per lane. Thus `bulk_start` includes per-lane start work on Metal, while CPU start work occurs outside the timed region. These figures compare these APIs for these workloads, not peak engine or GPU throughput.
 
 ## Recorded benchmark results
+
+The [wide arithmetic and byte-page results](examples/feature-benchmark-results.csv)
+were measured on 2026-09-30 with an Apple M1 Max, 64 GB RAM, macOS 27.0,
+and a release build with default fuel. All results matched Metal, Wasmtime,
+Wasmi, and native Rust. These times are milliseconds at 1,000,000 invocations,
+with 128 rounds per invocation and medians of three samples:
+
+| Workload | Metal total | Metal GPU | Wasmtime | Wasmi | Native Rust |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Wide arithmetic | 14.38129 | 10.76975 | 257.20425 | 2056.88792 | 244.96158 |
+| Byte pages | 59.69762 | 34.02750 | 557.26112 | 936.88908 | 364.66271 |
+
+Metal total is about 17.9× faster than Wasmtime for wide arithmetic and 9.3×
+for byte pages. The native path is one CPU thread. Metal total includes fresh
+per-lane state, transfers, and submission; GPU time excludes host work.
+The byte-page workload reserves 261 bytes per lane instead of a 64 KiB page.
+These measurements describe these workloads and APIs, not general Wasm speed.
+The CSV also includes 1, 1,000, and 100,000 invocations.
 
 The [lifetime results](examples/lifetime-benchmark-results.csv) were measured on
 2026-09-30 with an Apple M1 Max, 64 GB RAM, macOS 27.0, and a release build.

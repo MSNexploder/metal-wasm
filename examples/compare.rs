@@ -37,7 +37,23 @@ struct SuiteWorkload {
     wasmi: bool,
 }
 
-const SUITE_WORKLOADS: [SuiteWorkload; 13] = [
+const SUITE_WORKLOADS: [SuiteWorkload; 15] = [
+    SuiteWorkload {
+        name: "wide_arithmetic",
+        wat: include_str!("workloads/wide_arithmetic.wat"),
+        provider: None,
+        native: wide_arithmetic_native,
+        counts: &[1, 1_000, 100_000, 1_000_000],
+        wasmi: true,
+    },
+    SuiteWorkload {
+        name: "byte_pages",
+        wat: include_str!("workloads/byte_pages.wat"),
+        provider: None,
+        native: byte_pages_native,
+        counts: &[1, 1_000, 100_000, 1_000_000],
+        wasmi: true,
+    },
     SuiteWorkload {
         name: "gc_graph",
         wat: include_str!("workloads/gc_graph.wat"),
@@ -154,6 +170,8 @@ fn main() -> Result<()> {
         Some("--gc") => return compare_suite(Some("gc_graph")),
         Some("--reference-casts") => return compare_suite(Some("reference_casts")),
         Some("--typed-exceptions") => return compare_suite(Some("typed_exceptions")),
+        Some("--wide-arithmetic") => return compare_suite(Some("wide_arithmetic")),
+        Some("--byte-pages") => return compare_suite(Some("byte_pages")),
         Some("--simd") => return compare_suite(Some("simd_i32x4")),
         Some("--tail-multi-resource") => return compare_suite(Some("tail_multi_resource")),
         Some("--metal-native-100m") => true,
@@ -334,6 +352,22 @@ fn compare_compute(control: bool) -> Result<()> {
     Ok(())
 }
 
+fn suite_wasmtime_engine() -> Result<wasmtime::Engine> {
+    let mut config = wasmtime::Config::new();
+    config
+        .wasm_wide_arithmetic(true)
+        .wasm_custom_page_sizes(true);
+    Ok(wasmtime::Engine::new(&config)?)
+}
+
+fn suite_wasmi_engine() -> wasmi::Engine {
+    let mut config = wasmi::Config::default();
+    config
+        .wasm_wide_arithmetic(true)
+        .wasm_custom_page_sizes(true);
+    wasmi::Engine::new(&config)
+}
+
 fn compare_suite(filter: Option<&str>) -> Result<()> {
     println!("workload,count,metal_total_us,metal_gpu_us,wasmtime_us,wasmi_us,native_us,samples");
     for workload in &SUITE_WORKLOADS {
@@ -350,7 +384,7 @@ fn compare_suite(filter: Option<&str>) -> Result<()> {
         } else {
             Kernel::new(&wasm, "calculate")?
         };
-        let wasmtime_engine = wasmtime::Engine::default();
+        let wasmtime_engine = suite_wasmtime_engine()?;
         let wasmtime_module = wasmtime::Module::new(&wasmtime_engine, &wasm)?;
         let mut wasmtime_store = wasmtime::Store::new(&wasmtime_engine, ());
         let mut wasmtime_linker = wasmtime::Linker::new(&wasmtime_engine);
@@ -364,7 +398,7 @@ fn compare_suite(filter: Option<&str>) -> Result<()> {
         let wasmtime_func =
             wasmtime_instance.get_typed_func::<i32, i32>(&mut wasmtime_store, "calculate")?;
         let mut run_wasmi = if workload.wasmi {
-            let wasmi_engine = wasmi::Engine::default();
+            let wasmi_engine = suite_wasmi_engine();
             let wasmi_module = wasmi::Module::new(&wasmi_engine, &wasm)?;
             let mut wasmi_store = wasmi::Store::new(&wasmi_engine, ());
             let mut wasmi_linker = wasmi::Linker::new(&wasmi_engine);
@@ -1099,6 +1133,35 @@ fn dispatch_native(input: u32) -> u32 {
 }
 
 #[inline(always)]
+fn wide_arithmetic_native(input: u32) -> u32 {
+    let mut low = ((input as u64) << 32) ^ 0x9e37_79b9_7f4a_7c15;
+    let mut high = 0x85eb_ca6b_c2b2_ae35u64;
+    for round in 0..128u128 {
+        let a = (low as u128) * 0xd6e8_feb8_6659_fd93u128;
+        let b = ((high as i64 as i128) * (0x9e37_79b9_7f4a_7c15u64 as i64 as i128)) as u128;
+        let value = a.wrapping_add(b).wrapping_sub(round);
+        low = value as u64;
+        high = (value >> 64) as u64;
+    }
+    (low ^ high ^ (low >> 32)) as u32
+}
+
+#[inline(always)]
+fn byte_pages_native(input: u32) -> u32 {
+    let mut memory = [input as u8; 261];
+    let mut value = input ^ 0x9e37_79b9;
+    for round in 0..128u32 {
+        let index = ((value ^ round) & 255) as usize;
+        value = value
+            .rotate_left(5)
+            .wrapping_add(memory[index] as u32)
+            .wrapping_mul(0x85eb_ca6b);
+        memory[index] = (value >> 24) as u8;
+    }
+    value ^ memory.len() as u32
+}
+
+#[inline(always)]
 fn float_native(input: u32) -> u32 {
     let mut value = ((input & 2047) as f64 / 2048.0) + 0.25;
     for round in 0..12u32 {
@@ -1412,7 +1475,7 @@ mod tests {
                 metal_wasm::Kernel::new(&wasm, "calculate").unwrap()
             };
             let metal_output = metal.run(&inputs).unwrap();
-            let wasmtime_engine = wasmtime::Engine::default();
+            let wasmtime_engine = super::suite_wasmtime_engine().unwrap();
             let wasmtime_module = wasmtime::Module::new(&wasmtime_engine, &wasm).unwrap();
             let mut wasmtime_store = wasmtime::Store::new(&wasmtime_engine, ());
             let mut wasmtime_linker = wasmtime::Linker::new(&wasmtime_engine);
@@ -1438,7 +1501,7 @@ mod tests {
                 })
                 .collect();
             let wasmi_output = if workload.wasmi {
-                let wasmi_engine = wasmi::Engine::default();
+                let wasmi_engine = super::suite_wasmi_engine();
                 let wasmi_module = wasmi::Module::new(&wasmi_engine, &wasm).unwrap();
                 let mut wasmi_store = wasmi::Store::new(&wasmi_engine, ());
                 let mut wasmi_linker = wasmi::Linker::new(&wasmi_engine);
