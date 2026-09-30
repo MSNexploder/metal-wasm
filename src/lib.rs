@@ -6237,6 +6237,35 @@ impl Compiler<'_> {
                 };
                 self.emit_value(stack, expression);
             }
+            Operator::I64Add128 | Operator::I64Sub128 => {
+                let rhs_high = pop(stack)?;
+                let rhs_low = pop(stack)?;
+                let lhs_high = pop(stack)?;
+                let lhs_low = pop(stack)?;
+                let low = self.fresh_value();
+                let high = if matches!(operator, Operator::I64Add128) {
+                    self.source
+                        .push_str(&format!("{low} = {lhs_low} + {rhs_low};\n"));
+                    format!("{lhs_high} + {rhs_high} + ulong({low} < {lhs_low})")
+                } else {
+                    self.source
+                        .push_str(&format!("{low} = {lhs_low} - {rhs_low};\n"));
+                    format!("{lhs_high} - {rhs_high} - ulong({lhs_low} < {rhs_low})")
+                };
+                stack.push(low);
+                self.emit_value(stack, high);
+            }
+            Operator::I64MulWideS | Operator::I64MulWideU => {
+                let rhs = pop(stack)?;
+                let lhs = pop(stack)?;
+                self.emit_value(stack, format!("{lhs} * {rhs}"));
+                let high = if matches!(operator, Operator::I64MulWideS) {
+                    format!("as_type<ulong>(mulhi(as_type<long>({lhs}), as_type<long>({rhs})))")
+                } else {
+                    format!("mulhi({lhs}, {rhs})")
+                };
+                self.emit_value(stack, high);
+            }
             Operator::I64Add
             | Operator::I64Sub
             | Operator::I64Mul

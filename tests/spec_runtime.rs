@@ -1387,3 +1387,5 @@ new_feature_spec!(
     "spec/core/utf8-invalid-encoding.wast",
     0
 );
+
+new_feature_spec!(spec_wide_arithmetic, "spec/wide-arithmetic.wast", 99);

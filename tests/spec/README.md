@@ -51,3 +51,12 @@ of conformance or coverage of every proposal and host embedding. Threads and
 host interfaces such as WASI remain outside the supported GPU profile. Focused
 integration tests also cover resource bounds, multiple lanes, public reference
 transport, reclamation, and execution budgets beyond the official scripts.
+
+## Proposal tests
+
+`wide-arithmetic.wast` comes unchanged from the [official wide arithmetic tree](https://github.com/WebAssembly/wide-arithmetic/blob/024d4ce1b28cee7fd006d9c5175e3b7ece52b429/test/core/wide-arithmetic.wast),
+pinned at `024d4ce1b28cee7fd006d9c5175e3b7ece52b429`. Its 99 runtime and ten
+module/validation cases all run. `wide_arithmetic.rs` also compares 10,368
+inputs across Metal lanes with Rust `u128`/`i128` and Wasmtime, including carry,
+borrow, wraparound, signed extrema, and deterministic random inputs. The same
+WebAssembly Apache-2.0 license applies.
