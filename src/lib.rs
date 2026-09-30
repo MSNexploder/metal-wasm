@@ -23,9 +23,15 @@ use wasmparser::types::CoreTypeId;
 use wasmparser::{
     AbstractHeapType, BlockType, Catch, CompositeInnerType, ConstExpr, DataKind, ElementItems,
     ElementKind, ExternalKind, FuncType, FunctionBody, GlobalType, HeapType, MemoryType, Operator,
-    Parser, Payload, RefType, TableInit, TableType, TryTable, TypeRef, UnpackedIndex, ValType,
-    Validator,
+    Parser, Payload, RefType, StorageType, TableInit, TableType, TryTable, TypeRef, UnpackedIndex,
+    ValType, Validator,
 };
+
+mod gc;
+mod gc_translate;
+use gc::GcRecord;
+pub use gc::GcRef;
+use gc_translate::gc_type_source;
 
 static NEXT_KERNEL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -45,6 +51,8 @@ pub struct KernelLimits {
     pub call_depth: usize,
     /// Maximum immutable exception records allocated during one lane invocation.
     pub exception_records: usize,
+    /// Bounded GC heap size in 64-bit words per lane.
+    pub gc_heap_words: usize,
 }
 
 impl Default for KernelLimits {
@@ -55,6 +63,7 @@ impl Default for KernelLimits {
             table_growth_elements: MAX_TABLE_GROWTH,
             call_depth: MAX_CALL_DEPTH,
             exception_records: 64,
+            gc_heap_words: 1024,
         }
     }
 }
@@ -73,7 +82,7 @@ pub struct FunctionRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExternalRef {
     kernel: u64,
-    index: u32,
+    index: u64,
 }
 
 /// An immutable exception retained by its kernel until the kernel is dropped.
@@ -119,6 +128,10 @@ pub enum Value {
     FuncRef(Option<FunctionRef>),
     ExternRef(Option<ExternalRef>),
     ExnRef(Option<ExceptionRef>),
+    /// An unboxed 31-bit signed integer reference.
+    I31(u32),
+    /// A nullable GC graph snapshot owned by this kernel.
+    GcRef(Option<GcRef>),
 }
 
 impl Value {
@@ -132,6 +145,8 @@ impl Value {
             Self::FuncRef(value) => ValType::Ref(value.map_or(RefType::FUNCREF, |f| f.ty)),
             Self::ExternRef(_) => ValType::Ref(RefType::EXTERNREF),
             Self::ExnRef(_) => ValType::Ref(RefType::EXNREF),
+            Self::I31(_) => ValType::Ref(RefType::I31REF.as_non_null()),
+            Self::GcRef(value) => ValType::Ref(value.map_or(RefType::ANYREF, |r| r.ty)),
         }
     }
 
@@ -141,8 +156,10 @@ impl Value {
             Self::I64(bits) | Self::F64(bits) => bits,
             Self::V128(_) => unreachable!("v128 has two words"),
             Self::FuncRef(value) => value.map_or(0, |f| u64::from(f.index)),
-            Self::ExternRef(value) => value.map_or(0, |f| u64::from(f.index)),
+            Self::ExternRef(value) => value.map_or(0, |f| f.index),
             Self::ExnRef(value) => value.map_or(0, |f| u64::from(f.index)),
+            Self::I31(value) => 0x100000000 | u64::from(value & 0x7fffffff),
+            Self::GcRef(value) => value.map_or(0, |r| r.index),
         }
     }
 
@@ -163,12 +180,15 @@ pub struct Kernel {
     id: u64,
     external_values: Mutex<Vec<Arc<dyn Any + Send + Sync>>>,
     exception_values: Mutex<Vec<ExceptionRecord>>,
+    gc_values: Mutex<Vec<GcRecord>>,
     exception_tags: HashMap<String, u32>,
     tag_payload_types: Vec<Vec<ValType>>,
     exception_io: Option<ExceptionIo>,
     function_reference_types: Vec<RefType>,
     exported_functions: HashMap<String, u32>,
-    reference_supertypes: HashMap<CoreTypeId, Option<CoreTypeId>>,
+    reference_supertypes: ReferenceTypes,
+    gc: Option<GcLayout>,
+    gc_types: Vec<GcType>,
     device: Device,
     queue: metal::CommandQueue,
     pipeline: ComputePipelineState,
@@ -185,7 +205,9 @@ struct Translation {
     exception_io: Option<ExceptionIo>,
     function_reference_types: Vec<RefType>,
     exported_functions: HashMap<String, u32>,
-    reference_supertypes: HashMap<CoreTypeId, Option<CoreTypeId>>,
+    reference_supertypes: ReferenceTypes,
+    gc: Option<GcLayout>,
+    gc_types: Vec<GcType>,
     source: String,
     can_trap: bool,
     params: Vec<ValType>,
@@ -213,7 +235,7 @@ struct MemoryTemplate {
 
 struct TableTemplate {
     function_refs: bool,
-    values: Vec<u32>,
+    values: Vec<u64>,
     info: TableInfo,
     targets: Vec<usize>,
 }
@@ -243,7 +265,7 @@ struct MemoryInput<'a> {
 struct TableInfo {
     mutable: bool,
     capacity: usize,
-    elements: Vec<Vec<u32>>,
+    elements: Vec<Vec<u64>>,
     function_elements: Vec<bool>,
     lengths: Vec<u32>,
 }
@@ -297,6 +319,8 @@ impl Kernel {
             || limits.memory_bytes / 65536 > 65536
             || limits.exception_records == 0
             || limits.exception_records > u32::MAX as usize
+            || limits.gc_heap_words < 4
+            || limits.gc_heap_words > u32::MAX as usize
             || limits.call_depth == 0
             || limits.call_depth > u32::MAX as usize
         {
@@ -348,6 +372,9 @@ impl Kernel {
             id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed),
             external_values: Mutex::new(Vec::new()),
             exception_values: Mutex::new(Vec::new()),
+            gc_values: Mutex::new(Vec::new()),
+            gc: translation.gc,
+            gc_types: translation.gc_types,
             exception_tags: translation.exception_tags,
             tag_payload_types: translation.tag_payload_types,
             exception_io: translation.exception_io,
@@ -393,7 +420,7 @@ impl Kernel {
             }
             (Value::ExternRef(None), ValType::Ref(ty)) => ty.is_nullable() && is_external_ref(ty),
             (Value::ExternRef(Some(reference)), ValType::Ref(ty)) => {
-                reference.kernel == self.id
+                self.validate_external_reference(reference)
                     && matches!(
                         ty.heap_type(),
                         HeapType::Abstract {
@@ -402,7 +429,20 @@ impl Kernel {
                         }
                     )
             }
-            (Value::FuncRef(None), ValType::Ref(ty)) => ty.is_nullable() && is_function_ref(ty),
+            (Value::GcRef(None), ValType::Ref(ty)) => {
+                ty.is_nullable() && is_gc_ref(ty, &self.reference_supertypes)
+            }
+            (Value::GcRef(Some(r)), ValType::Ref(ty)) => {
+                self.validate_gc_reference(r) && ref_subtype(r.ty, ty, &self.reference_supertypes)
+            }
+            (Value::I31(_), ValType::Ref(ty)) => ref_subtype(
+                RefType::I31REF.as_non_null(),
+                ty,
+                &self.reference_supertypes,
+            ),
+            (Value::FuncRef(None), ValType::Ref(ty)) => {
+                ty.is_nullable() && is_function_ref_in(ty, &self.reference_supertypes)
+            }
             (Value::FuncRef(Some(reference)), ValType::Ref(ty)) => {
                 reference.kernel == self.id
                     && ref_subtype(reference.ty, ty, &self.reference_supertypes)
@@ -424,7 +464,7 @@ impl Kernel {
         values.push(Arc::new(value));
         Ok(ExternalRef {
             kernel: self.id,
-            index,
+            index: u64::from(index),
         })
     }
 
@@ -707,22 +747,26 @@ impl Kernel {
                 bytes[8..].copy_from_slice(&words[1].to_le_bytes());
                 Value::V128(bytes)
             }
-            ValType::Ref(ty) if is_function_ref(ty) => Value::FuncRef(if low == 0 {
-                None
-            } else {
-                Some(FunctionRef {
-                    kernel: self.id,
-                    index: low as u32,
-                    ty: *self
-                        .function_reference_types
-                        .get(low as usize - 1)
-                        .ok_or_else(|| Error::Metal("invalid function reference result".into()))?,
+            ValType::Ref(ty) if is_function_ref_in(ty, &self.reference_supertypes) => {
+                Value::FuncRef(if low == 0 {
+                    None
+                } else {
+                    Some(FunctionRef {
+                        kernel: self.id,
+                        index: low as u32,
+                        ty: *self
+                            .function_reference_types
+                            .get(low as usize - 1)
+                            .ok_or_else(|| {
+                                Error::Metal("invalid function reference result".into())
+                            })?,
+                    })
                 })
-            }),
+            }
             ValType::Ref(ty) if is_external_ref(ty) => {
                 Value::ExternRef((low != 0).then_some(ExternalRef {
                     kernel: self.id,
-                    index: low as u32,
+                    index: low,
                 }))
             }
             ValType::Ref(ty) if is_exception_ref(ty) => Value::ExnRef(if low == 0 {
@@ -922,7 +966,30 @@ impl Kernel {
                 input_bytes = size_of_val(encoded32.as_slice());
                 encoded32.as_ptr().cast::<u8>()
             } else {
-                if let Some(io) = self.exception_io.filter(|io| io.input) {
+                if let Some(gc) = self.gc {
+                    let buffer = &instance_buffers.last().unwrap()[0].1;
+                    let stride = gc.heap_words + gc.root_words;
+                    let heap_words = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            buffer.contents().cast::<u64>(),
+                            stride * (end - start),
+                        )
+                    };
+                    let mut arguments = Vec::new();
+                    for (index, row) in inputs[start..end].iter().enumerate() {
+                        let encoded = self
+                            .encode_gc_row(row, self.exception_io)
+                            .map_err(|e| shift_trap(e, start + index))?;
+                        arguments.extend(encoded.arguments);
+                        heap_words[index * stride..index * stride + gc.heap_words]
+                            .copy_from_slice(&encoded.heap);
+                        if self.exception_io.is_some_and(|io| io.input) {
+                            exception_arenas.extend(encoded.exceptions);
+                        }
+                        exception_handles.push(encoded.existing_exceptions);
+                    }
+                    encoded64 = arguments;
+                } else if let Some(io) = self.exception_io.filter(|io| io.input) {
                     let mut arguments = Vec::new();
                     for (index, row) in inputs[start..end].iter().enumerate() {
                         let (args, arena, handles) = self
@@ -990,6 +1057,35 @@ impl Kernel {
                 let result_words = output_stride / size_of::<u64>();
                 for index in 0..end - start {
                     let result = &values[index * result_words..(index + 1) * result_words];
+                    if let Some(gc) = self.gc {
+                        let buffer = &instance_buffers.last().unwrap()[0].1;
+                        let stride = gc.heap_words + gc.root_words;
+                        let heaps = unsafe {
+                            std::slice::from_raw_parts(
+                                buffer.contents().cast::<u64>(),
+                                stride * (end - start),
+                            )
+                        };
+                        let arena = if self.exception_io.is_some_and(|io| io.output) {
+                            let offset = (end - start) * result_words + index * exception_words;
+                            &values[offset..offset + exception_words]
+                        } else {
+                            &[]
+                        };
+                        rows.push(
+                            self.decode_gc_row(
+                                result,
+                                &heaps[index * stride..index * stride + gc.heap_words],
+                                arena,
+                                self.exception_io,
+                                exception_handles
+                                    .get(index)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]),
+                            )?,
+                        );
+                        continue;
+                    }
                     let handles = if let Some(io) = self.exception_io.filter(|io| io.output) {
                         let offset = (end - start) * result_words + index * exception_words;
                         self.decode_exceptions(
@@ -1082,23 +1178,47 @@ impl Kernel {
             }
             for table in &template.tables {
                 if table.info.mutable {
-                    include(table.info.capacity.max(1) * size_of::<u32>())?;
+                    include(table.info.capacity.max(1) * size_of::<u64>())?;
                 }
             }
+        }
+        if let Some(gc) = self.gc {
+            include((gc.heap_words + gc.root_words) * 8)?;
         }
         Ok(limit.min((MAX_BATCH_BYTES / per_lane).max(1)))
     }
 
     fn prepare_batch(&self, count: u32) -> Result<Vec<Vec<(u64, metal::Buffer)>>, Error> {
-        self.instances
+        let mut buffers = self
+            .instances
             .iter()
             .map(|instance| instance.for_batch(&self.device, count))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(gc) = self.gc {
+            buffers.push(vec![(
+                gc.slot,
+                lane_buffer(
+                    &self.device,
+                    &[gc.heap_words as u64],
+                    gc.heap_words + gc.root_words,
+                    count,
+                )?,
+            )]);
+        }
+        Ok(buffers)
     }
 
     fn reset_batch(&self, buffers: &[Vec<(u64, metal::Buffer)>], count: u32) {
         for (instance, buffers) in self.instances.iter().zip(buffers) {
             instance.reset_batch(buffers, count);
+        }
+        if let Some(gc) = self.gc {
+            reset_lane_buffer(
+                &buffers.last().unwrap()[0].1,
+                &[gc.heap_words as u64],
+                gc.heap_words + gc.root_words,
+                count,
+            );
         }
     }
 
@@ -1223,6 +1343,8 @@ impl Kernel {
                         8 => "call depth limit exceeded",
                         9 => "null reference",
                         10 => "exception record limit exceeded",
+                        15 => "GC resource limit exceeded",
+                        16 => "out of bounds array access",
                         12 => "null function reference",
                         13 => "cast failure",
                         14 => "out of bounds table access",
@@ -1444,11 +1566,7 @@ fn normalize_value(ty: ValType, ids: &[CoreTypeId]) -> ValType {
     }
 }
 
-fn ref_subtype(
-    actual: RefType,
-    expected: RefType,
-    parents: &HashMap<CoreTypeId, Option<CoreTypeId>>,
-) -> bool {
+fn ref_subtype(actual: RefType, expected: RefType, parents: &ReferenceTypes) -> bool {
     if actual.is_nullable() && !expected.is_nullable() {
         return false;
     }
@@ -1460,7 +1578,7 @@ fn ref_subtype(
             HeapType::Concrete(UnpackedIndex::Id(mut id)),
             HeapType::Concrete(UnpackedIndex::Id(target)),
         ) => {
-            while let Some(Some(parent)) = parents.get(&id) {
+            while let Some((Some(parent), _)) = parents.get(&id) {
                 if *parent == target {
                     return true;
                 }
@@ -1474,14 +1592,14 @@ fn ref_subtype(
                 shared: false,
                 ty: AbstractHeapType::Func,
             },
-        ) => is_function_ref(actual),
+        ) => is_function_ref_in(actual, parents),
         (
             HeapType::Abstract {
                 shared: false,
                 ty: AbstractHeapType::NoFunc,
             },
             _,
-        ) => is_function_ref(expected),
+        ) => is_function_ref_in(expected, parents),
         (
             HeapType::Abstract {
                 shared: false,
@@ -1502,6 +1620,57 @@ fn ref_subtype(
                 ty: AbstractHeapType::Exn,
             },
         ) => true,
+        (
+            actual,
+            HeapType::Abstract {
+                shared: false,
+                ty: expected,
+            },
+        ) => {
+            let actual = match actual {
+                HeapType::Concrete(UnpackedIndex::Id(id)) => {
+                    parents.get(&id).map(|(_, kind)| *kind)
+                }
+                HeapType::Abstract { shared: false, ty } => Some(ty),
+                _ => None,
+            };
+            match (actual, expected) {
+                (Some(actual), expected) if actual == expected => true,
+                (
+                    Some(AbstractHeapType::None),
+                    AbstractHeapType::Any
+                    | AbstractHeapType::Eq
+                    | AbstractHeapType::I31
+                    | AbstractHeapType::Struct
+                    | AbstractHeapType::Array,
+                ) => true,
+                (
+                    Some(
+                        AbstractHeapType::Eq
+                        | AbstractHeapType::I31
+                        | AbstractHeapType::Struct
+                        | AbstractHeapType::Array,
+                    ),
+                    AbstractHeapType::Any,
+                ) => true,
+                (
+                    Some(
+                        AbstractHeapType::I31 | AbstractHeapType::Struct | AbstractHeapType::Array,
+                    ),
+                    AbstractHeapType::Eq,
+                ) => true,
+                _ => false,
+            }
+        }
+        (
+            HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::None,
+            },
+            HeapType::Concrete(UnpackedIndex::Id(id)),
+        ) => parents
+            .get(&id)
+            .is_some_and(|(_, kind)| *kind != AbstractHeapType::Func),
         _ => false,
     }
 }
@@ -1509,12 +1678,19 @@ fn ref_subtype(
 fn is_function_ref(ty: RefType) -> bool {
     matches!(
         ty.heap_type(),
-        HeapType::Concrete(_)
-            | HeapType::Abstract {
-                shared: false,
-                ty: AbstractHeapType::Func | AbstractHeapType::NoFunc
-            }
+        HeapType::Abstract {
+            shared: false,
+            ty: AbstractHeapType::Func | AbstractHeapType::NoFunc
+        }
     )
+}
+
+fn is_function_ref_in(ty: RefType, kinds: &ReferenceTypes) -> bool {
+    is_function_ref(ty)
+        || matches!(ty.heap_type(), HeapType::Concrete(UnpackedIndex::Id(id)) if kinds.get(&id).is_some_and(|(_, k)| *k == AbstractHeapType::Func))
+}
+fn is_gc_ref(ty: RefType, kinds: &ReferenceTypes) -> bool {
+    !is_function_ref_in(ty, kinds) && !is_external_ref(ty) && !is_exception_ref(ty)
 }
 
 fn is_external_ref(ty: RefType) -> bool {
@@ -1537,11 +1713,42 @@ fn is_exception_ref(ty: RefType) -> bool {
     )
 }
 
+type ReferenceTypes = HashMap<CoreTypeId, (Option<CoreTypeId>, AbstractHeapType)>;
+
+#[derive(Clone)]
+struct GcType {
+    fields: Vec<StorageType>,
+    array: bool,
+    reference: RefType,
+}
+impl GcType {
+    fn words(&self) -> usize {
+        self.fields.iter().map(storage_words).sum()
+    }
+}
+fn storage_words(ty: &StorageType) -> usize {
+    match ty {
+        StorageType::Val(ValType::V128) => 2,
+        _ => 1,
+    }
+}
+fn storage_is_ref(ty: &StorageType) -> bool {
+    matches!(ty, StorageType::Val(ValType::Ref(r)) if !is_function_ref(*r) && !is_exception_ref(*r))
+}
+#[derive(Clone, Copy)]
+struct GcLayout {
+    slot: u64,
+    heap_words: usize,
+    root_words: usize,
+}
+
 struct ParsedModule<'a> {
     uses_exceptions: bool,
     types: Vec<FuncType>,
     type_ids: Vec<CoreTypeId>,
-    supertypes: HashMap<CoreTypeId, Option<CoreTypeId>>,
+    supertypes: ReferenceTypes,
+    gc_types: Vec<Option<GcType>>,
+    gc_ids: Vec<u32>,
     tag_types: Vec<u32>,
     tag_bindings: Vec<u32>,
     function_types: Vec<u32>,
@@ -1577,7 +1784,7 @@ impl ParsedModule<'_> {
             if id == self.type_ids[expected] {
                 return true;
             }
-            match actual.supertypes.get(&id).copied().flatten() {
+            match actual.supertypes.get(&id).and_then(|(p, _)| *p) {
                 Some(parent) => id = parent,
                 None => return false,
             }
@@ -1605,20 +1812,43 @@ fn parse_module<'a>(
         .collect();
     let mut supertypes = HashMap::new();
     let mut types = Vec::new();
+    let mut gc_types = Vec::new();
     for &id in &type_ids {
         let subtype = &validated[id];
         if subtype.composite_type.shared {
             return Err(Error::Unsupported("shared types are unsupported".into()));
         }
-        match &subtype.composite_type.inner {
-            CompositeInnerType::Func(ty) => types.push(ty.clone()),
+        let reference = RefType::new(false, HeapType::Concrete(UnpackedIndex::Id(id))).unwrap();
+        let (function, gc, kind) = match &subtype.composite_type.inner {
+            CompositeInnerType::Func(ty) => (ty.clone(), None, AbstractHeapType::Func),
+            // Preserve module type indices while storing GC layouts separately.
+            CompositeInnerType::Struct(ty) => (
+                FuncType::new([], []),
+                Some(GcType {
+                    fields: ty.fields.iter().map(|f| f.element_type).collect(),
+                    array: false,
+                    reference,
+                }),
+                AbstractHeapType::Struct,
+            ),
+            CompositeInnerType::Array(ty) => (
+                FuncType::new([], []),
+                Some(GcType {
+                    fields: vec![ty.0.element_type],
+                    array: true,
+                    reference,
+                }),
+                AbstractHeapType::Array,
+            ),
             _ => {
                 return Err(Error::Unsupported(
-                    "GC and continuation types are unsupported".into(),
+                    "continuation types are unsupported".into(),
                 ));
             }
-        }
-        supertypes.insert(id, validated.supertype_of(id));
+        };
+        types.push(function);
+        gc_types.push(gc);
+        supertypes.insert(id, (validated.supertype_of(id), kind));
     }
     let mut tag_types = Vec::new();
     let mut tag_bindings = Vec::new();
@@ -1736,10 +1966,9 @@ fn parse_module<'a>(
                     }
                     let value = match table.init {
                         TableInit::RefNull => 0,
-                        TableInit::Expr(expr) if imported_globals == 0 => u32::try_from(
-                            eval_const(&expr, &globals_template, &local_global_slots)?,
-                        )
-                        .map_err(|_| Error::Unsupported("function reference overflow".into()))?,
+                        TableInit::Expr(expr) if imported_globals == 0 && !expr_uses_gc(&expr) => {
+                            eval_const(&expr, &globals_template, &local_global_slots)?
+                        }
                         TableInit::Expr(expr) => {
                             table_init_exprs.push((tables.len(), expr));
                             0
@@ -1755,7 +1984,7 @@ fn parse_module<'a>(
                     table_types.push(table.ty);
                     table_bindings.push(None);
                     tables.push(TableTemplate {
-                        function_refs: is_function_ref(table.ty.element_type),
+                        function_refs: is_function_ref_in(table.ty.element_type, &supertypes),
                         values: vec![value; size],
                         info: TableInfo {
                             capacity,
@@ -1809,7 +2038,11 @@ fn parse_module<'a>(
                     }
                     let slot = globals_template.len();
                     local_global_slots.push(slot);
-                    if imported_globals == 0 {
+                    if imported_globals == 0
+                        && dynamic_globals.is_empty()
+                        && !matches!(global.ty.content_type, ValType::Ref(r) if is_gc_ref(r, &supertypes))
+                        && !expr_uses_gc(&global.init_expr)
+                    {
                         if global.ty.content_type == ValType::V128 {
                             globals_template.extend(eval_v128_const(
                                 &global.init_expr,
@@ -1833,7 +2066,7 @@ fn parse_module<'a>(
                     globals_mutable.push(global.ty.mutable);
                     global_types.push(global.ty);
                     if imported_globals == 0
-                        && matches!(global.ty.content_type, ValType::Ref(ty) if is_function_ref(ty))
+                        && matches!(global.ty.content_type, ValType::Ref(ty) if is_function_ref_in(ty, &supertypes))
                     {
                         reference_globals.push(slot);
                     }
@@ -1844,59 +2077,54 @@ fn parse_module<'a>(
                     let element = element?;
                     let function_elements = match &element.items {
                         ElementItems::Functions(_) => true,
-                        ElementItems::Expressions(ty, _) => is_function_ref(*ty),
+                        ElementItems::Expressions(ty, _) => {
+                            is_function_ref_in(normalize_ref(*ty, &type_ids), &supertypes)
+                        }
                     };
-                    let values: Vec<u32> =
-                        match element.items {
-                            ElementItems::Functions(indices) => indices
-                                .into_iter()
-                                .map(|index| {
-                                    index?.checked_add(1).ok_or_else(|| {
-                                        Error::Unsupported("function index overflow".into())
-                                    })
+                    let values: Vec<u64> = match element.items {
+                        ElementItems::Functions(indices) => indices
+                            .into_iter()
+                            .map(|index| {
+                                u64::from(index?).checked_add(1).ok_or_else(|| {
+                                    Error::Unsupported("function index overflow".into())
                                 })
-                                .collect::<Result<_, Error>>()?,
-                            ElementItems::Expressions(ty, expressions)
-                                if is_supported_value(ValType::Ref(ty)) =>
-                            {
-                                let mut values = Vec::new();
-                                for expr in expressions {
-                                    let expr = expr?;
-                                    if imported_globals != 0
+                            })
+                            .collect::<Result<_, Error>>()?,
+                        ElementItems::Expressions(ty, expressions)
+                            if is_supported_value(ValType::Ref(ty)) =>
+                        {
+                            let mut values = Vec::new();
+                            for expr in expressions {
+                                let expr = expr?;
+                                if expr_uses_gc(&expr)
+                                    || (imported_globals != 0 || !dynamic_globals.is_empty())
                                         && expr
                                             .get_operators_reader()
                                             .into_iter()
                                             .any(|op| matches!(op, Ok(Operator::GlobalGet { .. })))
-                                    {
-                                        dynamic_elements.push((
-                                            element_info.elements.len(),
-                                            values.len(),
-                                            expr,
-                                        ));
-                                        values.push(0);
-                                    } else {
-                                        values.push(
-                                            u32::try_from(eval_const(
-                                                &expr,
-                                                &globals_template,
-                                                &local_global_slots,
-                                            )?)
-                                            .map_err(|_| {
-                                                Error::Unsupported(
-                                                    "function reference overflow".into(),
-                                                )
-                                            })?,
-                                        );
-                                    }
+                                {
+                                    dynamic_elements.push((
+                                        element_info.elements.len(),
+                                        values.len(),
+                                        expr,
+                                    ));
+                                    values.push(0);
+                                } else {
+                                    values.push(eval_const(
+                                        &expr,
+                                        &globals_template,
+                                        &local_global_slots,
+                                    )?);
                                 }
-                                values
                             }
-                            _ => {
-                                return Err(Error::Unsupported(
-                                    "unsupported element reference type".into(),
-                                ));
-                            }
-                        };
+                            values
+                        }
+                        _ => {
+                            return Err(Error::Unsupported(
+                                "unsupported element reference type".into(),
+                            ));
+                        }
+                    };
                     let length = match element.kind {
                         ElementKind::Active {
                             table_index,
@@ -1913,6 +2141,7 @@ fn parse_module<'a>(
                                 .and_then(|index| tables.get_mut(index))
                                 .filter(|_| {
                                     imported_globals == 0
+                                        && dynamic_globals.is_empty()
                                         && !dynamic_elements.iter().any(|(segment, _, _)| {
                                             *segment == element_info.elements.len()
                                         })
@@ -1971,7 +2200,7 @@ fn parse_module<'a>(
                             if let Some(memory) = memory_index
                                 .checked_sub(imported)
                                 .and_then(|index| memories.get_mut(index))
-                                .filter(|_| imported_globals == 0)
+                                .filter(|_| imported_globals == 0 && dynamic_globals.is_empty())
                             {
                                 let offset = eval_const(
                                     &offset_expr,
@@ -2064,6 +2293,8 @@ fn parse_module<'a>(
     Ok(ParsedModule {
         uses_exceptions,
         types,
+        gc_ids: vec![0; type_ids.len()],
+        gc_types,
         type_ids,
         supertypes,
         tag_types,
@@ -2291,14 +2522,14 @@ fn limits_match(
         && expected_max.is_none_or(|max| actual_max.is_some_and(|actual| actual <= max))
 }
 
-fn remap_reference(value: u32, functions: &[usize]) -> Result<u32, Error> {
+fn remap_reference(value: u64, functions: &[usize]) -> Result<u64, Error> {
     if value == 0 {
         return Ok(0);
     }
     let index = *functions
         .get(value as usize - 1)
         .ok_or_else(|| Error::Unsupported("function reference is out of range".into()))?;
-    u32::try_from(index)
+    u64::try_from(index)
         .ok()
         .and_then(|v| v.checked_add(1))
         .ok_or_else(|| Error::Unsupported("too many linked functions".into()))
@@ -2353,6 +2584,61 @@ fn translate_with_limits(
                 modules[provider].resolved_functions[exported];
         }
     }
+    let mut gc_types = Vec::new();
+    let mut gc_type_ids = HashMap::new();
+    for module in &mut modules {
+        for (index, ty) in module.gc_types.iter().enumerate() {
+            if let Some(ty) = ty {
+                let next = gc_types.len() as u32 + 1;
+                let id = *gc_type_ids
+                    .entry(module.type_ids[index])
+                    .or_insert_with(|| {
+                        gc_types.push(ty.clone());
+                        next
+                    });
+                module.gc_ids[index] = id;
+            }
+        }
+    }
+    let uses_gc = !gc_types.is_empty()
+        || modules.iter().any(|m| {
+            let gc_ref = |r| is_gc_ref(normalize_ref(r, &m.type_ids), &m.supertypes);
+            m.types
+                .iter()
+                .flat_map(|t| t.params().iter().chain(t.results()))
+                .chain(m.global_types.iter().map(|g| &g.content_type))
+                .any(|t| matches!(t, ValType::Ref(r) if gc_ref(*r)))
+                || m.table_types.iter().any(|t| gc_ref(t.element_type))
+                || m.bodies.iter().any(|b| {
+                    b.get_locals_reader()
+                        .unwrap()
+                        .into_iter()
+                        .any(|local| matches!(local, Ok((_,ValType::Ref(r))) if gc_ref(r)))
+                        || b.get_operators_reader()
+                            .unwrap()
+                            .into_iter()
+                            .any(|op| match op {
+                                Ok(
+                                    Operator::RefI31
+                                    | Operator::RefEq
+                                    | Operator::AnyConvertExtern
+                                    | Operator::ExternConvertAny,
+                                ) => true,
+                                Ok(
+                                    Operator::RefNull { hty }
+                                    | Operator::RefTestNonNull { hty }
+                                    | Operator::RefTestNullable { hty }
+                                    | Operator::RefCastNonNull { hty }
+                                    | Operator::RefCastNullable { hty },
+                                ) => gc_ref(RefType::new(true, hty).unwrap()),
+                                Ok(
+                                    Operator::BrOnCast { to_ref_type, .. }
+                                    | Operator::BrOnCastFail { to_ref_type, .. },
+                                ) => gc_ref(to_ref_type),
+                                _ => false,
+                            })
+                })
+        });
     let &(kind, local_export) = modules[0]
         .exports
         .get(export_name)
@@ -2434,10 +2720,10 @@ fn translate_with_limits(
         }
         for &global in &module.reference_globals {
             let value = remap_reference(
-                instance.globals_template[global] as u32,
+                instance.globals_template[global],
                 &module.resolved_functions,
             )?;
-            instance.globals_template[global] = u64::from(value);
+            instance.globals_template[global] = value;
             if value != 0 {
                 referenced.push((value - 1) as usize);
             }
@@ -2686,6 +2972,31 @@ fn translate_with_limits(
             passive_data: allocate(!instance.data_lengths.is_empty()),
         });
     }
+    let init_roots = modules
+        .iter()
+        .map(|m| {
+            m.dynamic_globals
+                .iter()
+                .map(|(_, _, e)| e)
+                .chain(m.dynamic_elements.iter().map(|(_, _, e)| e))
+                .chain(m.table_init_exprs.iter().map(|(_, e)| e))
+                .map(|e| e.get_operators_reader().into_iter().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
+        + ty.params().len()
+        + 1;
+    let mut gc = uses_gc.then_some(GcLayout {
+        slot: next_slot,
+        heap_words: limits.gc_heap_words,
+        root_words: 0,
+    });
+    if uses_gc {
+        next_slot += 1;
+        can_trap = true;
+    }
     if next_slot > 31 {
         return Err(Error::Unsupported(
             "linked module state exceeds Metal's 31 buffer slots".into(),
@@ -2695,6 +3006,9 @@ fn translate_with_limits(
     source.push_str(include_str!("softfloat64.metal"));
     source.push_str(include_str!("wasm_float.metal"));
     source.push_str(include_str!("wasm_simd.metal"));
+    if uses_gc {
+        source.push_str(include_str!("wasm_gc.metal"));
+    }
     let max_memories = modules
         .iter()
         .map(|m| m.instance.memories.len())
@@ -2728,14 +3042,22 @@ fn translate_with_limits(
         .max()
         .unwrap_or(0)
         .max(1);
-    let needs_exception_input = ty
-        .params()
-        .iter()
-        .any(|ty| matches!(ty, ValType::Ref(ty) if is_exception_ref(*ty)));
-    let needs_exception_output = ty
-        .results()
-        .iter()
-        .any(|ty| matches!(ty, ValType::Ref(ty) if is_exception_ref(*ty)));
+    let gc_boundary = uses_gc
+        && ty
+            .params()
+            .iter()
+            .chain(ty.results())
+            .any(|t| matches!(t, ValType::Ref(_)));
+    let needs_exception_input = gc_boundary && exceptions
+        || ty
+            .params()
+            .iter()
+            .any(|ty| matches!(ty, ValType::Ref(ty) if is_exception_ref(*ty)));
+    let needs_exception_output = gc_boundary && exceptions
+        || ty
+            .results()
+            .iter()
+            .any(|ty| matches!(ty, ValType::Ref(ty) if is_exception_ref(*ty)));
     let exception_io = (needs_exception_input || needs_exception_output).then_some(ExceptionIo {
         records: limits.exception_records,
         payload_words: exception_payload_words,
@@ -2746,12 +3068,16 @@ fn translate_with_limits(
         let words = exception_payload_words;
         source.push_str(&format!("constant uint EXCEPTION_RECORDS = {}u; constant uint EXCEPTION_WORDS = {words}u;\nstruct ExceptionState {{ uint pending; uint count; uint tags[{}]; ulong values[{}]; }};\n", limits.exception_records, limits.exception_records, limits.exception_records.checked_mul(words).ok_or_else(|| Error::Unsupported("exception arena size overflow".into()))?));
     }
+    let gc_field = if uses_gc { "thread GcState* gc;" } else { "" };
     let exception_field = if exceptions {
         "thread ExceptionState* exceptions;"
     } else {
         ""
     };
-    source.push_str(&format!("struct ModuleState {{ {exception_field} device uchar* memory[{max_memories}]; device uint* pages[{max_memories}]; device ulong* globals; device uint* table[{max_tables}]; device const uchar* passive_data; uint table_size[{max_tables}]; thread uint* element_lengths; thread uint* data_lengths; thread uint* element_values[{max_elements}]; }};\n"));
+    source.push_str(&format!("struct ModuleState {{ {exception_field} {gc_field} device uchar* memory[{max_memories}]; device uint* pages[{max_memories}]; device ulong* globals; device ulong* table[{max_tables}]; device const uchar* passive_data; uint table_size[{max_tables}]; thread uint* element_lengths; thread uint* data_lengths; thread ulong* element_values[{max_elements}]; }};\n"));
+    if uses_gc {
+        source.push_str(&gc_type_source(&gc_types, &modules));
+    }
     if tail_calls {
         let max_args = order
             .iter()
@@ -2773,14 +3099,14 @@ fn translate_with_limits(
     for (module_index, module) in modules.iter().enumerate() {
         for (element, values) in module.instance.element_info.elements.iter().enumerate() {
             source.push_str(&format!(
-                "constant uint m{module_index}_element_{element}[{}] = {{{}}};\n",
+                "constant ulong m{module_index}_element_{element}[{}] = {{{}}};\n",
                 values.len().max(1),
                 if values.is_empty() {
                     "0u".into()
                 } else {
                     values
                         .iter()
-                        .map(|v| format!("{v}u"))
+                        .map(|v| format!("{v}ul"))
                         .collect::<Vec<_>>()
                         .join(", ")
                 }
@@ -2796,9 +3122,10 @@ fn translate_with_limits(
         )?);
         source.push_str(";\n");
     }
+    let mut max_gc_roots = 1;
     for &function in &order {
         let (module_index, local) = functions[function];
-        source.push_str(&translate_body(
+        let (body_source, roots) = translate_body(
             &modules,
             module_index,
             function,
@@ -2809,7 +3136,28 @@ fn translate_with_limits(
             limits.call_depth,
             limits.memory_bytes,
             &order,
-        )?);
+            uses_gc,
+        )?;
+        source.push_str(&body_source);
+        max_gc_roots = max_gc_roots.max(roots);
+    }
+    if let Some(layout) = &mut gc {
+        let helper_roots = gc_types
+            .iter()
+            .map(|t| t.fields.len().max(1))
+            .max()
+            .unwrap_or(1);
+        let depth = if recursive {
+            limits.call_depth
+        } else {
+            order.len().max(1)
+        };
+        layout.root_words = max_gc_roots
+            .checked_mul(depth)
+            .and_then(|n| n.checked_add(init_roots))
+            .and_then(|n| n.checked_add(helper_roots))
+            .filter(|n| *n <= u32::MAX as usize)
+            .ok_or_else(|| Error::Unsupported("GC root capacity overflow".into()))?;
     }
     if tail_calls {
         source.push_str(&tail_dispatcher(
@@ -2831,7 +3179,7 @@ fn translate_with_limits(
         }
         for (index, &table) in slot.tables.iter().enumerate() {
             source.push_str(&format!(
-                ", device uint* m{module_index}_table{index} [[buffer({table})]]"
+                ", device ulong* m{module_index}_table{index} [[buffer({table})]]"
             ));
         }
         for (slot, ty, field) in [
@@ -2845,10 +3193,23 @@ fn translate_with_limits(
             }
         }
     }
+    if let Some(layout) = gc {
+        source.push_str(&format!(
+            ", device ulong* gc_buffer [[buffer({})]]",
+            layout.slot
+        ));
+    }
     source.push_str(
         ", uint id [[thread_position_in_grid]]) {\nulong count = config[0];\nif (id >= count) return;\nuint trap = 0u;\n",
     );
     source.push_str(&format!("ModuleState states[{}] = {{}};\n", modules.len()));
+    if let Some(layout) = gc {
+        let stride = layout.heap_words + layout.root_words;
+        source.push_str(&format!("GcState gc = {{ gc_buffer + ulong(id) * {stride}ul, {}u, gc_buffer + ulong(id) * {stride}ul + {}ul, {}u, 0u, states }};\nGcRootFrame init_frame(gc, {init_roots}u, trap);\n", layout.heap_words, layout.heap_words, layout.root_words));
+        for m in 0..modules.len() {
+            source.push_str(&format!("states[{m}].gc = &gc;\n"));
+        }
+    }
     if exceptions {
         source.push_str("ExceptionState exceptions = {};\n");
         if let Some(io) = exception_io.filter(|io| io.input) {
@@ -2893,7 +3254,7 @@ fn translate_with_limits(
                 .iter()
                 .any(|(index, _, _)| *index == segment)
             {
-                source.push_str(&format!("uint m{module_index}_dynamic_element_{segment}[{}] = {{{}}};\nstates[{module_index}].element_values[{segment}] = m{module_index}_dynamic_element_{segment};\n", values.len().max(1), if values.is_empty() { "0u".into() } else { values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>().join(", ") }));
+                source.push_str(&format!("ulong m{module_index}_dynamic_element_{segment}[{}] = {{{}}};\nstates[{module_index}].element_values[{segment}] = m{module_index}_dynamic_element_{segment};\n", values.len().max(1), if values.is_empty() { "0u".into() } else { values.iter().map(|v| format!("{v}ul")).collect::<Vec<_>>().join(", ") }));
             }
         }
         if !instance.data_lengths.is_empty() {
@@ -2946,10 +3307,20 @@ fn translate_with_limits(
     } else {
         "trap == 0u"
     };
+    if uses_gc {
+        for (i, arg) in args.iter().take(ty.params().len()).enumerate() {
+            if ty.params()[i] != ValType::V128 {
+                source.push_str(&format!(
+                    "gc.roots[{}u] = {arg};\n",
+                    init_roots - ty.params().len() + i
+                ));
+            }
+        }
+    }
     for &module_index in &postorder {
         let module = &modules[module_index];
         for (slot, ty, expr) in &module.dynamic_globals {
-            let value = const_source(expr, module)?;
+            let value = const_source(expr, module, uses_gc)?;
             if *ty == ValType::V128 {
                 source.push_str(&format!("if ({ready}) {{ ulong2 value = {value}; states[{module_index}].globals[{slot}u] = value.x; states[{module_index}].globals[{}u] = value.y; }}\n", slot + 1));
             } else {
@@ -2959,16 +3330,16 @@ fn translate_with_limits(
             }
         }
         for &(segment, item, ref expr) in &module.dynamic_elements {
-            let value = const_source(expr, module)?;
-            source.push_str(&format!("if ({ready}) states[{module_index}].element_values[{segment}][{item}] = uint({value});\n"));
+            let value = const_source(expr, module, uses_gc)?;
+            source.push_str(&format!("if ({ready}) states[{module_index}].element_values[{segment}][{item}] = ulong({value});\n"));
         }
         for &(local, ref expr) in &module.table_init_exprs {
-            let value = const_source(expr, module)?;
+            let value = const_source(expr, module, uses_gc)?;
             let count = module.instance.tables[local].values.len();
-            source.push_str(&format!("if ({ready}) {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{module_index}].table[{local}][j] = uint({value}); }}\n"));
+            source.push_str(&format!("if ({ready}) {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{module_index}].table[{local}][j] = ulong({value}); }}\n"));
         }
         for &(segment, table_index, ref expr) in &module.active_elements {
-            let offset = const_source(expr, module)?;
+            let offset = const_source(expr, module, uses_gc)?;
             let (owner, local) = module.table_bindings[table_index].unwrap();
             let count = module.instance.element_info.elements[segment].len();
             let offset = if module.table_types[table_index].table64 {
@@ -2988,7 +3359,7 @@ fn translate_with_limits(
             source.push_str(&format!("if ({ready}) {{ ulong offset = {offset}; if (offset > states[{owner}].table_size[{local}] || {count}ul > states[{owner}].table_size[{local}] - offset) trap = 14u; else {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{owner}].table[{local}][offset + j] = {values}[j]; }} }}\n"));
         }
         for (memory_index, expr, data_offset, count) in &module.active_data {
-            let offset = const_source(expr, module)?;
+            let offset = const_source(expr, module, uses_gc)?;
             let (owner, local) = module.memory_bindings[*memory_index].unwrap();
             let offset = if module.memory_types[*memory_index].memory64 {
                 format!("ulong({offset})")
@@ -2996,6 +3367,18 @@ fn translate_with_limits(
                 format!("ulong(uint({offset}))")
             };
             source.push_str(&format!("if ({ready}) {{ ulong offset = {offset}; ulong size = ulong(states[{owner}].pages[{local}][0]) * 65536ul; if (offset > size || {count}ul > size - offset) trap = 4u; else {{ for (ulong j = 0ul; j < {count}ul; ++j) states[{owner}].memory[{local}][offset + j] = states[{module_index}].passive_data[{data_offset}ul + j]; }} }}\n"));
+        }
+        if uses_gc {
+            for (segment, values) in module.instance.element_info.elements.iter().enumerate() {
+                if module.instance.element_info.lengths[segment] == 0
+                    && module
+                        .dynamic_elements
+                        .iter()
+                        .any(|(s, _, _)| *s == segment)
+                {
+                    source.push_str(&format!("for(uint j=0u;j<{}u;++j) states[{module_index}].element_values[{segment}][j]=0ul;\n",values.len()));
+                }
+            }
         }
         if let Some(local) = module.start_index {
             let start = module.resolved_functions[local];
@@ -3005,6 +3388,11 @@ fn translate_with_limits(
                 source.push_str(&format!("if ({ready}) f{start}({context});\n"));
             }
         }
+    }
+    if uses_gc {
+        source.push_str(&format!(
+            "for(uint j=0u;j<{init_roots}u;++j) gc.roots[j]=0ul;\n"
+        ));
     }
     if !modules[0].memory_bindings.is_empty() {
         let argument_bytes = param_words * if fast_i32 { 4 } else { 8 };
@@ -3133,6 +3521,8 @@ fn translate_with_limits(
         function_reference_types,
         exported_functions,
         reference_supertypes,
+        gc,
+        gc_types,
         source,
         can_trap,
         params: ty.params().to_vec(),
@@ -3232,13 +3622,17 @@ fn tail_dispatcher(
 
 fn is_supported_value(ty: ValType) -> bool {
     is_numeric(ty)
-        || matches!(ty, ValType::Ref(ty) if is_function_ref(ty) || matches!(ty.heap_type(), HeapType::Abstract { shared: false, ty: AbstractHeapType::Exn | AbstractHeapType::NoExn | AbstractHeapType::Extern | AbstractHeapType::NoExtern }))
+        || matches!(ty, ValType::Ref(r) if matches!(r.heap_type(), HeapType::Concrete(_) | HeapType::Abstract { shared:false, ty:AbstractHeapType::Any | AbstractHeapType::Eq | AbstractHeapType::I31 | AbstractHeapType::Struct | AbstractHeapType::Array | AbstractHeapType::None | AbstractHeapType::Func | AbstractHeapType::NoFunc | AbstractHeapType::Extern | AbstractHeapType::NoExtern | AbstractHeapType::Exn | AbstractHeapType::NoExn }))
 }
 
-fn const_source(expr: &ConstExpr<'_>, module: &ParsedModule<'_>) -> Result<String, Error> {
+fn const_source(
+    expr: &ConstExpr<'_>,
+    module: &ParsedModule<'_>,
+    uses_gc: bool,
+) -> Result<String, Error> {
     let mut operators = expr.get_operators_reader().into_iter();
     let mut stack: Vec<String> = Vec::new();
-    for operator in operators.by_ref() {
+    for (root_index, operator) in operators.by_ref().enumerate() {
         let value = match operator? {
             Operator::I32Const { value } => format!("{}ul", value as u32),
             Operator::I64Const { value } => format!("{}ul", value as u64),
@@ -3298,10 +3692,95 @@ fn const_source(expr: &ConstExpr<'_>, module: &ParsedModule<'_>) -> Result<Strin
                     format!("({lhs} {symbol} {rhs})")
                 }
             }
+            Operator::RefI31 => {
+                let v = pop(&mut stack)?;
+                format!("(0x100000000ul | (ulong(uint({v})) & 0x7ffffffful))")
+            }
+            Operator::AnyConvertExtern => {
+                let v = pop(&mut stack)?;
+                format!("gc_internalize({v})")
+            }
+            Operator::ExternConvertAny => {
+                let v = pop(&mut stack)?;
+                format!("gc_externalize({v})")
+            }
+            op @ (Operator::StructNew {
+                struct_type_index: index,
+            }
+            | Operator::StructNewDefault {
+                struct_type_index: index,
+            }) => {
+                let t = module.gc_types[index as usize].as_ref().unwrap();
+                let args = if matches!(op, Operator::StructNewDefault { .. }) {
+                    t.fields
+                        .iter()
+                        .map(|f| {
+                            if storage_words(f) == 2 {
+                                "ulong2(0ul)".into()
+                            } else {
+                                "0ul".into()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    stack.split_off(stack.len() - t.fields.len())
+                };
+                format!(
+                    "gc_struct_{}({}gc,trap)",
+                    module.gc_ids[index as usize],
+                    if args.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{},", args.join(","))
+                    }
+                )
+            }
+            op @ (Operator::ArrayNew {
+                array_type_index: index,
+            }
+            | Operator::ArrayNewDefault {
+                array_type_index: index,
+            }) => {
+                let n = pop(&mut stack)?;
+                let t = module.gc_types[index as usize].as_ref().unwrap();
+                let v = if matches!(op, Operator::ArrayNewDefault { .. }) {
+                    if storage_words(&t.fields[0]) == 2 {
+                        "ulong2(0ul)".into()
+                    } else {
+                        "0ul".into()
+                    }
+                } else {
+                    pop(&mut stack)?
+                };
+                format!(
+                    "gc_array_{}({v},{n},gc,trap)",
+                    module.gc_ids[index as usize]
+                )
+            }
+            Operator::ArrayNewFixed {
+                array_type_index: index,
+                array_size,
+            } => {
+                let args = stack.split_off(stack.len() - array_size as usize);
+                format!(
+                    "gc_fixed_{}_{}({}gc,trap)",
+                    module.gc_ids[index as usize],
+                    array_size,
+                    if args.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{},", args.join(","))
+                    }
+                )
+            }
             Operator::End => break,
             _ => return Err(Error::Unsupported("unsupported scalar initializer".into())),
         };
-        stack.push(value);
+        stack.push(if uses_gc && !value.starts_with("ulong2(") {
+            format!("gc_keep(gc, {root_index}u, {value})")
+        } else {
+            value
+        });
     }
     if stack.len() != 1 || operators.next().is_some() {
         return Err(Error::Unsupported("unsupported scalar initializer".into()));
@@ -3430,7 +3909,7 @@ fn visit_function(
             {
                 let (owner, slot) = module.global_bindings[global_index as usize];
                 let provider = &modules[owner];
-                if matches!(module.global_types[global_index as usize].content_type, ValType::Ref(ty) if is_function_ref(ty))
+                if matches!(module.global_types[global_index as usize].content_type, ValType::Ref(ty) if is_function_ref_in(ty, &module.supertypes))
                     && !provider.dynamic_globals.iter().any(|(s, _, _)| *s == slot)
                 {
                     Some(provider.instance.globals_template[slot] as u32)
@@ -3503,7 +3982,7 @@ fn visit_function(
                         if !owner.info.mutable {
                             if let Some(slot) = previous_constant {
                                 if owner.values.get(slot as usize).copied()
-                                    != Some(target as u32 + 1)
+                                    != Some(target as u64 + 1)
                                 {
                                     continue;
                                 }
@@ -3633,7 +4112,8 @@ fn translate_body(
     call_depth: usize,
     memory_bytes: usize,
     order: &[usize],
-) -> Result<String, Error> {
+    uses_gc: bool,
+) -> Result<(String, usize), Error> {
     let module = &modules[module_index];
     let body = &module.bodies[local_function - module.imports.len()];
     let ty = module.function_type(local_function)?;
@@ -3713,7 +4193,7 @@ fn translate_body(
         source.push_str("device uchar* memory = nullptr; device uint* pages = nullptr;\n");
     }
     if !tables.is_empty() {
-        source.push_str("device uint* table = nullptr; thread uint* table_size = nullptr;\n");
+        source.push_str("device ulong* table = nullptr; thread uint* table_size = nullptr;\n");
     }
     for (exists, ty, field) in [
         (
@@ -3786,10 +4266,17 @@ fn translate_body(
     if end != End::Block || operators.next().is_some() {
         return Err(Error::Unsupported("invalid function body".into()));
     }
+    if uses_gc {
+        source.push_str("thread GcState& gc = *states[0].gc;\nGcRootFrame gc_frame(gc, GC_FRAME_SLOTSu, trap);\nif (trap != 0u) return;\n");
+    }
     let declarations_at = source.len();
     source.push_str("uint flow = 0u;\n");
     let mut compiler = Compiler {
         source,
+        uses_gc,
+        gc_types: &module.gc_types,
+        gc_ids: &module.gc_ids,
+        max_gc_roots: 0,
         module_index,
         resolved_functions: &module.resolved_functions,
         global_types,
@@ -3839,7 +4326,13 @@ fn translate_body(
     compiler
         .source
         .insert_str(declarations_at, &compiler.declarations);
-    Ok(compiler.source)
+    Ok((
+        compiler.source.replace(
+            "GC_FRAME_SLOTSu",
+            &format!("{}u", compiler.max_gc_roots.max(1)),
+        ),
+        compiler.max_gc_roots.max(1),
+    ))
 }
 
 #[derive(PartialEq, Eq)]
@@ -3923,13 +4416,17 @@ struct MemoryState {
 struct TableState<'a> {
     owner: usize,
     local: usize,
-    values: &'a [u32],
+    values: &'a [u64],
     info: &'a TableInfo,
     targets: &'a [usize],
     is64: bool,
 }
 
 struct Compiler<'a> {
+    uses_gc: bool,
+    gc_types: &'a [Option<GcType>],
+    gc_ids: &'a [u32],
+    max_gc_roots: usize,
     module_index: usize,
     resolved_functions: &'a [usize],
     global_types: &'a [FuncType],
@@ -3964,6 +4461,14 @@ struct Compiler<'a> {
 impl Compiler<'_> {
     fn reference_test(&self, value: &str, ty: RefType) -> Result<String, Error> {
         let nonnull = match ty.heap_type() {
+            HeapType::Concrete(UnpackedIndex::Module(index))
+                if self.gc_ids[index as usize] != 0 =>
+            {
+                format!(
+                    "(({value} >> 32u) == 3ul && gc_type_match(uint(gc.heap[uint({value})]), {}u))",
+                    self.gc_ids[index as usize]
+                )
+            }
             HeapType::Concrete(UnpackedIndex::Module(index)) => {
                 let targets = self
                     .cast_targets
@@ -3988,6 +4493,39 @@ impl Compiler<'_> {
             HeapType::Abstract {
                 shared: false,
                 ty: AbstractHeapType::NoFunc | AbstractHeapType::NoExtern | AbstractHeapType::NoExn,
+            } => "false".into(),
+            HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::Any,
+            } => "true".into(),
+            HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::Eq,
+            } => format!("(({value}>>32u)==1ul || ({value}>>32u)==3ul)"),
+            HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::I31,
+            } => format!("({value}>>32u)==1ul"),
+            HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::Struct | AbstractHeapType::Array,
+            } => format!(
+                "(({value}>>32u)==3ul && gc_kind(uint(gc.heap[uint({value})]))=={}u)",
+                if matches!(
+                    ty.heap_type(),
+                    HeapType::Abstract {
+                        ty: AbstractHeapType::Struct,
+                        ..
+                    }
+                ) {
+                    1
+                } else {
+                    2
+                }
+            ),
+            HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::None,
             } => "false".into(),
             _ => return Err(Error::Unsupported("unsupported reference cast type".into())),
         };
@@ -4690,6 +5228,26 @@ impl Compiler<'_> {
         operator: &Operator<'_>,
         stack: &mut Vec<String>,
     ) -> Result<(), Error> {
+        if self.uses_gc
+            && matches!(
+                operator,
+                Operator::Call { .. }
+                    | Operator::CallRef { .. }
+                    | Operator::CallIndirect { .. }
+                    | Operator::StructNew { .. }
+                    | Operator::StructNewDefault { .. }
+                    | Operator::ArrayNew { .. }
+                    | Operator::ArrayNewDefault { .. }
+                    | Operator::ArrayNewFixed { .. }
+                    | Operator::ArrayNewData { .. }
+                    | Operator::ArrayNewElem { .. }
+            )
+        {
+            self.publish_gc_roots(stack);
+        }
+        if self.emit_gc_operator(operator, stack)? {
+            return Ok(());
+        }
         match operator {
             Operator::Nop => {}
             Operator::I32Const { value } => stack.push(format!("{}ul", *value as u32)),
@@ -4760,7 +5318,7 @@ impl Compiler<'_> {
                 let value = pop(stack)?;
                 let index = pop(stack)?;
                 let size = self.table_size(*table)?;
-                self.source.push_str(&format!("if ({index} >= {size}) {{ trap = 14u; return; }}\ntable[{index}] = uint({value});\n"));
+                self.source.push_str(&format!("if ({index} >= {size}) {{ trap = 14u; return; }}\ntable[{index}] = ulong({value});\n"));
             }
             Operator::TableSize { table } => {
                 let size = self.table_size(*table)?;
@@ -4780,7 +5338,7 @@ impl Compiler<'_> {
                 let result = self.fresh_value();
                 let slot = self.fresh_value();
                 self.source.push_str(&format!(
-                    "{result} = {failure};\nif ({count} <= {capacity}ul - ulong(*table_size)) {{\n{result} = *table_size;\nfor ({slot} = *table_size; {slot} < ulong(*table_size) + {count}; ++{slot}) table[{slot}] = uint({value});\n*table_size += uint({count});\n}}\n"));
+                    "{result} = {failure};\nif ({count} <= {capacity}ul - ulong(*table_size)) {{\n{result} = *table_size;\nfor ({slot} = *table_size; {slot} < ulong(*table_size) + {count}; ++{slot}) table[{slot}] = ulong({value});\n*table_size += uint({count});\n}}\n"));
                 stack.push(result);
             }
             Operator::TableFill { table } => {
@@ -4790,7 +5348,7 @@ impl Compiler<'_> {
                 let size = self.table_size(*table)?;
                 let slot = self.fresh_value();
                 self.source.push_str(&format!(
-                    "if ({destination} > {size} || {count} > {size} - {destination}) {{ trap = 14u; return; }}\nfor ({slot} = 0ul; {slot} < {count}; ++{slot}) table[{destination} + {slot}] = uint({value});\n"));
+                    "if ({destination} > {size} || {count} > {size} - {destination}) {{ trap = 14u; return; }}\nfor ({slot} = 0ul; {slot} < {count}; ++{slot}) table[{destination} + {slot}] = ulong({value});\n"));
             }
             Operator::TableCopy {
                 dst_table,
@@ -4838,6 +5396,15 @@ impl Compiler<'_> {
                     .ok_or_else(|| Error::Unsupported("element index is out of range".into()))?;
                 self.source
                     .push_str(&format!("element_lengths[{elem_index}u] = 0u;\n"));
+                if self.uses_gc
+                    && self
+                        .dynamic_elements
+                        .iter()
+                        .any(|(s, _, _)| *s == *elem_index as usize)
+                {
+                    let length = self.element_info.elements[*elem_index as usize].len();
+                    self.source.push_str(&format!("for(uint j=0u;j<{length}u;++j) states[{}].element_values[{elem_index}][j]=0ul;\n",self.module_index));
+                }
             }
             Operator::GlobalGet { global_index } => {
                 let index = *global_index as usize;
@@ -5230,7 +5797,7 @@ impl Compiler<'_> {
                 for &index in table_targets {
                     if !table_mutable
                         && constant_slot.is_some()
-                        && constant_target != Some(index as u32 + 1)
+                        && constant_target != Some(index as u64 + 1)
                     {
                         continue;
                     }
@@ -7748,7 +8315,11 @@ mod tests {
                     Value::F32(bits) => wasmtime::Val::F32(*bits),
                     Value::F64(bits) => wasmtime::Val::F64(*bits),
                     Value::V128(bits) => wasmtime::Val::V128(u128::from_le_bytes(*bits).into()),
-                    Value::FuncRef(_) | Value::ExternRef(_) | Value::ExnRef(_) => {
+                    Value::FuncRef(_)
+                    | Value::ExternRef(_)
+                    | Value::ExnRef(_)
+                    | Value::I31(_)
+                    | Value::GcRef(_) => {
                         panic!("numeric differential helper received a reference")
                     }
                 })
@@ -8985,4 +9556,20 @@ mod tests {
             &[vec![Value::I32(0)], vec![Value::I32(17)]],
         );
     }
+}
+
+fn expr_uses_gc(expr: &ConstExpr<'_>) -> bool {
+    expr.get_operators_reader().into_iter().any(|op| {
+        matches!(
+            op,
+            Ok(Operator::StructNew { .. }
+                | Operator::StructNewDefault { .. }
+                | Operator::ArrayNew { .. }
+                | Operator::ArrayNewDefault { .. }
+                | Operator::ArrayNewFixed { .. }
+                | Operator::RefI31
+                | Operator::AnyConvertExtern
+                | Operator::ExternConvertAny)
+        )
+    })
 }
