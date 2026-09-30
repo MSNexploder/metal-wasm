@@ -1,0 +1,5 @@
+workload,count,metal_total_us,metal_gpu_us,wasmtime_us,wasmi_us,native_us,samples
+persistent_state,1,3862.21,496.88,1.67,5.71,1.25,3
+persistent_state,1000,6483.58,578.17,3257.29,5781.58,796.17,3
+persistent_state,4096,12396.79,887.17,13219.92,23689.62,3271.04,3
+persistent_state,10000,23754.08,2182.16,32099.54,57340.12,7865.29,3

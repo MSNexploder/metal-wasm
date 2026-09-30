@@ -44,13 +44,75 @@ let output = kernel.run(&[1, 2, 3])?;
 
 Requires macOS with a Metal device and the Rust toolchain. Run `cargo test` to validate GPU execution. The kernel compiles once and can run repeatedly with different input batches. `run_timed` sums GPU execution time across dispatches; it excludes host-side buffer copies and submission.
 
+## Persistent instances
+
+`Store` keeps a fixed number of independent lanes alive across calls. Each lane
+retains memories and their sizes, globals, tables and their sizes, segment drop
+state, GC objects, and exception records. Different exports use the same state.
+Instantiation runs the new module's initializers, active segments, and start
+function once. Existing providers keep their state and do not restart.
+
+```rust
+use metal_wasm::Store;
+
+let wasm = std::fs::read("function.wasm")?;
+let mut store = Store::new(3)?;
+let instance = store.instantiate(&wasm, &[])?;
+let first = store.call_i32(instance, "calculate", &[1, 2, 3])?;
+let second = store.call_i32(instance, "calculate", &[4, 5, 6])?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Use `Store::new_with_limits(lanes, limits)` to change resource bounds.
+`call(instance, export, rows)` supports general signatures. Every call needs
+exactly one input row per lane. `call_i32_timed` supplies the `(i32) -> i32`
+interface and GPU command time. Pipelines compile on their first use; adding
+an instance invalidates cached pipelines so indirect calls can reach new functions.
+
+`instantiate(wasm, &[("provider", existing_instance)])` links to live provider
+resources, including reexports and namespace aliases. Import limits are checked
+against the provider's current memory and table sizes in every lane. Instance
+and reference handles belong to one store. `function_reference(instance, export)`
+and opaque external host values can be used in any lane of that store. Returned
+GC and exception handles retain their live identity and can only be passed back
+to their original lane. GC handles root their objects until the store is dropped.
+The matching reference conversion, kind, and exception payload methods are also
+available on `Store`.
+
+`get_global(instance, export)` reads one value per lane.
+`read_memory(instance, export, range)` and
+`write_memory(instance, export, offset, rows)` access current exported memories.
+These methods also resolve imported resource exports. Change tables and globals
+through exported Wasm functions.
+
+Traps and uncaught exceptions retain changes made before execution stopped.
+Other submitted lanes may also have completed. A failed start does not return an
+instance handle; its resources remain internally retained because references
+can have escaped into a provider. A failed Metal command makes the store unusable.
+
+Persistent resources must fit the device's Metal buffer limit. Exception capacity
+is a bound over each persistent lane's lifetime; handled records are retained.
+Host reference records also remain retained until store drop. There is no execution
+timeout. `Kernel` continues to provide fresh independent instances and GC snapshots
+for each invocation.
+
 ## Compatibility checks
 
 Run `cargo run --example compat -- MODULE.wasm EXPORT I32_INPUT ...` with chosen inputs to check an exported `(i32) -> i32` function against fresh Wasmtime instances. It reports an unsupported module or signature with the reason, accepts matching traps and uncaught exceptions, and fails if Metal and Wasmtime disagree. For example, `cargo run --example compat -- tests/corpus/memory.wasm calculate 0 1 42` checks a compiled Rust memory workload. Run only terminating functions; the GPU runner has no execution timeout.
 
-`cargo test --test compiled_corpus` checks two supported compiled Rust modules against Wasmtime and checks that a third compiled module reports its unsupported host import. Their sources, binaries, and build commands are in `tests/corpus/`. `cargo test --test spec_runtime` checks pinned official scalar, SIMD, typed function reference, exception, tail-call, extended-constant, multiple-memory, memory64, and the complete pinned GC script directory assertions. The harness replays successful actions within one lane for reference and table scripts, including external handle arguments. Other scripts that require persistent instance state remain outside the harness; see `tests/spec/README.md`. Runtime tests also compare memory, table, import, and initialization behavior with Wasmtime. These checks do not establish full Wasm conformance.
+`cargo test --test compiled_corpus` checks two supported compiled Rust modules against Wasmtime and checks that a third compiled module reports its unsupported host import. `cargo test --test persistent_runtime` also compares a compiled Rust static with persistent Wasmtime instances and checks lane state, linking, traps, live references, and collection. Sources, binaries, and build commands are in `tests/corpus/`. `cargo test --test spec_runtime` checks pinned official scalar, SIMD, typed function reference, exception, tail-call, extended-constant, multiple-memory, memory64, and complete GC scripts. It uses actual persistent instances for all scripts, including actions after traps, named invocations, registrations, global reads, and module definitions. Whole initialization, linking, growth, and bulk-operation scripts extend coverage; see `tests/spec/README.md`. These checks do not establish full Wasm conformance.
 
 ## Performance comparison
+
+Run `cargo run --release --example compare -- --persistent` to compare Metal,
+Wasmtime, Wasmi, and native Rust with persistent state. At 1, 1,000, 4,096, and
+10,000 lanes, each sample makes 16 calls per lane. Each call performs 24 rounds
+of integer arithmetic using a mutable global and four memory cells. CPU Wasm
+engines use one persistent instance per lane. The benchmark verifies every lane's
+final digest and reports the median of three samples, including Metal total and
+GPU command times. Compilation, instantiation, initialization, warmup, and digest
+verification are outside the timed region. `count` means lanes; total calls are
+`count * 16`. The workload is also included in `--suite`.
 
 Run `cargo run --release --example compare` to compare Metal, Wasmtime, Wasmi, and optimized native Rust at 1, 1,000, 1,000,000, and 10,000,000 invocations. The example uses the same `x * 7 + 3` function for every path, checks every result, and prints median elapsed times in microseconds. It takes 31 samples of 100 runs for 1 invocation, 11 samples of 10 runs for 1,000, and 3 single-run samples for each larger count. Small runs are repeated inside each timed sample to reduce clock overhead.
 
@@ -60,11 +122,30 @@ Run `cargo run --release --example compare -- --mix` for a compute-heavy compari
 
 Run `cargo run --release --example compare -- --control` for the same counts with a 32-iteration Wasm loop and an `if`/`else` in every iteration. The `grouped` pattern places even inputs before odd inputs in groups of 32, so neighboring lanes usually take the same branch. The `mixed` pattern interleaves those same even and odd values, so neighboring lanes disagree. Both patterns execute the same arithmetic and number of iterations overall; only input order changes. Each path runs on Metal, Wasmtime, Wasmi, and native Rust, with the CPU Wasm engines omitted at 100,000,000 inputs. This mode uses three samples and checks every result. The `pattern` column identifies the input pattern; `metal_gpu_us` includes GPU buffer access and kernel execution.
 
-Run `cargo run --release --example compare -- --suite` for thirteen workloads. `gc_graph` runs 64 rounds of struct and array allocation, mutation, and reclamation in each lane; run `cargo run --release --example compare -- --gc` to measure it alone. Its 2,560 allocated words per invocation exceed the default 1,024-word heap, so it exercises collection. It uses counts 1, 1,000, 10,000, and 100,000. The original `dispatch_i64`, `float_f64`, and `stateful_memory` cases remain. `bulk_start` uses a start function and bulk memory operations; `recursive_calls` uses variable-depth recursion; `mutable_table` uses passive elements, table updates, and indirect calls; `imported_calls` links a separate Wasm provider module; `linked_resources` imports and mutates provider memory, a global, and a table. `simd_i32x4` runs 32 rounds of four-lane integer arithmetic and a lane reduction. `reference_casts` runs 32 rounds of cast branches, typed dispatch, exception table capture and rethrow, and external-null tests. It measures GPU reference operations; public exception serialization and non-null external host values are covered by integration tests. `typed_exceptions` runs 32 rounds of typed function dispatch, divergent branches, and payload throws and catches. `tail_multi_resource` combines tail calls, extended constants, two memories, a 64-bit memory, and a 64-bit table. Run `cargo run --release --example compare -- --simd`, `--tail-multi-resource`, `--typed-exceptions`, or `--reference-casts` to measure one workload. Their definitions are in `examples/workloads/`. Each workload is checked against optimized native Rust and Wasmtime; Wasmi is omitted for the SIMD and new feature workloads because this version does not support their Wasm features. This mode reports the median of three single-run samples at 1, 1,000, 100,000, and 1,000,000 invocations, except the four memory workloads, which use 1, 1,000, 4,096, and 10,000 to exercise bounded dispatches.
+Run `cargo run --release --example compare -- --suite` for fourteen workloads. `persistent_state` uses repeated calls against live per-lane state, as described above. `gc_graph` runs 64 rounds of struct and array allocation, mutation, and reclamation in each lane; run `cargo run --release --example compare -- --gc` to measure it alone. Its 2,560 allocated words per invocation exceed the default 1,024-word heap, so it exercises collection. It uses counts 1, 1,000, 10,000, and 100,000. The original `dispatch_i64`, `float_f64`, and `stateful_memory` cases remain. `bulk_start` uses a start function and bulk memory operations; `recursive_calls` uses variable-depth recursion; `mutable_table` uses passive elements, table updates, and indirect calls; `imported_calls` links a separate Wasm provider module; `linked_resources` imports and mutates provider memory, a global, and a table. `simd_i32x4` runs 32 rounds of four-lane integer arithmetic and a lane reduction. `reference_casts` runs 32 rounds of cast branches, typed dispatch, exception table capture and rethrow, and external-null tests. It measures GPU reference operations; public exception serialization and non-null external host values are covered by integration tests. `typed_exceptions` runs 32 rounds of typed function dispatch, divergent branches, and payload throws and catches. `tail_multi_resource` combines tail calls, extended constants, two memories, a 64-bit memory, and a 64-bit table. Run `cargo run --release --example compare -- --simd`, `--tail-multi-resource`, `--typed-exceptions`, or `--reference-casts` to measure one workload. Their definitions are in `examples/workloads/`. Each workload is checked against optimized native Rust and Wasmtime; Wasmi is omitted for the SIMD and new feature workloads because this version does not support their Wasm features. This mode reports the median of three single-run samples at 1, 1,000, 100,000, and 1,000,000 invocations, except the four memory workloads, which use 1, 1,000, 4,096, and 10,000 to exercise bounded dispatches.
 
 The timed region includes result allocation and execution. Metal also includes per-lane state initialization, input transfer, command submission, and result transfer. Module compilation, CPU engine instantiation, warmup, input generation, and result verification are outside the timed region. Wasmtime and Wasmi reuse one instance per module and make one typed host call per input; the stateful and linked-resource workloads reset their touched state for each call. Metal batches one or more dispatches and runs each start function per lane. Thus `bulk_start` includes per-lane start work on Metal, while CPU start work occurs outside the timed region. These figures compare these APIs for these workloads, not peak engine or GPU throughput.
 
 ## Recorded benchmark results
+
+The [persistent results](examples/persistent-benchmark-results.csv) were measured
+on 2026-09-30 with an Apple M1 Max, 64 GB RAM, macOS 27.0, and a release build.
+Each sample executes 16 calls per lane. These times are milliseconds and are
+medians of three samples; every final lane digest matched all four implementations.
+
+| Lanes | Total calls | Metal total | Metal GPU | Wasmtime | Wasmi | Native Rust |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 16 | 3.86221 | 0.49688 | 0.00167 | 0.00571 | 0.00125 |
+| 1,000 | 16,000 | 6.48358 | 0.57817 | 3.25729 | 5.78158 | 0.79617 |
+| 4,096 | 65,536 | 12.39679 | 0.88717 | 13.21992 | 23.68962 | 3.27104 |
+| 10,000 | 160,000 | 23.75408 | 2.18216 | 32.09954 | 57.34012 | 7.86529 |
+
+At 10,000 lanes, Metal total time is about 1.35× faster than Wasmtime and 2.41×
+faster than Wasmi. Native Rust is about 3.02× faster than Metal total time.
+Metal GPU time excludes host work and submission. The difference from total time
+shows the cost of 16 synchronous calls through this API, including metadata,
+argument, and result handling. This workload retains instance state on the GPU;
+it does not copy each lane's full linear memory between calls.
 
 The [full suite results](examples/benchmark-results.csv) were measured on 2026-09-30 with an Apple M1 Max, 64 GB RAM, macOS 27.0, and a release build. All thirteen workloads passed result verification. Each row reports the median of three samples. The new `gc_graph` workload produced these times in milliseconds:
 

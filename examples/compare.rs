@@ -2,7 +2,7 @@ use std::error::Error;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use metal_wasm::Kernel;
+use metal_wasm::{Kernel, Store};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -22,6 +22,10 @@ const OTHER_MULTIPLIER: u32 = 0x85eb_ca6b;
 const MEMORY_DATA: [u8; 16] = [
     5, 17, 35, 55, 77, 91, 114, 138, 161, 184, 207, 229, 13, 47, 83, 121,
 ];
+const PERSISTENT_COUNTS: [usize; 4] = [1, 1_000, 4_096, 10_000];
+const PERSISTENT_STEPS: usize = 16;
+const PERSISTENT_INIT_XORS: [u32; 4] = [0xa5a5_a5a5, 0x3c6e_f372, 0xdaa6_6d2b, 0x78de_e6e4];
+const PERSISTENT_WAT: &str = include_str!("workloads/persistent_state.wat");
 
 struct SuiteWorkload {
     name: &'static str,
@@ -144,6 +148,7 @@ fn main() -> Result<()> {
         Some("--mix") => return compare_compute(false),
         Some("--control") => return compare_compute(true),
         Some("--suite") => return compare_suite(None),
+        Some("--persistent") => return compare_persistent(),
         Some("--gc") => return compare_suite(Some("gc_graph")),
         Some("--reference-casts") => return compare_suite(Some("reference_casts")),
         Some("--typed-exceptions") => return compare_suite(Some("typed_exceptions")),
@@ -420,7 +425,428 @@ fn compare_suite(filter: Option<&str>) -> Result<()> {
             );
         }
     }
+    if filter.is_none() {
+        compare_persistent_rows()?;
+    }
     Ok(())
+}
+
+fn compare_persistent() -> Result<()> {
+    println!("workload,count,metal_total_us,metal_gpu_us,wasmtime_us,wasmi_us,native_us,samples");
+    compare_persistent_rows()
+}
+
+fn compare_persistent_rows() -> Result<()> {
+    let wasm = wat::parse_str(PERSISTENT_WAT)?;
+    for count in PERSISTENT_COUNTS {
+        // `count` is the lane count. Each sample performs this many step calls
+        // per lane, for `count * PERSISTENT_STEPS` total calls.
+        eprintln!(
+            "measuring persistent_state at {count} lanes ({} step calls per lane, {} total calls per sample)...",
+            PERSISTENT_STEPS,
+            count * PERSISTENT_STEPS
+        );
+        let seeds = persistent_seeds(count);
+        let inputs = persistent_inputs(&seeds);
+        let expected = persistent_expected_digests(&seeds, &inputs);
+        let (metal_total, metal_gpu) = measure_persistent_metal(&wasm, &seeds, &inputs, &expected)?;
+        let wasmtime = measure_persistent_wasmtime(&wasm, &seeds, &inputs, &expected)?;
+        let wasmi = measure_persistent_wasmi(&wasm, &seeds, &inputs, &expected)?;
+        let native = measure_persistent_native(&seeds, &inputs, &expected)?;
+        println!(
+            "persistent_state,{count},{:.2},{:.2},{:.2},{:.2},{:.2},3",
+            micros(metal_total),
+            micros(metal_gpu),
+            micros(wasmtime),
+            micros(wasmi),
+            micros(native)
+        );
+    }
+    Ok(())
+}
+
+fn persistent_seeds(count: usize) -> Vec<u32> {
+    (0..count)
+        .map(|lane| {
+            (lane as u32)
+                .wrapping_mul(0x6d2b_79f5)
+                .wrapping_add(0x1234_5678)
+        })
+        .collect()
+}
+
+fn persistent_inputs(seeds: &[u32]) -> Vec<Vec<u32>> {
+    (0..PERSISTENT_STEPS)
+        .map(|round| {
+            seeds
+                .iter()
+                .copied()
+                .map(|seed| {
+                    seed.rotate_left((round as u32) & 31) ^ (round as u32).wrapping_mul(0x9e37_79b9)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct PersistentState {
+    global: u32,
+    cells: [u32; 4],
+}
+
+fn persistent_state(seed: u32) -> PersistentState {
+    PersistentState {
+        global: seed,
+        cells: PERSISTENT_INIT_XORS.map(|xor| seed ^ xor),
+    }
+}
+
+fn persistent_step(state: &mut PersistentState, input: u32) -> u32 {
+    let mut value = state.global ^ input;
+    for round in 0..24u32 {
+        let slot = (round & 3) as usize;
+        value = ((value ^ state.global)
+            .rotate_left(5)
+            .wrapping_add(state.cells[slot])
+            ^ u32::from(MEMORY_DATA[(round & 15) as usize]))
+        .wrapping_mul(MIX_MULTIPLIER)
+        .wrapping_add(round);
+        state.cells[slot] = value;
+        state.global = value.rotate_left(13);
+    }
+    value ^ state.global
+}
+
+fn persistent_digest(state: &PersistentState, input: u32) -> u32 {
+    input
+        ^ state.global
+        ^ state.cells[0]
+        ^ state.cells[1].rotate_left(3)
+        ^ state.cells[2].rotate_left(7)
+        ^ state.cells[3].rotate_left(11)
+}
+
+fn persistent_expected_digests(seeds: &[u32], inputs: &[Vec<u32>]) -> Vec<u32> {
+    let mut states: Vec<_> = seeds.iter().copied().map(persistent_state).collect();
+    for round_inputs in inputs {
+        run_native_persistent(&mut states, round_inputs).unwrap();
+    }
+    states
+        .iter()
+        .zip(seeds)
+        .map(|(state, &seed)| persistent_digest(state, seed))
+        .collect()
+}
+
+fn run_native_persistent(states: &mut [PersistentState], inputs: &[u32]) -> Result<Vec<u32>> {
+    if states.len() != inputs.len() {
+        return Err(format!(
+            "persistent state/input length mismatch: {} states, {} inputs",
+            states.len(),
+            inputs.len()
+        )
+        .into());
+    }
+    Ok(states
+        .iter_mut()
+        .zip(inputs)
+        .map(|(state, &input)| persistent_step(state, input))
+        .collect())
+}
+
+fn verify_persistent_values(actual: &[u32], expected: &[u32], label: &str) -> Result<()> {
+    if actual.len() != expected.len() {
+        return Err(format!(
+            "{label} output length: got {}, expected {}",
+            actual.len(),
+            expected.len()
+        )
+        .into());
+    }
+    for (lane, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        if actual != expected {
+            return Err(format!(
+                "{label} output mismatch at lane {lane}: got {actual}, expected {expected}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn measure_persistent_metal(
+    wasm: &[u8],
+    seeds: &[u32],
+    inputs: &[Vec<u32>],
+    expected: &[u32],
+) -> Result<(Duration, Duration)> {
+    let mut store = Store::new(seeds.len())?;
+    let instance = store.instantiate(wasm, &[])?;
+    let mut total_times = Vec::with_capacity(3);
+    let mut gpu_times = Vec::with_capacity(3);
+    let warmup_inputs = inputs.first().ok_or("persistent workload has no steps")?;
+    black_box(store.call_i32(instance, "init", seeds)?);
+    black_box(store.call_i32(instance, "step", warmup_inputs)?);
+    black_box(store.call_i32(instance, "digest", seeds)?);
+    for _ in 0..3 {
+        let initialized = store.call_i32(instance, "init", seeds)?;
+        verify_persistent_values(&initialized, seeds, "Metal init")?;
+        let start = Instant::now();
+        let mut gpu_time = Duration::ZERO;
+        for round_inputs in inputs {
+            let (output, elapsed) =
+                store.call_i32_timed(instance, "step", black_box(round_inputs))?;
+            black_box(output);
+            gpu_time = gpu_time
+                .checked_add(elapsed.ok_or("Metal GPU timestamps are unavailable")?)
+                .ok_or("Metal GPU time overflow")?;
+        }
+        total_times.push(start.elapsed());
+        gpu_times.push(gpu_time);
+        let digest = store.call_i32(instance, "digest", seeds)?;
+        verify_persistent_values(&digest, expected, "Metal digest")?;
+    }
+    total_times.sort_unstable();
+    gpu_times.sort_unstable();
+    Ok((total_times[1], gpu_times[1]))
+}
+
+struct WasmtimePersistent {
+    _engine: wasmtime::Engine,
+    _instances: Vec<wasmtime::Instance>,
+    store: wasmtime::Store<()>,
+    init: Vec<wasmtime::TypedFunc<i32, i32>>,
+    step: Vec<wasmtime::TypedFunc<i32, i32>>,
+    digest: Vec<wasmtime::TypedFunc<i32, i32>>,
+}
+
+impl WasmtimePersistent {
+    fn new(wasm: &[u8], count: usize) -> Result<Self> {
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, wasm)?;
+        let mut store = wasmtime::Store::new(&engine, ());
+        let mut instances = Vec::with_capacity(count);
+        for _ in 0..count {
+            instances.push(wasmtime::Instance::new(&mut store, &module, &[])?);
+        }
+        let mut init = Vec::with_capacity(count);
+        let mut step = Vec::with_capacity(count);
+        let mut digest = Vec::with_capacity(count);
+        for instance in &instances {
+            init.push(instance.get_typed_func(&mut store, "init")?);
+            step.push(instance.get_typed_func(&mut store, "step")?);
+            digest.push(instance.get_typed_func(&mut store, "digest")?);
+        }
+        Ok(Self {
+            _engine: engine,
+            _instances: instances,
+            store,
+            init,
+            step,
+            digest,
+        })
+    }
+}
+
+fn call_wasmtime_persistent(
+    store: &mut wasmtime::Store<()>,
+    funcs: &[wasmtime::TypedFunc<i32, i32>],
+    inputs: &[u32],
+) -> Result<Vec<u32>> {
+    if funcs.len() != inputs.len() {
+        return Err(format!(
+            "Wasmtime state/input length mismatch: {} functions, {} inputs",
+            funcs.len(),
+            inputs.len()
+        )
+        .into());
+    }
+    Ok(funcs
+        .iter()
+        .zip(inputs)
+        .map(|(func, &input)| {
+            func.call(&mut *store, input as i32)
+                .map(|value| value as u32)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn measure_persistent_wasmtime(
+    wasm: &[u8],
+    seeds: &[u32],
+    inputs: &[Vec<u32>],
+    expected: &[u32],
+) -> Result<Duration> {
+    let mut runner = WasmtimePersistent::new(wasm, seeds.len())?;
+    let mut times = Vec::with_capacity(3);
+    let warmup_inputs = inputs.first().ok_or("persistent workload has no steps")?;
+    black_box(call_wasmtime_persistent(
+        &mut runner.store,
+        &runner.init,
+        seeds,
+    )?);
+    black_box(call_wasmtime_persistent(
+        &mut runner.store,
+        &runner.step,
+        warmup_inputs,
+    )?);
+    black_box(call_wasmtime_persistent(
+        &mut runner.store,
+        &runner.digest,
+        seeds,
+    )?);
+    for _ in 0..3 {
+        let initialized = call_wasmtime_persistent(&mut runner.store, &runner.init, seeds)?;
+        verify_persistent_values(&initialized, seeds, "Wasmtime init")?;
+        let start = Instant::now();
+        for round_inputs in inputs {
+            black_box(call_wasmtime_persistent(
+                &mut runner.store,
+                &runner.step,
+                black_box(round_inputs),
+            )?);
+        }
+        times.push(start.elapsed());
+        let digest = call_wasmtime_persistent(&mut runner.store, &runner.digest, seeds)?;
+        verify_persistent_values(&digest, expected, "Wasmtime digest")?;
+    }
+    times.sort_unstable();
+    Ok(times[1])
+}
+
+struct WasmiPersistent {
+    _engine: wasmi::Engine,
+    _instances: Vec<wasmi::Instance>,
+    store: wasmi::Store<()>,
+    init: Vec<wasmi::TypedFunc<i32, i32>>,
+    step: Vec<wasmi::TypedFunc<i32, i32>>,
+    digest: Vec<wasmi::TypedFunc<i32, i32>>,
+}
+
+impl WasmiPersistent {
+    fn new(wasm: &[u8], count: usize) -> Result<Self> {
+        let engine = wasmi::Engine::default();
+        let module = wasmi::Module::new(&engine, wasm)?;
+        let mut store = wasmi::Store::new(&engine, ());
+        let mut instances = Vec::with_capacity(count);
+        for _ in 0..count {
+            instances.push(wasmi::Linker::new(&engine).instantiate_and_start(&mut store, &module)?);
+        }
+        let mut init = Vec::with_capacity(count);
+        let mut step = Vec::with_capacity(count);
+        let mut digest = Vec::with_capacity(count);
+        for instance in &instances {
+            init.push(instance.get_typed_func(&store, "init")?);
+            step.push(instance.get_typed_func(&store, "step")?);
+            digest.push(instance.get_typed_func(&store, "digest")?);
+        }
+        Ok(Self {
+            _engine: engine,
+            _instances: instances,
+            store,
+            init,
+            step,
+            digest,
+        })
+    }
+}
+
+fn call_wasmi_persistent(
+    store: &mut wasmi::Store<()>,
+    funcs: &[wasmi::TypedFunc<i32, i32>],
+    inputs: &[u32],
+) -> Result<Vec<u32>> {
+    if funcs.len() != inputs.len() {
+        return Err(format!(
+            "Wasmi state/input length mismatch: {} functions, {} inputs",
+            funcs.len(),
+            inputs.len()
+        )
+        .into());
+    }
+    let mut output = Vec::with_capacity(inputs.len());
+    for (func, &input) in funcs.iter().zip(inputs) {
+        output.push(func.call(&mut *store, input as i32)? as u32);
+    }
+    Ok(output)
+}
+
+fn measure_persistent_wasmi(
+    wasm: &[u8],
+    seeds: &[u32],
+    inputs: &[Vec<u32>],
+    expected: &[u32],
+) -> Result<Duration> {
+    let mut runner = WasmiPersistent::new(wasm, seeds.len())?;
+    let mut times = Vec::with_capacity(3);
+    let warmup_inputs = inputs.first().ok_or("persistent workload has no steps")?;
+    black_box(call_wasmi_persistent(
+        &mut runner.store,
+        &runner.init,
+        seeds,
+    )?);
+    black_box(call_wasmi_persistent(
+        &mut runner.store,
+        &runner.step,
+        warmup_inputs,
+    )?);
+    black_box(call_wasmi_persistent(
+        &mut runner.store,
+        &runner.digest,
+        seeds,
+    )?);
+    for _ in 0..3 {
+        let initialized = call_wasmi_persistent(&mut runner.store, &runner.init, seeds)?;
+        verify_persistent_values(&initialized, seeds, "Wasmi init")?;
+        let start = Instant::now();
+        for round_inputs in inputs {
+            black_box(call_wasmi_persistent(
+                &mut runner.store,
+                &runner.step,
+                black_box(round_inputs),
+            )?);
+        }
+        times.push(start.elapsed());
+        let digest = call_wasmi_persistent(&mut runner.store, &runner.digest, seeds)?;
+        verify_persistent_values(&digest, expected, "Wasmi digest")?;
+    }
+    times.sort_unstable();
+    Ok(times[1])
+}
+
+fn measure_persistent_native(
+    seeds: &[u32],
+    inputs: &[Vec<u32>],
+    expected: &[u32],
+) -> Result<Duration> {
+    let mut times = Vec::with_capacity(3);
+    let warmup_inputs = inputs.first().ok_or("persistent workload has no steps")?;
+    let mut warmup_states: Vec<_> = seeds.iter().copied().map(persistent_state).collect();
+    black_box(run_native_persistent(&mut warmup_states, warmup_inputs)?);
+    black_box(
+        warmup_states
+            .iter()
+            .zip(seeds)
+            .map(|(state, &seed)| persistent_digest(state, seed))
+            .collect::<Vec<_>>(),
+    );
+    for _ in 0..3 {
+        let mut states: Vec<_> = seeds.iter().copied().map(persistent_state).collect();
+        let start = Instant::now();
+        for round_inputs in inputs {
+            black_box(run_native_persistent(&mut states, black_box(round_inputs))?);
+        }
+        times.push(start.elapsed());
+        let digest: Vec<_> = states
+            .iter()
+            .zip(seeds)
+            .map(|(state, &seed)| persistent_digest(state, seed))
+            .collect();
+        verify_persistent_values(&digest, expected, "native digest")?;
+    }
+    times.sort_unstable();
+    Ok(times[1])
 }
 
 fn mix_wat() -> String {
@@ -841,7 +1267,11 @@ fn micros(duration: Duration) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{SUITE_WORKLOADS, control_inputs};
+    use super::{
+        PERSISTENT_WAT, SUITE_WORKLOADS, WasmiPersistent, WasmtimePersistent,
+        call_wasmi_persistent, call_wasmtime_persistent, control_inputs,
+        persistent_expected_digests, persistent_inputs, persistent_seeds,
+    };
 
     #[test]
     fn control_patterns_have_the_same_values_and_grouped_branches_agree() {
@@ -938,5 +1368,36 @@ mod tests {
             }
             assert_eq!(metal_output, expected, "{}: Metal", workload.name);
         }
+    }
+
+    #[test]
+    fn persistent_workload_preserves_state_across_cpu_calls() {
+        let wasm = wat::parse_str(PERSISTENT_WAT).unwrap();
+        let seeds = persistent_seeds(3);
+        let inputs = persistent_inputs(&seeds);
+        let expected = persistent_expected_digests(&seeds, &inputs);
+
+        let mut wasmtime = WasmtimePersistent::new(&wasm, seeds.len()).unwrap();
+        for _ in 0..2 {
+            let initialized =
+                call_wasmtime_persistent(&mut wasmtime.store, &wasmtime.init, &seeds).unwrap();
+            assert_eq!(initialized, seeds, "Wasmtime init");
+            for round_inputs in &inputs {
+                call_wasmtime_persistent(&mut wasmtime.store, &wasmtime.step, round_inputs)
+                    .unwrap();
+            }
+            let digest =
+                call_wasmtime_persistent(&mut wasmtime.store, &wasmtime.digest, &seeds).unwrap();
+            assert_eq!(digest, expected, "Wasmtime digest");
+        }
+
+        let mut wasmi = WasmiPersistent::new(&wasm, seeds.len()).unwrap();
+        let initialized = call_wasmi_persistent(&mut wasmi.store, &wasmi.init, &seeds).unwrap();
+        assert_eq!(initialized, seeds, "Wasmi init");
+        for round_inputs in &inputs {
+            call_wasmi_persistent(&mut wasmi.store, &wasmi.step, round_inputs).unwrap();
+        }
+        let digest = call_wasmi_persistent(&mut wasmi.store, &wasmi.digest, &seeds).unwrap();
+        assert_eq!(digest, expected, "Wasmi digest");
     }
 }
