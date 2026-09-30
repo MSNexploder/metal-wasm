@@ -1,0 +1,9 @@
+workload,count,metal_total_us,metal_gpu_us,wasmtime_us,wasmi_us,native_us,samples
+lifetime_cycles,1,10326.17,6538.29,172.25,,1.75,3
+lifetime_cycles_unmetered,1,11300.71,7258.04,172.25,,1.75,3
+lifetime_cycles,1000,16840.50,8463.63,169703.29,,1058.58,3
+lifetime_cycles_unmetered,1000,16531.71,8188.96,169703.29,,1058.58,3
+lifetime_cycles,4096,32954.42,12207.79,702017.04,,4379.75,3
+lifetime_cycles_unmetered,4096,31294.46,11610.75,702017.04,,4379.75,3
+lifetime_cycles,10000,68316.88,22345.83,1733524.33,,10811.54,3
+lifetime_cycles_unmetered,10000,70974.38,22244.58,1733524.33,,10811.54,3

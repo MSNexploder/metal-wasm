@@ -167,6 +167,25 @@ The timed region includes result allocation and execution. Metal also includes p
 
 ## Recorded benchmark results
 
+The [lifetime results](examples/lifetime-benchmark-results.csv) were measured on
+2026-09-30 with an Apple M1 Max, 64 GB RAM, macOS 27.0, and a release build.
+Each sample runs 16 calls per lane and 64 GC/exception cycles per call. These
+times are milliseconds and are medians of three samples. Every final digest
+matched Metal, Wasmtime, and native Rust. These rows use the default fuel budget.
+
+| Lanes | Total calls | Metal total | Metal GPU | Wasmtime | Native Rust |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 16 | 10.32617 | 6.53829 | 0.17225 | 0.00175 |
+| 1,000 | 16,000 | 16.84050 | 8.46363 | 169.70329 | 1.05858 |
+| 4,096 | 65,536 | 32.95442 | 12.20779 | 702.01704 | 4.37975 |
+| 10,000 | 160,000 | 68.31688 | 22.34583 | 1733.52433 | 10.81154 |
+
+At 10,000 lanes, Metal total time is about 25.4× faster than Wasmtime. Native
+Rust is about 6.3× faster than Metal total time; it uses local values without a
+Wasm heap or collector. The CSV also includes paired runs with fuel disabled.
+Three samples do not establish a precise metering cost. Metal GPU time includes
+shader collection; total time also includes host collection between calls.
+
 The earlier persistent and full-suite measurements below predate default fuel
 and explicit reference release.
 
