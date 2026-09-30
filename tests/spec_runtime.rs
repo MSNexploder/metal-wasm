@@ -10,30 +10,59 @@ use wast::{Wast, WastArg, WastDirective, WastExecute, WastInvoke, WastRet};
 static GPU_LOCK: Mutex<()> = Mutex::new(());
 static SPECTEST: OnceLock<Vec<u8>> = OnceLock::new();
 
-fn arg(value: &WastArg<'_>) -> Value {
-    match value {
+#[derive(Clone, Copy)]
+enum SpecArg {
+    Value(Value),
+    External(u32),
+}
+
+fn arg(value: &WastArg<'_>) -> SpecArg {
+    let value = match value {
         WastArg::Core(WastArgCore::I32(value)) => Value::I32(*value as u32),
         WastArg::Core(WastArgCore::I64(value)) => Value::I64(*value as u64),
         WastArg::Core(WastArgCore::F32(value)) => Value::F32(value.bits),
         WastArg::Core(WastArgCore::F64(value)) => Value::F64(value.bits),
         WastArg::Core(WastArgCore::V128(value)) => Value::V128(value.to_le_bytes()),
-        WastArg::Core(WastArgCore::RefNull(_)) => Value::FuncRef(None),
+        WastArg::Core(WastArgCore::RefExtern(id)) => return SpecArg::External(*id),
+        WastArg::Core(WastArgCore::RefNull(wast::core::HeapType::Abstract { ty, .. })) => {
+            match ty {
+                wast::core::AbstractHeapType::Extern | wast::core::AbstractHeapType::NoExtern => {
+                    Value::ExternRef(None)
+                }
+                wast::core::AbstractHeapType::Exn | wast::core::AbstractHeapType::NoExn => {
+                    Value::ExnRef(None)
+                }
+                wast::core::AbstractHeapType::Func | wast::core::AbstractHeapType::NoFunc => {
+                    Value::FuncRef(None)
+                }
+                other => panic!("unsupported null argument: {other:?}"),
+            }
+        }
         other => panic!("unexpected spec argument: {other:?}"),
-    }
+    };
+    SpecArg::Value(value)
 }
 
-fn matches_result(actual: Value, expected: &WastRet<'_>) -> bool {
+fn matches_result(kernel: &Kernel, actual: Value, expected: &WastRet<'_>) -> bool {
     match expected {
-        WastRet::Core(expected) => matches_core(actual, expected),
+        WastRet::Core(expected) => matches_core(kernel, actual, expected),
         other => panic!("unexpected spec result: {other:?}"),
     }
 }
 
-fn matches_core(actual: Value, expected: &WastRetCore<'_>) -> bool {
+fn matches_core(kernel: &Kernel, actual: Value, expected: &WastRetCore<'_>) -> bool {
     match (actual, expected) {
-        (Value::FuncRef(None), WastRetCore::RefNull(_)) => true,
+        (
+            Value::FuncRef(None) | Value::ExternRef(None) | Value::ExnRef(None),
+            WastRetCore::RefNull(_),
+        ) => true,
+        (Value::ExternRef(Some(handle)), WastRetCore::RefExtern(id)) => {
+            id.is_none_or(|id| *kernel.external_reference_value::<u32>(handle).unwrap() == id)
+        }
         (Value::FuncRef(Some(_)), WastRetCore::RefFunc(None)) => true,
-        (actual, WastRetCore::Either(cases)) => cases.iter().any(|case| matches_core(actual, case)),
+        (actual, WastRetCore::Either(cases)) => {
+            cases.iter().any(|case| matches_core(kernel, actual, case))
+        }
         (Value::I32(actual), WastRetCore::I32(expected)) => actual == *expected as u32,
         (Value::I64(actual), WastRetCore::I64(expected)) => actual == *expected as u64,
         (Value::F32(actual), WastRetCore::F32(pattern)) => match pattern {
@@ -90,7 +119,7 @@ fn invoke(
     module: &[u8],
     kernels: &mut HashMap<String, Kernel>,
     providers: &HashMap<String, Vec<u8>>,
-    sequence: Option<(&str, &[(String, Vec<Value>)])>,
+    sequence: Option<(&str, &[(String, Vec<SpecArg>)])>,
 ) -> Result<Vec<Vec<Value>>, Error> {
     assert!(
         call.module.is_none(),
@@ -98,9 +127,10 @@ fn invoke(
     );
     let mut wrapped = None;
     let (export, inputs) = if let Some((text, history)) = sequence {
-        wrapped = Some(sequence_module(text, module, history, &call));
+        let (bytes, inputs) = sequence_module(text, module, history, &call);
+        wrapped = Some(bytes);
         kernels.clear();
-        ("__spec_sequence", Vec::new())
+        ("__spec_sequence", inputs)
     } else {
         (call.name, call.args.iter().map(arg).collect())
     };
@@ -113,13 +143,31 @@ fn invoke(
             &imports,
             KernelLimits {
                 call_depth: 256,
+                table_growth_elements: 65_536,
                 ..KernelLimits::default()
             },
         )?;
         kernels.insert(export.to_owned(), kernel);
     }
     let kernel = &kernels[export];
-    kernel.run_values(&[inputs])
+    let mut external = HashMap::new();
+    let inputs: Result<Vec<_>, Error> = inputs
+        .into_iter()
+        .map(|arg| match arg {
+            SpecArg::Value(value) => Ok(value),
+            SpecArg::External(id) => {
+                let handle = if let Some(handle) = external.get(&id) {
+                    *handle
+                } else {
+                    let handle = kernel.external_reference(id)?;
+                    external.insert(id, handle);
+                    handle
+                };
+                Ok(Value::ExternRef(Some(handle)))
+            }
+        })
+        .collect();
+    kernel.run_values(&[inputs?])
 }
 
 // Replay successful actions in one lane to test scripts with persistent state.
@@ -146,10 +194,12 @@ fn module_text(source: &str, offset: usize) -> &str {
 fn sequence_module(
     text: &str,
     bytes: &[u8],
-    history: &[(String, Vec<Value>)],
+    history: &[(String, Vec<SpecArg>)],
     call: &WastInvoke<'_>,
-) -> Vec<u8> {
-    use wasmparser::{CompositeInnerType, ExternalKind, Parser, Payload, Validator};
+) -> (Vec<u8>, Vec<SpecArg>) {
+    use wasmparser::{
+        CompositeInnerType, ExternalKind, HeapType, Parser, Payload, ValType, Validator,
+    };
     let validated = Validator::new().validate_all(bytes).unwrap();
     let validated = validated.as_ref();
     let mut exports = HashMap::new();
@@ -173,32 +223,72 @@ fn sequence_module(
     let results = result_types(call.name);
     let mut source = text[..text.len() - 1].to_owned();
     source.push_str(" (func (export \"__spec_sequence\")");
-    if !results.is_empty() {
-        source.push_str(&format!(
-            " (result {})",
-            results
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" ")
-        ));
-    }
-    let actions = history
+    let actions: Vec<_> = history
         .iter()
         .map(|(name, args)| (name.as_str(), args.clone(), true))
         .chain(std::iter::once((
             call.name,
             call.args.iter().map(arg).collect(),
             false,
-        )));
+        )))
+        .collect();
+    let mut external = HashMap::new();
+    let mut inputs = Vec::new();
+    for (_, args, _) in &actions {
+        for arg in args {
+            if let SpecArg::External(id) = arg {
+                external.entry(*id).or_insert_with(|| {
+                    let index = inputs.len();
+                    inputs.push(*arg);
+                    source.push_str(" (param (ref extern))");
+                    index
+                });
+            }
+        }
+    }
+
+    if !results.is_empty() {
+        source.push_str(&format!(
+            " (result {})",
+            results
+                .iter()
+                .map(|ty| match ty {
+                    ValType::Ref(reference) => match reference.heap_type() {
+                        HeapType::Concrete(id) => {
+                            let module_index = (0..validated.core_type_count_in_module())
+                                .find(|index| {
+                                    validated.core_type_at_in_module(*index)
+                                        == id.as_core_type_id().unwrap()
+                                })
+                                .unwrap();
+                            format!(
+                                "(ref {}{module_index})",
+                                if reference.is_nullable() { "null " } else { "" }
+                            )
+                        }
+                        _ => ty.to_string(),
+                    },
+                    _ => ty.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
     for (name, args, discard) in actions {
         for value in args {
             source.push_str(&match value {
-                Value::I32(bits) => format!(" i32.const {}", bits as i32),
-                Value::I64(bits) => format!(" i64.const {}", bits as i64),
-                Value::F32(bits) => format!(" i32.const {} f32.reinterpret_i32", bits as i32),
-                Value::F64(bits) => format!(" i64.const {} f64.reinterpret_i64", bits as i64),
-                Value::FuncRef(None) => " ref.null nofunc".into(),
+                SpecArg::External(id) => format!(" local.get {}", external[&id]),
+                SpecArg::Value(Value::I32(bits)) => format!(" i32.const {}", bits as i32),
+                SpecArg::Value(Value::I64(bits)) => format!(" i64.const {}", bits as i64),
+                SpecArg::Value(Value::F32(bits)) => {
+                    format!(" i32.const {} f32.reinterpret_i32", bits as i32)
+                }
+                SpecArg::Value(Value::F64(bits)) => {
+                    format!(" i64.const {} f64.reinterpret_i64", bits as i64)
+                }
+                SpecArg::Value(Value::FuncRef(None)) => " ref.null nofunc".into(),
+                SpecArg::Value(Value::ExternRef(None)) => " ref.null noextern".into(),
+                SpecArg::Value(Value::ExnRef(None)) => " ref.null noexn".into(),
                 _ => {
                     panic!("sequence arguments must be scalar numbers or null function references")
                 }
@@ -212,7 +302,7 @@ fn sequence_module(
         }
     }
     source.push_str("))");
-    wat::parse_str(source).unwrap()
+    (wat::parse_str(source).unwrap(), inputs)
 }
 
 fn spec_imports(providers: &HashMap<String, Vec<u8>>) -> Vec<(&str, &[u8])> {
@@ -221,7 +311,7 @@ fn spec_imports(providers: &HashMap<String, Vec<u8>>) -> Vec<(&str, &[u8])> {
         .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
         .collect();
     if !providers.contains_key("spectest") {
-        let spectest = SPECTEST.get_or_init(|| wat::parse_str("(module (func (export \"print_i32_f32\") (param i32 f32)) (global (export \"global_i32\") i32 (i32.const 666)))").unwrap());
+        let spectest = SPECTEST.get_or_init(|| wat::parse_str("(module (func (export \"print_i32_f32\") (param i32 f32)) (global (export \"global_i32\") i32 (i32.const 666)) (table (export \"table\") 10 20 funcref) (table (export \"table64\") i64 10 20 funcref))").unwrap());
         imports.push(("spectest", spectest));
     }
     imports
@@ -234,7 +324,8 @@ fn assert_links(bytes: &[u8], providers: &HashMap<String, Vec<u8>>) {
     let actual = Kernel::new_with_imports(bytes, "__invalid_spec_export", &imports);
     assert!(
         matches!(actual, Err(Error::Unsupported(ref reason)) if reason == "export \"__invalid_spec_export\" is not a function"),
-        "valid module failed validation or linking"
+        "valid module failed validation or linking: {:?}",
+        actual.err()
     );
 }
 
@@ -254,9 +345,14 @@ fn check_script_mode(source: &str, minimum_assertions: usize, replay: bool) {
     let mut checked = 0;
     let mut validation_cases = 0;
     let mut text = None;
-    let mut history: Vec<(String, Vec<Value>)> = Vec::new();
+    let mut history: Vec<(String, Vec<SpecArg>)> = Vec::new();
     for directive in script.directives {
         match directive {
+            WastDirective::ModuleDefinition(mut wat) => {
+                let bytes = wat.encode().unwrap();
+                wasmparser::Validator::new().validate_all(&bytes).unwrap();
+                validation_cases += 1;
+            }
             WastDirective::Module(mut wat) => {
                 kernels.clear();
                 history.clear();
@@ -275,6 +371,7 @@ fn check_script_mode(source: &str, minimum_assertions: usize, replay: bool) {
                 ..
             } => {
                 let action = (call.name.to_owned(), call.args.iter().map(arg).collect());
+                let export = if replay { "__spec_sequence" } else { call.name };
                 let invocation = format!("{call:?}");
                 let actual = invoke(
                     call,
@@ -289,7 +386,7 @@ fn check_script_mode(source: &str, minimum_assertions: usize, replay: bool) {
                 assert_eq!(actual[0].len(), results.len());
                 for (value, expected) in actual[0].iter().zip(&results) {
                     assert!(
-                        matches_result(*value, expected),
+                        matches_result(&kernels[export], *value, expected),
                         "{invocation}: expected {expected:?}, got {value:?}"
                     );
                 }
@@ -705,4 +802,37 @@ fn spec_function_type_recursion() {
 #[test]
 fn spec_function_select() {
     check_script_mode(include_str!("spec/select_functions.wast"), 90, true);
+}
+
+#[test]
+fn spec_external_locals() {
+    check_script(include_str!("spec/local_init.wast"), 4);
+}
+
+#[test]
+fn spec_reference_tests() {
+    check_script_mode(include_str!("spec/ref_test_non_gc.wast"), 12, true);
+    check_script(include_str!("spec/br_on_cast_validation.wast"), 0);
+    check_script(include_str!("spec/br_on_cast_fail_validation.wast"), 0);
+    check_script(include_str!("spec/ref_null_non_gc.wast"), 25);
+}
+
+#[test]
+fn spec_reference_tables() {
+    check_script_mode(include_str!("spec/memory64_table64.wast"), 0, true);
+    for source in [
+        include_str!("spec/table.wast"),
+        include_str!("spec/table_get.wast"),
+        include_str!("spec/table_set.wast"),
+        include_str!("spec/table_size.wast"),
+        include_str!("spec/table_grow_instances.wast"),
+        include_str!("spec/bulk_memory_table_fill.wast"),
+        include_str!("spec/memory64_table_get64.wast"),
+        include_str!("spec/memory64_table_set64.wast"),
+        include_str!("spec/memory64_table_size64.wast"),
+        include_str!("spec/memory64_table_grow64.wast"),
+        include_str!("spec/memory64_table_fill64.wast"),
+    ] {
+        check_script_mode(source, 1, true);
+    }
 }

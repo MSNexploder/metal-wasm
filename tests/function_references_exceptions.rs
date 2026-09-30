@@ -447,3 +447,632 @@ fn typed_select_accepts_nonnullable_and_nullable_function_references() {
         &[0, 1, 7, 8, u32::MAX],
     );
 }
+
+#[test]
+fn function_reference_casts_and_branches_match_nominal_subtypes() {
+    let _lock = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let wasm = wat::parse_str(
+        r#"(module
+      (type $base (sub (func (result i32))))
+      (type $child (sub $base (func (result i32))))
+      (type $other (func (result i32)))
+      (func $child (type $child) i32.const 41)
+      (func $other (type $other) i32.const 17)
+      (table 3 funcref) (elem (i32.const 0) $child $other)
+      (func (export "test") (param i32) (result i32)
+        local.get 0 table.get 0 ref.test (ref $child))
+      (func (export "nullable") (param i32) (result i32)
+        local.get 0 table.get 0 ref.test (ref null $child))
+      (func (export "cast") (param i32) (result i32)
+        local.get 0 table.get 0 ref.cast (ref $child) call_ref $child)
+      (func (export "branch") (param i32) (result i32)
+        block $success (result (ref $child))
+          local.get 0 table.get 0 br_on_cast $success (ref null func) (ref $child)
+          drop i32.const 17 return
+        end drop i32.const 41)
+      (func (export "branch_fail") (param i32) (result i32)
+        block $failure (result funcref)
+          local.get 0 table.get 0 br_on_cast_fail $failure (ref null func) (ref $child)
+          drop i32.const 41 return
+        end drop i32.const 17))"#,
+    )
+    .unwrap();
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+    for export in ["test", "nullable", "cast", "branch", "branch_fail"] {
+        let kernel = Kernel::new(&wasm, export).unwrap();
+        for input in 0..3 {
+            let mut store = wasmtime::Store::new(&engine, ());
+            let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+            let expected = instance
+                .get_typed_func::<i32, i32>(&mut store, export)
+                .unwrap()
+                .call(&mut store, input);
+            match (kernel.run(&[input as u32]), expected) {
+                (Ok(actual), Ok(expected)) => assert_eq!(actual, [expected as u32]),
+                (
+                    Err(Error::Trap {
+                        reason: "cast failure",
+                        ..
+                    }),
+                    Err(error),
+                ) => assert_eq!(
+                    error.downcast_ref::<wasmtime::Trap>(),
+                    Some(&wasmtime::Trap::CastFailure)
+                ),
+                (actual, expected) => panic!("{export}({input}): {actual:?}, {expected:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn casts_recognize_host_handles_without_reachable_function_bodies() {
+    let _lock = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let wasm = wat::parse_str(
+        r#"(module
+      (type $base (sub (func))) (type $child (sub $base (func)))
+      (func (export "child") (type $child) unreachable)
+      (func (export "test") (param funcref) (result i32)
+        local.get 0 ref.test (ref $child)))"#,
+    )
+    .unwrap();
+    let kernel = Kernel::new(&wasm, "test").unwrap();
+    let child = kernel.function_reference("child").unwrap();
+    assert_eq!(
+        kernel
+            .run_values(&[
+                vec![Value::FuncRef(Some(child))],
+                vec![Value::FuncRef(None)]
+            ])
+            .unwrap(),
+        [vec![Value::I32(1)], vec![Value::I32(0)]]
+    );
+}
+
+#[test]
+fn external_handles_survive_tables_globals_bulk_operations_and_results() {
+    let _lock = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let wasm = wat::parse_str(
+        r#"(module
+      (table $a 2 4 externref) (table $b 2 4 externref)
+      (global $saved (mut externref) (ref.null extern))
+      (elem $nulls externref (ref.null extern))
+      (func (export "run") (param externref) (result externref externref i32)
+        local.get 0 global.set $saved
+        i32.const 0 local.get 0 table.set $a
+        i32.const 1 local.get 0 i32.const 1 table.fill $a
+        i32.const 0 i32.const 0 i32.const 2 table.copy $b $a
+        local.get 0 i32.const 1 table.grow $b drop
+        i32.const 1 i32.const 0 i32.const 1 table.init $b $nulls
+        elem.drop $nulls
+        i32.const 2 table.get $b global.get $saved
+        i32.const 1 table.get $b ref.is_null))"#,
+    )
+    .unwrap();
+    let kernel = Kernel::new(&wasm, "run").unwrap();
+    let handle = kernel.external_reference(String::from("retained")).unwrap();
+    assert_eq!(
+        &*kernel.external_reference_value::<String>(handle).unwrap(),
+        "retained"
+    );
+    assert!(kernel.external_reference_value::<u32>(handle).is_err());
+    assert_eq!(
+        kernel
+            .run_values(&[
+                vec![Value::ExternRef(Some(handle))],
+                vec![Value::ExternRef(None)]
+            ])
+            .unwrap(),
+        [
+            vec![
+                Value::ExternRef(Some(handle)),
+                Value::ExternRef(Some(handle)),
+                Value::I32(1)
+            ],
+            vec![
+                Value::ExternRef(None),
+                Value::ExternRef(None),
+                Value::I32(1)
+            ]
+        ]
+    );
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let external = wasmtime::ExternRef::new(&mut store, String::from("retained")).unwrap();
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let function = instance.get_func(&mut store, "run").unwrap();
+    let mut results = [
+        wasmtime::Val::ExternRef(None),
+        wasmtime::Val::ExternRef(None),
+        wasmtime::Val::I32(0),
+    ];
+    function
+        .call(
+            &mut store,
+            &[wasmtime::Val::ExternRef(Some(external))],
+            &mut results,
+        )
+        .unwrap();
+    for result in &results[..2] {
+        let reference = result.externref().unwrap().unwrap();
+        assert_eq!(
+            reference
+                .data(&store)
+                .unwrap()
+                .unwrap()
+                .downcast_ref::<String>()
+                .unwrap(),
+            "retained"
+        );
+    }
+    assert_eq!(results[2].i32(), Some(1));
+    let other = Kernel::new(&wasm, "run").unwrap();
+    assert!(
+        other
+            .run_values(&[vec![Value::ExternRef(Some(handle))]])
+            .is_err()
+    );
+    assert!(other.external_reference_value::<String>(handle).is_err());
+}
+
+#[test]
+fn external_casts_enforce_nullability_and_bottom_types() {
+    let _lock = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let wasm = wat::parse_str(
+        r#"(module
+      (func (export "run") (param externref) (result externref i32 i32)
+        local.get 0 ref.cast (ref extern)
+        local.get 0 ref.test (ref extern)
+        local.get 0 ref.test (ref null noextern)))"#,
+    )
+    .unwrap();
+    let kernel = Kernel::new(&wasm, "run").unwrap();
+    let handle = kernel.external_reference(42u32).unwrap();
+    assert_eq!(
+        kernel
+            .run_values(&[vec![Value::ExternRef(Some(handle))]])
+            .unwrap(),
+        [vec![
+            Value::ExternRef(Some(handle)),
+            Value::I32(1),
+            Value::I32(0)
+        ]]
+    );
+    assert!(matches!(
+        kernel.run_values(&[vec![Value::ExternRef(None)]]),
+        Err(Error::Trap {
+            reason: "cast failure",
+            ..
+        })
+    ));
+    let wasm = wat::parse_str(
+        r#"(module (func (export "run") (param (ref extern)) (result externref) local.get 0))"#,
+    )
+    .unwrap();
+    let kernel = Kernel::new(&wasm, "run").unwrap();
+    assert!(kernel.run_values(&[vec![Value::ExternRef(None)]]).is_err());
+}
+
+#[test]
+fn exception_tables_retain_records_and_support_casts() {
+    let _lock = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let source = r#"(module
+      (tag $e (param i32))
+      (global $saved (mut exnref) (ref.null exn))
+      (table $table 2 4 exnref)
+      (table $wide i64 2 exnref)
+      (elem $nulls exnref (ref.null exn))
+      (func (export "calculate") (param i32) (result i32)
+        block $capture (result exnref)
+          try_table (catch_all_ref $capture) local.get 0 throw $e end unreachable
+        end
+        global.set $saved
+        i32.const 0 global.get $saved table.set $table
+        i32.const 1 global.get $saved i32.const 1 table.fill $table
+        i32.const 0 i32.const 1 i32.const 1 table.copy $table $table
+        global.get $saved i32.const 1 table.grow $table
+        i32.const 2 i32.ne if unreachable end
+        i64.const 1 i32.const 2 i32.const 1 table.copy $wide $table
+        i32.const 1 i32.const 0 i32.const 1 table.init $table $nulls
+        elem.drop $nulls
+        i32.const 1 i32.const 0 i32.const 0 table.init $table $nulls
+        i32.const 1 table.get $table ref.is_null i32.eqz if unreachable end
+        block $done (result i32)
+          try_table (catch $e $done)
+            i64.const 1 table.get $wide ref.cast (ref exn) throw_ref
+          end unreachable
+        end)
+      (func (export "after_drop") (param i32) (result i32)
+        elem.drop $nulls
+        i32.const 0 i32.const 0 i32.const 1 table.init $table $nulls
+        i32.const 0))"#;
+    compare(source, &[0, 7, u32::MAX]);
+    let wasm = wat::parse_str(source).unwrap();
+    let kernel = Kernel::new(&wasm, "after_drop").unwrap();
+    assert!(matches!(
+        kernel.run(&[0]),
+        Err(Error::Trap {
+            reason: "out of bounds table access",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn public_exceptions_preserve_vector_and_external_payloads_across_runs() {
+    let _lock = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let wasm = wat::parse_str(
+        r#"(module
+      (tag $e (export "e") (param i32 v128 externref))
+      (memory (export "memory") 1)
+      (func (export "run") (param exnref i32 externref) (result exnref i32)
+        (local $saved exnref)
+        local.get 0 ref.is_null
+        if
+          block $capture (result i32 v128 externref exnref)
+            try_table (catch_ref $e $capture)
+              local.get 1 v128.const i32x4 7 11 13 17 local.get 2 throw $e
+            end unreachable
+          end
+          local.set $saved drop drop drop
+        else local.get 0 local.set $saved end
+        local.get $saved
+        block $payload (result i32 v128 externref)
+          try_table (catch $e $payload) local.get $saved throw_ref end unreachable
+        end drop drop))"#,
+    )
+    .unwrap();
+    let kernel = Kernel::new(&wasm, "run").unwrap();
+    let external = kernel.external_reference(String::from("payload")).unwrap();
+    let result = kernel
+        .run_values(&[vec![
+            Value::ExnRef(None),
+            Value::I32(98),
+            Value::ExternRef(Some(external)),
+        ]])
+        .unwrap();
+    let Value::ExnRef(Some(reference)) = result[0][0] else {
+        panic!("missing exception");
+    };
+    let mut vector = [0u8; 16];
+    for (lane, n) in [7u32, 11, 13, 17].iter().enumerate() {
+        vector[lane * 4..lane * 4 + 4].copy_from_slice(&n.to_le_bytes());
+    }
+    let payload = vec![
+        Value::I32(98),
+        Value::V128(vector),
+        Value::ExternRef(Some(external)),
+    ];
+    assert_eq!(kernel.exception_payload(reference).unwrap(), payload);
+    assert_eq!(result[0][1], Value::I32(98));
+    let input = vec![
+        Value::ExnRef(Some(reference)),
+        Value::I32(0),
+        Value::ExternRef(None),
+    ];
+    assert_eq!(kernel.run_values(&[input.clone()]).unwrap()[0], result[0]);
+    // Odd memory input widths exercise alignment of the appended exception arena.
+    // Enough lanes also force consecutive dispatches with the same retained handle.
+    let (returned, memory) = kernel
+        .run_values_with_memory_io(
+            &vec![input; 1_100],
+            "memory",
+            0,
+            &vec![vec![1, 2, 3]; 1_100],
+            0..3,
+        )
+        .unwrap();
+    assert!(returned.iter().all(|row| row == &result[0]));
+    assert!(memory.iter().all(|row| row == &[1, 2, 3]));
+    let created = kernel.exception_reference("e", &payload).unwrap();
+    assert_eq!(kernel.exception_payload(created).unwrap(), payload);
+    assert_eq!(
+        kernel
+            .run_values(&[vec![
+                Value::ExnRef(Some(created)),
+                Value::I32(0),
+                Value::ExternRef(None)
+            ]])
+            .unwrap()[0][1],
+        Value::I32(98)
+    );
+    assert!(kernel.exception_reference("e", &[Value::I32(1)]).is_err());
+    let other = Kernel::new(&wasm, "run").unwrap();
+    assert!(other.exception_payload(reference).is_err());
+    assert!(
+        other
+            .run_values(&[vec![
+                Value::ExnRef(Some(reference)),
+                Value::I32(0),
+                Value::ExternRef(None)
+            ]])
+            .is_err()
+    );
+    assert!(other.exception_reference("e", &payload).is_err());
+}
+
+#[test]
+fn nested_public_exceptions_preserve_aliases_and_bound_imported_records() {
+    let _lock = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let wasm = wat::parse_str(r#"(module
+      (tag $leaf (export "leaf") (param i64))
+      (tag $outer (export "outer") (param exnref exnref))
+      (func (export "run") (param exnref i64) (result exnref i64)
+        (local $saved exnref)
+        local.get 0 ref.is_null
+        if
+          block $capture (result exnref)
+            try_table (catch_all_ref $capture) local.get 1 throw $leaf end unreachable
+          end local.set $saved
+          block $capture (result exnref)
+            try_table (catch_all_ref $capture) local.get $saved local.get $saved throw $outer end unreachable
+          end local.set $saved
+        else local.get 0 local.set $saved end
+        local.get $saved
+        block $unpack (result exnref exnref)
+          try_table (catch $outer $unpack) local.get $saved throw_ref end unreachable
+        end drop local.set $saved
+        block $value (result i64)
+          try_table (catch $leaf $value) local.get $saved throw_ref end unreachable
+        end))"#).unwrap();
+    let kernel = Kernel::new_with_limits(
+        &wasm,
+        "run",
+        KernelLimits {
+            exception_records: 2,
+            ..KernelLimits::default()
+        },
+    )
+    .unwrap();
+    let result = kernel
+        .run_values(&[vec![Value::ExnRef(None), Value::I64(u64::MAX)]])
+        .unwrap();
+    let Value::ExnRef(Some(outer)) = result[0][0] else {
+        panic!("missing outer");
+    };
+    let payload = kernel.exception_payload(outer).unwrap();
+    assert_eq!(payload[0], payload[1]);
+    let Value::ExnRef(Some(leaf)) = payload[0] else {
+        panic!("missing leaf");
+    };
+    assert_eq!(
+        kernel.exception_payload(leaf).unwrap(),
+        [Value::I64(u64::MAX)]
+    );
+    assert_eq!(
+        kernel
+            .run_values(&[vec![Value::ExnRef(Some(outer)), Value::I64(0)]])
+            .unwrap(),
+        result
+    );
+    let deeper = kernel
+        .exception_reference(
+            "outer",
+            &[Value::ExnRef(Some(outer)), Value::ExnRef(Some(outer))],
+        )
+        .unwrap();
+    assert!(matches!(
+        kernel.run_values(&[
+            vec![Value::ExnRef(None), Value::I64(0)],
+            vec![Value::ExnRef(Some(deeper)), Value::I64(0)]
+        ]),
+        Err(Error::Trap {
+            input_index: 1,
+            reason: "exception record limit exceeded"
+        })
+    ));
+}
+
+#[test]
+fn exception_payload_function_handles_reach_indirect_calls() {
+    let _lock = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let wasm = wat::parse_str(
+        r#"(module
+      (type $f (func (result i32)))
+      (tag $e (export "e") (param funcref))
+      (table 1 funcref)
+      (func (export "target") (type $f) i32.const 42)
+      (func (export "run") (param exnref) (result i32) (local funcref)
+        block $unpack (result funcref)
+          try_table (catch $e $unpack) local.get 0 throw_ref end unreachable
+        end local.set 1
+        i32.const 0 local.get 1 table.set 0
+        i32.const 0 call_indirect (type $f)))"#,
+    )
+    .unwrap();
+    let kernel = Kernel::new(&wasm, "run").unwrap();
+    let target = kernel.function_reference("target").unwrap();
+    let exception = kernel
+        .exception_reference("e", &[Value::FuncRef(Some(target))])
+        .unwrap();
+    assert_eq!(
+        kernel
+            .run_values(&[vec![Value::ExnRef(Some(exception))]])
+            .unwrap(),
+        [vec![Value::I32(42)]]
+    );
+}
+
+#[test]
+fn linked_external_and_exception_tables_preserve_tag_aliases() {
+    let _lock = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let provider = wat::parse_str(
+        r#"(module
+      (tag $e (export "e") (param f32 f64 externref))
+      (table (export "external") 1 externref)
+      (table (export "exceptions") 1 exnref)
+      (func (export "stash") (param externref exnref)
+        i32.const 0 local.get 0 table.set 0
+        i32.const 0 local.get 1 table.set 1)
+      (func (export "raise") i32.const 0 table.get 1 throw_ref))"#,
+    )
+    .unwrap();
+    let root = wat::parse_str(
+        r#"(module
+      (import "p" "e" (tag $e (param f32 f64 externref)))
+      (import "p" "external" (table $external 1 externref))
+      (import "p" "exceptions" (table $exceptions 1 exnref))
+      (import "p" "stash" (func $stash (param externref exnref)))
+      (import "p" "raise" (func $raise))
+      (export "alias" (tag $e))
+      (func (export "run") (param externref exnref)
+          (result f32 f64 externref exnref externref)
+        local.get 0 local.get 1 call $stash
+        block $caught (result f32 f64 externref exnref)
+          try_table (catch_ref $e $caught) call $raise end unreachable
+        end
+        i32.const 0 table.get $external))"#,
+    )
+    .unwrap();
+    let kernel = Kernel::new_with_imports(&root, "run", &[("p", &provider)]).unwrap();
+    let external = kernel.external_reference(String::from("opaque")).unwrap();
+    let payload = [
+        Value::F32(0x7fc1_2345),
+        Value::F64(0xfff8_0000_1234_5678),
+        Value::ExternRef(Some(external)),
+    ];
+    let exception = kernel.exception_reference("alias", &payload).unwrap();
+    let rows = vec![
+        vec![
+            Value::ExternRef(Some(external)),
+            Value::ExnRef(Some(exception))
+        ];
+        33
+    ];
+    let expected = vec![
+        payload[0],
+        payload[1],
+        payload[2],
+        Value::ExnRef(Some(exception)),
+        Value::ExternRef(Some(external)),
+    ];
+    assert_eq!(kernel.run_values(&rows).unwrap(), vec![expected; 33]);
+    assert_eq!(kernel.exception_payload(exception).unwrap(), payload);
+    assert_eq!(
+        &*kernel.external_reference_value::<String>(external).unwrap(),
+        "opaque"
+    );
+}
+
+#[test]
+fn external_and_exception_cast_branches_keep_the_correct_stack_values() {
+    let _lock = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let wasm = wat::parse_str(
+        r#"(module
+      (tag (export "e"))
+      (func (export "run") (param externref exnref) (result i32 i32)
+        block $external (result i32 externref)
+          i32.const 10 local.get 0
+          br_on_cast $external externref (ref extern)
+          drop drop i32.const 20 ref.null extern
+        end drop
+        block $exception (result i32 exnref)
+          i32.const 30 local.get 1
+          br_on_cast_fail $exception exnref (ref exn)
+          drop drop i32.const 40 ref.null exn
+        end drop))"#,
+    )
+    .unwrap();
+    let kernel = Kernel::new(&wasm, "run").unwrap();
+    let external = kernel.external_reference(7u32).unwrap();
+    let exception = kernel.exception_reference("e", &[]).unwrap();
+    assert_eq!(
+        kernel
+            .run_values(&[
+                vec![Value::ExternRef(None), Value::ExnRef(None)],
+                vec![
+                    Value::ExternRef(Some(external)),
+                    Value::ExnRef(Some(exception))
+                ],
+            ])
+            .unwrap(),
+        [
+            vec![Value::I32(20), Value::I32(30)],
+            vec![Value::I32(10), Value::I32(40)]
+        ]
+    );
+}
+
+#[test]
+fn public_exception_input_and_output_match_wasmtime() {
+    let _lock = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let wasm = wat::parse_str(
+        r#"(module
+      (tag $e (export "e") (param i64 externref))
+      (func (export "run") (param exnref) (result i64 externref exnref)
+        block $caught (result i64 externref exnref)
+          try_table (catch_ref $e $caught)
+            local.get 0 ref.cast (ref exn) throw_ref
+          end unreachable
+        end))"#,
+    )
+    .unwrap();
+    let kernel = Kernel::new(&wasm, "run").unwrap();
+    let external = kernel.external_reference(123u32).unwrap();
+    let payload = [
+        Value::I64(0xfedc_ba98_7654_3210),
+        Value::ExternRef(Some(external)),
+    ];
+    let exception = kernel.exception_reference("e", &payload).unwrap();
+    let actual = kernel
+        .run_values(&[vec![Value::ExnRef(Some(exception))]])
+        .unwrap();
+    assert_eq!(
+        actual,
+        [vec![payload[0], payload[1], Value::ExnRef(Some(exception))]]
+    );
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let tag = instance.get_tag(&mut store, "e").unwrap();
+    let exception_type = wasmtime::ExnType::from_tag_type(&tag.ty(&store)).unwrap();
+    let allocator = wasmtime::ExnRefPre::new(&mut store, exception_type);
+    let external = wasmtime::ExternRef::new(&mut store, 123u32).unwrap();
+    let exception = wasmtime::ExnRef::new(
+        &mut store,
+        &allocator,
+        &tag,
+        &[
+            wasmtime::Val::I64(0xfedc_ba98_7654_3210u64 as i64),
+            wasmtime::Val::ExternRef(Some(external)),
+        ],
+    )
+    .unwrap();
+    let function = instance.get_func(&mut store, "run").unwrap();
+    let mut results = [
+        wasmtime::Val::I64(0),
+        wasmtime::Val::ExternRef(None),
+        wasmtime::Val::ExnRef(None),
+    ];
+    function
+        .call(
+            &mut store,
+            &[wasmtime::Val::ExnRef(Some(exception))],
+            &mut results,
+        )
+        .unwrap();
+    assert_eq!(results[0].i64().unwrap() as u64, 0xfedc_ba98_7654_3210);
+    let external = results[1].externref().unwrap().unwrap();
+    assert_eq!(
+        external
+            .data(&store)
+            .unwrap()
+            .unwrap()
+            .downcast_ref::<u32>(),
+        Some(&123)
+    );
+    let returned = results[2].exnref().unwrap().unwrap();
+    assert_eq!(
+        returned.field(&mut store, 0).unwrap().i64(),
+        results[0].i64()
+    );
+    let field = returned.field(&mut store, 1).unwrap();
+    let field = field.externref().unwrap().unwrap();
+    assert_eq!(
+        field.data(&store).unwrap().unwrap().downcast_ref::<u32>(),
+        Some(&123)
+    );
+}
