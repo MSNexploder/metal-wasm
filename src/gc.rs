@@ -51,23 +51,20 @@ impl Kernel {
         if reference.kernel != self.id || reference.index as u32 == 0 {
             return false;
         }
+        let index = reference.index as u32 as usize - 1;
         match reference.index >> 32 {
-            2 => {
-                (reference.index as u32 as usize)
-                    <= self
-                        .external_values
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .len()
-            }
-            3 => {
-                (reference.index as u32 as usize)
-                    <= self
-                        .gc_values
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .len()
-            }
+            2 => self
+                .external_values
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(index)
+                .is_some_and(|v| v.valid(reference.generation)),
+            3 => self
+                .gc_values
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(index)
+                .is_some_and(|v| v.valid(reference.generation)),
             _ => false,
         }
     }
@@ -77,25 +74,19 @@ impl Kernel {
             return false;
         }
         match reference.index >> 32 {
-            0 => {
-                reference.index != 0
-                    && reference.index as usize
-                        <= self
-                            .external_values
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .len()
-            }
+            0 if reference.index != 0 => self
+                .external_values
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(reference.index as usize - 1)
+                .is_some_and(|v| v.valid(reference.generation)),
             1 => reference.index & 0x80000000 == 0,
-            3 => {
-                reference.index as u32 != 0
-                    && (reference.index as u32 as usize)
-                        <= self
-                            .gc_values
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .len()
-            }
+            3 if reference.index as u32 != 0 => self
+                .gc_values
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(reference.index as u32 as usize - 1)
+                .is_some_and(|v| v.valid(reference.generation)),
             _ => false,
         }
     }
@@ -112,7 +103,13 @@ impl Kernel {
         }
         let records = self.gc_values.lock().unwrap_or_else(|e| e.into_inner());
         Ok(
-            if self.gc_types[records[reference.index as u32 as usize - 1].type_index].array {
+            if self.gc_types[records[reference.index as u32 as usize - 1]
+                .value
+                .as_ref()
+                .unwrap()
+                .type_index]
+                .array
+            {
                 AbstractHeapType::Array
             } else {
                 AbstractHeapType::Struct
@@ -132,7 +129,7 @@ impl Kernel {
         }
         Ok(match reference.index >> 32 {
             0 => Value::GcRef(Some(GcRef {
-                generation: 0,
+                generation: reference.generation,
                 kernel: self.id,
                 index: FOREIGN_TAG | reference.index,
                 ty: nonnull(AbstractHeapType::Any),
@@ -140,9 +137,12 @@ impl Kernel {
             1 => Value::I31(reference.index as u32),
             3 => {
                 let records = self.gc_values.lock().unwrap_or_else(|e| e.into_inner());
-                let record = &records[reference.index as u32 as usize - 1];
+                let record = records[reference.index as u32 as usize - 1]
+                    .value
+                    .as_ref()
+                    .unwrap();
                 Value::GcRef(Some(GcRef {
-                    generation: 0,
+                    generation: reference.generation,
                     kernel: self.id,
                     index: reference.index,
                     ty: self.gc_types[record.type_index].reference,
@@ -155,6 +155,10 @@ impl Kernel {
     /// Apply `extern.convert_any` on the host. Returned handles may be passed
     /// back into this kernel; only original host values support host downcasts.
     pub fn externalize_reference(&self, value: Value) -> Result<Option<ExternalRef>, Error> {
+        let generation = match value {
+            Value::GcRef(Some(r)) => r.generation,
+            _ => 0,
+        };
         let index = match value {
             Value::GcRef(None) => return Ok(None),
             Value::I31(bits) => I31_TAG | u64::from(bits & 0x7fffffff),
@@ -172,7 +176,7 @@ impl Kernel {
             }
         };
         Ok(Some(ExternalRef {
-            generation: 0,
+            generation,
             kernel: self.id,
             index,
         }))
@@ -208,6 +212,7 @@ impl Kernel {
                 let record = id
                     .checked_sub(1)
                     .and_then(|n| objects.get(n as usize))
+                    .and_then(|v| v.value.as_ref())
                     .ok_or_else(|| invalid("unknown GC input reference"))?;
                 let words = record
                     .values
@@ -234,6 +239,7 @@ impl Kernel {
                     .index
                     .checked_sub(1)
                     .and_then(|n| exceptions.get(n as usize))
+                    .and_then(|v| v.value.as_ref())
                     .ok_or_else(|| invalid("unknown exception input reference"))?;
                 let io = io.ok_or_else(|| invalid("missing exception transfer layout"))?;
                 if exception_ids.len() >= io.records {
@@ -258,7 +264,7 @@ impl Kernel {
         };
         let mut heap = vec![0; layout.heap_words];
         for &id in &object_ids {
-            let record = &objects[id as usize - 1];
+            let record = objects[id as usize - 1].value.as_ref().unwrap();
             let offset = object_map[&id] as u32 as usize - 1;
             let values: Vec<_> = record.values.iter().copied().flat_map(&encode).collect();
             let words = values.len() + 3;
@@ -283,7 +289,7 @@ impl Kernel {
         };
         for (slot, &id) in exception_ids.iter().enumerate() {
             let io = io.unwrap();
-            let record = &exceptions[id as usize - 1];
+            let record = exceptions[id as usize - 1].value.as_ref().unwrap();
             let offset = 1 + slot * (io.payload_words + 1);
             arena[offset] = u64::from(record.tag);
             let payload: Vec<_> = record.payload.iter().copied().flat_map(&encode).collect();
@@ -299,7 +305,7 @@ impl Kernel {
             existing_exceptions: exception_ids
                 .into_iter()
                 .map(|index| ExceptionRef {
-                    generation: 0,
+                    generation: exceptions[index as usize - 1].generation,
                     kernel: self.id,
                     index,
                 })
@@ -465,41 +471,33 @@ impl Kernel {
         object_ids.sort_unstable();
         let mut exception_ids: Vec<_> = exceptions.keys().copied().collect();
         exception_ids.sort_unstable();
-        let object_end = retained_objects
-            .len()
-            .checked_add(object_ids.len())
-            .filter(|&n| n <= u32::MAX as usize)
-            .ok_or_else(|| invalid("too many retained GC objects"))?;
-        retained_exceptions
-            .len()
-            .checked_add(copy_exceptions.len())
-            .filter(|&n| n <= u32::MAX as usize)
-            .ok_or_else(|| invalid("too many retained exceptions"))?;
+        let object_slots = lease_slots(&retained_objects, object_ids.len())?;
+        let exception_slots = lease_slots(&retained_exceptions, copy_exceptions.len())?;
         let object_map: HashMap<_, _> = object_ids
             .iter()
-            .enumerate()
-            .map(|(slot, &id)| {
+            .zip(&object_slots)
+            .map(|(&id, &slot)| {
                 (
                     id,
                     GcRef {
-                        generation: 0,
+                        generation: retained_objects.get(slot).map_or(1, |v| v.generation),
                         kernel: self.id,
-                        index: OBJECT_TAG | (retained_objects.len() + slot + 1) as u64,
+                        index: OBJECT_TAG | (slot as u64 + 1),
                         ty: self.gc_types[objects[&id].0].reference,
                     },
                 )
             })
             .collect();
-        let mut next_exception = retained_exceptions.len();
+        let mut slots = exception_slots.iter();
         let exception_map: HashMap<_, _> = exception_ids
             .iter()
             .map(|&id| {
                 let reference = if copy_exceptions.contains(&id) {
-                    next_exception += 1;
+                    let slot = *slots.next().unwrap();
                     ExceptionRef {
-                        generation: 0,
+                        generation: retained_exceptions.get(slot).map_or(1, |v| v.generation),
                         kernel: self.id,
-                        index: next_exception as u32,
+                        index: slot as u32 + 1,
                     }
                 } else {
                     existing[id as usize - 1]
@@ -507,6 +505,17 @@ impl Kernel {
                 (id, reference)
             })
             .collect();
+        let externals = self
+            .external_values
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let external_generation = |id: u64| -> Result<u64, Error> {
+            externals
+                .get((id as u32 as usize).wrapping_sub(1))
+                .filter(|v| v.value.is_some())
+                .map(|v| v.generation)
+                .ok_or_else(|| invalid("missing retained external value"))
+        };
         let decode = |ty: ValType, words: &[u64]| -> Result<Value, Error> {
             let word = words[0];
             match ty {
@@ -514,7 +523,7 @@ impl Kernel {
                     _ if word == 0 => Value::GcRef(None),
                     1 => Value::I31(word as u32 & 0x7fffffff),
                     2 if word as u32 != 0 => Value::GcRef(Some(GcRef {
-                        generation: 0,
+                        generation: external_generation(word)?,
                         kernel: self.id,
                         index: word,
                         ty: nonnull(AbstractHeapType::Any),
@@ -530,7 +539,16 @@ impl Kernel {
                     None
                 } else {
                     Some(ExternalRef {
-                        generation: 0,
+                        generation: match word >> 32 {
+                            3 => {
+                                object_map
+                                    .get(&(word as u32))
+                                    .ok_or_else(|| invalid("missing external GC snapshot"))?
+                                    .generation
+                            }
+                            1 => 0,
+                            _ => external_generation(word)?,
+                        },
                         kernel: self.id,
                         index: if word >> 32 == 3 {
                             object_map
@@ -587,9 +605,32 @@ impl Kernel {
             .iter()
             .map(|(ty, words)| decode(*ty, words))
             .collect::<Result<_, _>>()?;
-        retained_objects.extend(new_objects?);
-        retained_exceptions.extend(new_exceptions?);
-        debug_assert_eq!(retained_objects.len(), object_end);
+        let new_objects = new_objects?;
+        let new_exceptions = new_exceptions?;
+        for (slot, record) in object_slots.into_iter().zip(new_objects) {
+            if slot == retained_objects.len() {
+                retained_objects.push(Lease {
+                    generation: 1,
+                    retained: false,
+                    value: Some(record),
+                });
+            } else {
+                retained_objects[slot].value = Some(record);
+                retained_objects[slot].retained = false;
+            }
+        }
+        for (slot, record) in exception_slots.into_iter().zip(new_exceptions) {
+            if slot == retained_exceptions.len() {
+                retained_exceptions.push(Lease {
+                    generation: 1,
+                    retained: false,
+                    value: Some(record),
+                });
+            } else {
+                retained_exceptions[slot].value = Some(record);
+                retained_exceptions[slot].retained = false;
+            }
+        }
         Ok(output)
     }
 }

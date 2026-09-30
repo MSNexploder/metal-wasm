@@ -4,7 +4,7 @@ Run many independent invocations of one WebAssembly function on a Metal GPU. Eac
 
 This version accepts exported functions with any number of `i32`, `i64`, `f32`, `f64`, `v128`, and function, external, exception, or GC reference parameters and results. `Kernel::run` retains the fast `(i32) -> i32` interface; `Kernel::run_values` accepts a row of raw `Value` bit patterns per invocation. `Value::V128` stores 16 bytes in Wasm lane order. It supports scalar numeric operations, SIMD operations, conversions, structured control flow, direct and indirect calls, and `return_call`, `return_call_indirect`, and `return_call_ref`. Wide arithmetic supports `i64.add128`, `i64.sub128`, `i64.mul_wide_s`, and `i64.mul_wide_u`, with low/high `i64` results. Add/subtract propagate carry/borrow; multiplication uses Metal's signed or unsigned `mulhi`. Tail calls reuse a shader call frame. Ordinary recursion is limited to 32 call frames by default; deeper calls trap. Larger call-depth limits can exceed the device’s stack capacity. Type-index blocks and calls can pass multiple values, including nullable and non-nullable typed function references. Recursive type groups and declared function, struct, and array subtyping are supported.
 
-Each module can own or import multiple unshared linear memories with 32-bit or 64-bit addresses, active and passive data segments, globals, and a start function. Memories can use the default 65,536-byte page size or declare `(pagesize 1)` or `(pagesize 65536)`. Different page sizes can coexist and participate in `memory.copy`; imports must match the provider's page size. Supported memory instructions include loads, stores, `memory.size`, `memory.grow`, `memory.copy`, `memory.fill`, `memory.init`, and `data.drop`. Initializers support `i32` and `i64` add, subtract, multiply, and reads of earlier immutable globals. The default total memory limit is 16 MiB per module instance. Growth can add at most four pages per memory by default, subject to declared maxima and that total limit; excess growth returns `-1`. `memory.size`, `memory.grow`, and `KernelLimits::memory_growth_pages` count each memory's declared pages. `KernelLimits::memory_bytes` limits the sum of owned memory bytes per lane; it accepts byte limits up to 4 GiB without page alignment. Memory64 uses 64-bit addresses and page counts but retains these physical allocation bounds. `KernelLimits` lets callers raise the memory limit, growth reserve, table growth reserve, call depth, exception record limit, and GC heap size when compiling. Each growable memory reserves GPU buffer space for its possible growth, even when the total limit prevents every memory from growing in one lane. Larger reserves can reduce batch size. Large batches use consecutive dispatches sized for a 64 MiB buffer budget; per-lane state buffers are reused and reset between dispatches. A single invocation or shared buffer that exceeds a Metal buffer limit returns `Unsupported`. If an invocation traps, the whole run returns `Error::Trap` with its index in the original input and reason; results are discarded.
+Each module can own or import multiple unshared linear memories with 32-bit or 64-bit addresses, active and passive data segments, globals, and a start function. Memories can use the default 65,536-byte page size or declare `(pagesize 1)` or `(pagesize 65536)`. Different page sizes can coexist and participate in `memory.copy`; imports must match the provider's page size. Supported memory instructions include loads, stores, `memory.size`, `memory.grow`, `memory.copy`, `memory.fill`, `memory.init`, and `data.drop`. Initializers support `i32` and `i64` add, subtract, multiply, and reads of earlier immutable globals. The default total memory limit is 16 MiB per module instance. Growth can add at most four pages per memory by default, subject to declared maxima and that total limit; excess growth returns `-1`. `memory.size`, `memory.grow`, and `KernelLimits::memory_growth_pages` count each memory's declared pages. `KernelLimits::memory_bytes` limits the sum of owned memory bytes per lane; it accepts byte limits up to 4 GiB without page alignment. Memory64 uses 64-bit addresses and page counts but retains these physical allocation bounds. `KernelLimits` lets callers raise the memory limit, growth reserve, table growth reserve, call depth, exception record limit, and GC heap size when compiling. Each growable memory reserves GPU buffer space for its possible growth, even when the total limit prevents every memory from growing in one lane. Larger reserves can reduce batch size. Large batches use consecutive dispatches sized for a 64 MiB buffer budget; per-lane state buffers are reused and reset between dispatches. A single invocation or shared buffer that exceeds a Metal buffer limit returns `Unsupported`. If an invocation traps, `run` and `run_values` return `Error::Trap` with its index in the original input and reason; results are discarded. `run_values_outcomes` returns a separate outcome for each invocation, as described below.
 
 Each module can own or import multiple unshared function, external, exception, or GC reference tables, including typed and non-nullable element types, with 32-bit or 64-bit indices. Each table has at most 65,536 initial entries. Active, passive, and declared element segments are supported. `table.get`, `table.set`, `table.size`, `table.grow`, `table.fill`, `table.copy`, `table.init`, `elem.drop`, and `ref.null`, `ref.func`, `ref.is_null`, `ref.as_non_null`, `br_on_null`, `br_on_non_null`, `ref.test`, `ref.cast`, `br_on_cast`, and `br_on_cast_fail` operate on per-lane table state. Growth can add at most 256 entries by default, subject to the declared maximum and the 65,536-entry limit. Unchanged tables share an initialized buffer between lanes. `call_indirect` checks the slot and nominal function type at runtime. `call_ref` dispatches a typed function reference.
 
@@ -22,7 +22,7 @@ Metal has no native `f64`, and this Mac flushes native `f32` subnormals. Both ty
 
 `Kernel::exception_reference(tag_export, payload)` creates an immutable exception for an exported tag. Pass it as `Value::ExnRef(Some(handle))`, or use `Value::ExnRef(None)` for null. `run_values` returns captured exception handles with their original tag and payload. `Kernel::exception_payload(handle)` reads raw payload values, including vectors and nested references. Returned handles can be passed to later invocations of the same kernel. Input serialization maps the reachable exception records into each lane and preserves shared child identities. Imported records count toward the lane's exception limit. Signatures with exception references also transfer an exception arena; numeric signatures retain their existing transfer format.
 
-External values, host GC snapshots, and host exception records remain retained until their kernel is dropped. Dropping a copied handle does not release its record. All reference handles belong to one compiled kernel; input and payload checks reject handles from other kernels. The `Kernel` API has no host record reclamation, so long-running applications that return many new objects or exceptions must bound kernel lifetime. `Store` supports explicit release, as described below.
+`Kernel::release_reference(value)` ends the active host lease for an external, GC, or exception reference and collects unreachable host records. All copied handles and external/any conversion aliases of that lease become invalid. Other retained snapshots and exception payloads keep reachable records alive. Reading a still-live exception payload renews the returned child leases; stale handles never become valid again. `Kernel::collect_garbage()` also reclaims unreachable records, including mixed GC/exception cycles and unpublished results from failed batches. Both methods require mutable access to the kernel. Dropping a copied handle alone does not release its lease. Null references and `i31` values need no storage; releasing them is a no-op. Scalars and non-null function references cannot be released. An `Arc<T>` already obtained through `external_reference_value` remains valid under normal Rust ownership. All reference handles belong to one compiled kernel; input and payload checks reject handles from other kernels. `Store` uses the same lease policy, as described below.
 
 
 Exception handling supports tags, `try_table`, `throw`, `throw_ref`, `catch`, `catch_ref`, `catch_all`, and `catch_all_ref`. Calls propagate exceptions to the nearest matching handler. Tail calls remove the caller’s handlers. Traps cannot be caught. Exception references can be kept in locals, globals, or tables and rethrown. Each lane has capacity for 64 live immutable exception records by default; `KernelLimits::exception_records` changes this limit. Allocation reclaims unreachable records and mixed GC/exception cycles before reporting `exception record limit exceeded`. Live records retain their slot and payload. An escaping exception returns `Error::UncaughtException` with the original input index. Provider start exceptions stop initialization.
@@ -81,10 +81,18 @@ The matching reference conversion, kind, and exception payload methods are also
 available on `Store`.
 
 `get_global(instance, export)` reads one value per lane.
+`set_global(instance, export, values)` writes one value per lane to a mutable global.
 `read_memory(instance, export, range)` and
 `write_memory(instance, export, offset, rows)` access current exported memories.
-These methods also resolve imported resource exports. Change tables and globals
-through exported Wasm functions.
+`table_size(instance, export)` returns each lane's current table size.
+`read_table(instance, export, range)` reads one row of references per lane.
+`write_table(instance, export, offset, rows)` writes one row per lane. Rows may
+have different lengths; each must fit its lane's current table size.
+Table ranges and offsets use `u64`, including for table64. All methods resolve
+imported resource exports to their provider state. Global and table writes validate
+the entire batch before mutation, including current per-lane bounds, types,
+nullability, subtyping, reference ownership, and lane identity. Written references
+become Wasm roots. Read references receive host leases.
 
 Traps and uncaught exceptions retain changes made before execution stopped.
 Other submitted lanes may also have completed. A failed start does not return an
@@ -105,9 +113,40 @@ and releases unreachable Rust host values. Collection also runs at dispatch
 boundaries and after host reference release. It does not run start functions.
 Dropping a copied handle alone does not release its lease. An `Arc<T>` obtained
 through `external_reference_value` remains valid under normal Rust ownership.
-Persistent resources must fit the device's Metal buffer limit. `Kernel` continues
-to provide fresh independent instances and GC snapshots for each invocation;
-its host records remain retained until kernel drop.
+Persistent resources must fit the device's Metal buffer limit. `Kernel` provides
+fresh independent instances and GC snapshots for each invocation, with explicit
+host reference release and collection.
+
+## Per-lane outcomes
+
+`Kernel::run_values_outcomes(inputs)` and
+`Store::call_outcomes(instance, export, inputs)` return
+`Result<Vec<LaneResult>, Error>`, where `LaneResult` is
+`Result<Vec<Value>, LaneError>`. An outer error reports invalid inputs, resource
+or serialization failures, or a failed Metal command. An inner error reports an
+executed lane's Wasm trap or uncaught exception. Successful lanes retain their
+results, including references. Later lanes and dispatches continue after a Wasm
+failure; failed result rows are not decoded.
+
+```rust
+use metal_wasm::{LaneError, Value};
+# fn report(kernel: &metal_wasm::Kernel) -> Result<(), metal_wasm::Error> {
+for (lane, outcome) in kernel.run_values_outcomes(&[vec![Value::I32(42)]])?
+    .into_iter().enumerate()
+{
+    match outcome {
+        Ok(values) => println!("lane {lane}: {values:?}"),
+        Err(LaneError::Trap { reason }) => println!("lane {lane}: {reason}"),
+        Err(LaneError::UncaughtException) => println!("lane {lane}: uncaught exception"),
+    }
+}
+# Ok(())
+# }
+```
+
+Existing `run`, `run_values`, and `Store::call` methods retain their first-failure
+error behavior. In a `Store`, writes made before a Wasm failure remain visible,
+and other submitted lanes can also complete. Invalid input batches do not execute.
 
 ## Execution budgets
 

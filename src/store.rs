@@ -15,6 +15,7 @@ struct Module {
     memories: Vec<Option<(usize, usize)>>,
     memory_page_sizes: Vec<usize>,
     tables: Vec<Option<(usize, usize)>>,
+    table_types: Vec<TableType>,
     globals: Vec<(usize, usize)>,
     global_types: Vec<GlobalType>,
     tags: Vec<u32>,
@@ -211,48 +212,6 @@ enum LiveException {
     Host(ExceptionRecord),
 }
 
-// The lease generation belongs to the public handle. The stored identity stays
-// available to Wasm and other retained graphs after that public lease is released.
-#[derive(Clone)]
-struct Lease<T> {
-    generation: u64,
-    retained: bool,
-    value: Option<T>,
-}
-impl<T> Lease<T> {
-    fn valid(&self, generation: u64) -> bool {
-        self.retained && self.generation == generation && self.value.is_some()
-    }
-    fn release(&mut self, generation: u64) -> Result<(), Error> {
-        if !self.valid(generation) {
-            return Err(Error::Unsupported(
-                "invalid or released reference for this store".into(),
-            ));
-        }
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| Error::Unsupported("reference generation exhausted".into()))?;
-        self.retained = false;
-        Ok(())
-    }
-}
-fn lease_insert<T>(values: &mut Vec<Lease<T>>, value: T) -> Result<usize, Error> {
-    if let Some(index) = values.iter().position(|v| v.value.is_none()) {
-        values[index].value = Some(value);
-        values[index].retained = true;
-        return Ok(index);
-    }
-    if values.len() >= u32::MAX as usize {
-        return Err(Error::Unsupported("too many retained references".into()));
-    }
-    values.push(Lease {
-        generation: 1,
-        retained: true,
-        value: Some(value),
-    });
-    Ok(values.len() - 1)
-}
 #[derive(Default)]
 struct Reachable {
     gc: HashSet<(usize, u64)>,
@@ -277,6 +236,7 @@ pub struct Store {
     lanes: usize,
     limits: KernelLimits,
     device: Device,
+    queue: metal::CommandQueue,
     modules: Vec<Module>,
     entries: HashMap<(usize, String), Kernel>,
     resources: Vec<Vec<Resource>>,
@@ -315,12 +275,15 @@ impl Store {
         {
             return Err(Error::Unsupported("invalid kernel resource limits".into()));
         }
+        let device = Device::system_default()
+            .ok_or_else(|| Error::Metal("no Metal device is available".into()))?;
+        let queue = device.new_command_queue();
         Ok(Self {
             id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed),
             lanes,
             limits,
-            device: Device::system_default()
-                .ok_or_else(|| Error::Metal("no Metal device is available".into()))?,
+            device,
+            queue,
             modules: Vec::new(),
             entries: HashMap::new(),
             resources: Vec::new(),
@@ -403,7 +366,7 @@ impl Store {
                 if let Some((owner, index)) = modules[i].table_bindings[local] {
                     if owner < self.resources.len() {
                         modules[i].table_types[local].initial = (0..self.lanes)
-                            .map(|lane| self.table_size(owner, index, lane) as u64)
+                            .map(|lane| self.lane_table_size(owner, index, lane) as u64)
                             .min()
                             .unwrap();
                     }
@@ -430,7 +393,12 @@ impl Store {
         )?;
         let metadata = translation.persistent_metadata.take().unwrap();
         Ok((
-            Kernel::from_translation(translation, self.limits)?,
+            Kernel::from_translation(
+                translation,
+                self.limits,
+                self.device.clone(),
+                self.queue.clone(),
+            )?,
             metadata,
         ))
     }
@@ -458,6 +426,7 @@ impl Store {
             memories: Vec::new(),
             memory_page_sizes: Vec::new(),
             tables: Vec::new(),
+            table_types: Vec::new(),
             globals: Vec::new(),
             global_types: Vec::new(),
             tags: Vec::new(),
@@ -474,6 +443,7 @@ impl Store {
                     .map(|ty| ty.page_size() as usize)
                     .collect(),
                 module.table_bindings.clone(),
+                module.table_types.clone(),
                 module.global_bindings.clone(),
                 module.global_types.clone(),
                 module.tag_bindings.clone(),
@@ -498,6 +468,7 @@ impl Store {
             module.memories,
             module.memory_page_sizes,
             module.tables,
+            module.table_types,
             module.globals,
             module.global_types,
             module.tags,
@@ -548,7 +519,7 @@ impl Store {
             )
         }
     }
-    fn table_size(&self, module: usize, index: usize, lane: usize) -> usize {
+    fn lane_table_size(&self, module: usize, index: usize, lane: usize) -> usize {
         self.metadata_words()
             [lane * self.metadata.stride() + self.metadata.module_ranges[module].start + index]
             as usize
@@ -709,6 +680,18 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         Ok((values, time))
     }
+    /// Call every lane and return individual Wasm outcomes.
+    /// All lanes retain writes made before completion, a trap, or an exception.
+    pub fn call_outcomes(
+        &mut self,
+        instance: Instance,
+        export: &str,
+        inputs: &[Vec<Value>],
+    ) -> Result<Vec<LaneResult>, Error> {
+        self.call_lanes_timed(instance, export, inputs, false, false)
+            .map(|(rows, _)| rows)
+    }
+
     fn call_timed(
         &mut self,
         instance: Instance,
@@ -716,6 +699,23 @@ impl Store {
         inputs: &[Vec<Value>],
         i32_only: bool,
     ) -> Result<(Vec<Vec<Value>>, Option<Duration>), Error> {
+        let (rows, time) = self.call_lanes_timed(instance, export, inputs, i32_only, true)?;
+        let rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(lane, row)| row.map_err(|e| e.at(lane)))
+            .collect::<Result<_, _>>()?;
+        Ok((rows, time))
+    }
+
+    fn call_lanes_timed(
+        &mut self,
+        instance: Instance,
+        export: &str,
+        inputs: &[Vec<Value>],
+        i32_only: bool,
+        fail_fast: bool,
+    ) -> Result<(Vec<LaneResult>, Option<Duration>), Error> {
         let (index, _) = self.export(instance, export, ExternalKind::Func)?;
         if inputs.len() != self.lanes {
             return Err(Error::Unsupported(
@@ -734,7 +734,7 @@ impl Store {
                     "export must have signature (i32) -> i32".into(),
                 ))
             } else {
-                self.execute(&kernel, inputs)
+                self.execute_lanes(&kernel, inputs, fail_fast)
             };
         self.entries.insert(key, kernel);
         result
@@ -744,6 +744,21 @@ impl Store {
         kernel: &Kernel,
         inputs: &[Vec<Value>],
     ) -> Result<(Vec<Vec<Value>>, Option<Duration>), Error> {
+        let (rows, time) = self.execute_lanes(kernel, inputs, true)?;
+        let rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(lane, row)| row.map_err(|e| e.at(lane)))
+            .collect::<Result<_, _>>()?;
+        Ok((rows, time))
+    }
+
+    fn execute_lanes(
+        &mut self,
+        kernel: &Kernel,
+        inputs: &[Vec<Value>],
+        fail_fast: bool,
+    ) -> Result<(Vec<LaneResult>, Option<Duration>), Error> {
         self.check()?;
         for (lane, row) in inputs.iter().enumerate() {
             if row.len() != kernel.params.len()
@@ -834,20 +849,9 @@ impl Store {
             }
             buffers.push(vec![(5, heap.clone())]);
         }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                metadata.as_ptr(),
-                self.metadata_buffer
-                    .as_ref()
-                    .unwrap()
-                    .contents()
-                    .cast::<u64>(),
-                metadata.len(),
-            );
-        }
-        self.host_exception_slots = host_slots;
+        self.install_metadata(&metadata, host_slots);
         let result_words: usize = kernel.results.iter().map(|t| value_words(*t)).sum();
-        let dispatched = kernel.dispatch(
+        let dispatched = kernel.dispatch_lanes(
             &input,
             self.lanes * result_words * if fast { 4 } else { 8 },
             self.lanes as u32,
@@ -855,7 +859,7 @@ impl Store {
             None,
             0,
         );
-        let (output, time) = match dispatched {
+        let (output, time, traps) = match dispatched {
             Ok(v) => v,
             Err(e) => {
                 if matches!(&e, Error::Metal(_)) {
@@ -866,8 +870,19 @@ impl Store {
                 return Err(e);
             }
         };
+        if fail_fast
+            && let Some((lane, error)) = (0..self.lanes)
+                .find_map(|lane| lane_failure(&traps, lane).map(|error| (lane, error)))
+        {
+            self.collect_garbage()?;
+            return Err(error.at(lane));
+        }
         let mut rows = Vec::new();
         for lane in 0..self.lanes {
+            if let Some(error) = lane_failure(&traps, lane) {
+                rows.push(Err(error));
+                continue;
+            }
             let mut row = Vec::new();
             let mut offset = 0;
             for &ty in &kernel.results {
@@ -888,7 +903,7 @@ impl Store {
                 row.push(self.decode(ty, &words, lane)?);
                 offset += value_words(ty);
             }
-            rows.push(row);
+            rows.push(Ok(row));
         }
         self.collect_garbage()?;
         Ok((rows, time))
@@ -913,6 +928,176 @@ impl Store {
             })
             .collect()
     }
+    /// Set one value per lane of an exported mutable global.
+    /// Invalid rows leave every lane unchanged.
+    pub fn set_global(
+        &mut self,
+        instance: Instance,
+        export: &str,
+        values: &[Value],
+    ) -> Result<(), Error> {
+        let (m, g) = self.export(instance, export, ExternalKind::Global)?;
+        let ty = self.modules[m].global_types[g];
+        if !ty.mutable {
+            return Err(Error::Unsupported("global is immutable".into()));
+        }
+        if values.len() != self.lanes
+            || values
+                .iter()
+                .enumerate()
+                .any(|(lane, &v)| !self.accepts(v, ty.content_type, lane))
+        {
+            return Err(Error::Unsupported(
+                "global values do not match its type or lane".into(),
+            ));
+        }
+        let mut metadata = self.metadata_words().to_vec();
+        let mut host_slots = self.host_exception_slots.clone();
+        let words = values
+            .iter()
+            .enumerate()
+            .map(|(lane, &v)| self.encode(v, lane, &mut metadata, &mut host_slots))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (owner, slot) = self.modules[m].globals[g];
+        let r = self.resource(owner, "globals");
+        for (lane, words) in words.iter().enumerate() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    words.as_ptr(),
+                    self.resource_buffer
+                        .as_ref()
+                        .unwrap()
+                        .contents()
+                        .cast::<u8>()
+                        .add(r.offset(self.lanes) + lane * r.size + slot * 8)
+                        .cast::<u64>(),
+                    words.len(),
+                );
+            }
+        }
+        self.install_metadata(&metadata, host_slots);
+        self.collect_garbage()
+    }
+
+    /// Return the current element count of an exported table in every lane.
+    pub fn table_size(&self, instance: Instance, export: &str) -> Result<Vec<u64>, Error> {
+        let (m, t) = self.export(instance, export, ExternalKind::Table)?;
+        let (owner, index) = self.modules[m].tables[t].unwrap();
+        Ok((0..self.lanes)
+            .map(|lane| self.lane_table_size(owner, index, lane) as u64)
+            .collect())
+    }
+
+    /// Read an element range from every lane, retaining returned references.
+    pub fn read_table(
+        &self,
+        instance: Instance,
+        export: &str,
+        range: Range<u64>,
+    ) -> Result<Vec<Vec<Value>>, Error> {
+        let (m, t) = self.export(instance, export, ExternalKind::Table)?;
+        let (owner, index) = self.modules[m].tables[t].unwrap();
+        if range.start > range.end
+            || (0..self.lanes)
+                .any(|lane| range.end > self.lane_table_size(owner, index, lane) as u64)
+        {
+            return Err(Error::Unsupported(
+                "table range exceeds current table size".into(),
+            ));
+        }
+        let ty = ValType::Ref(self.modules[m].table_types[t].element_type);
+        let r = self.resource(owner, &format!("table{index}"));
+        (0..self.lanes)
+            .map(|lane| {
+                (range.start as usize..range.end as usize)
+                    .map(|element| {
+                        let word = unsafe {
+                            *self
+                                .bytes(r)
+                                .as_ptr()
+                                .add(lane * r.size + element * 8)
+                                .cast::<u64>()
+                        };
+                        self.decode(ty, &[word], lane)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Write element rows at the same offset in every lane.
+    /// Bounds, types, and lane ownership are checked before changing state.
+    pub fn write_table(
+        &mut self,
+        instance: Instance,
+        export: &str,
+        offset: u64,
+        rows: &[Vec<Value>],
+    ) -> Result<(), Error> {
+        let (m, t) = self.export(instance, export, ExternalKind::Table)?;
+        let (owner, index) = self.modules[m].tables[t].unwrap();
+        let ty = ValType::Ref(self.modules[m].table_types[t].element_type);
+        if rows.len() != self.lanes
+            || rows.iter().enumerate().any(|(lane, row)| {
+                offset
+                    .checked_add(row.len() as u64)
+                    .is_none_or(|end| end > self.lane_table_size(owner, index, lane) as u64)
+                    || row.iter().any(|&v| !self.accepts(v, ty, lane))
+            })
+        {
+            return Err(Error::Unsupported(
+                "table rows exceed bounds or do not match its type or lane".into(),
+            ));
+        }
+        let mut metadata = self.metadata_words().to_vec();
+        let mut host_slots = self.host_exception_slots.clone();
+        let words = rows
+            .iter()
+            .enumerate()
+            .map(|(lane, row)| {
+                row.iter()
+                    .map(|&v| {
+                        self.encode(v, lane, &mut metadata, &mut host_slots)
+                            .map(|v| v[0])
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let r = self.resource(owner, &format!("table{index}"));
+        for (lane, words) in words.iter().enumerate() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    words.as_ptr(),
+                    self.resource_buffer
+                        .as_ref()
+                        .unwrap()
+                        .contents()
+                        .cast::<u8>()
+                        .add(r.offset(self.lanes) + lane * r.size + offset as usize * 8)
+                        .cast::<u64>(),
+                    words.len(),
+                );
+            }
+        }
+        self.install_metadata(&metadata, host_slots);
+        self.collect_garbage()
+    }
+
+    fn install_metadata(&mut self, metadata: &[u64], host_slots: HashMap<(usize, u32), usize>) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                metadata.as_ptr(),
+                self.metadata_buffer
+                    .as_ref()
+                    .unwrap()
+                    .contents()
+                    .cast::<u64>(),
+                metadata.len(),
+            );
+        }
+        self.host_exception_slots = host_slots;
+    }
+
     pub fn read_memory(
         &self,
         instance: Instance,
@@ -1705,7 +1890,7 @@ impl Store {
                 let r = self.resource(m, &format!("table{table}"));
                 let bytes = self.bytes(r);
                 for lane in 0..self.lanes {
-                    for i in 0..self.table_size(m, table, lane) {
+                    for i in 0..self.lane_table_size(m, table, lane) {
                         let offset = lane * r.size + i * 8;
                         pending.push(TraceReference::Guest(
                             lane,

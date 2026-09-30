@@ -88,7 +88,7 @@ pub struct FunctionRef {
     ty: RefType,
 }
 
-/// An opaque host value retained by its kernel, or by an active store lease.
+/// An opaque host value retained by an active kernel or store lease.
 /// Metal carries the identity, but cannot access the host value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExternalRef {
@@ -97,7 +97,7 @@ pub struct ExternalRef {
     index: u64,
 }
 
-/// An immutable exception retained by its kernel, or by an active store lease.
+/// An immutable exception retained by an active kernel or store lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExceptionRef {
     generation: u64,
@@ -188,12 +188,121 @@ impl Value {
     }
 }
 
+/// A Wasm execution failure in one lane. Setup and Metal failures use `Error`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneError {
+    Trap { reason: &'static str },
+    UncaughtException,
+}
+
+impl LaneError {
+    fn at(self, input_index: usize) -> Error {
+        match self {
+            Self::Trap { reason } => Error::Trap {
+                input_index,
+                reason,
+            },
+            Self::UncaughtException => Error::UncaughtException { input_index },
+        }
+    }
+}
+
+/// One lane's returned values or Wasm execution failure.
+pub type LaneResult = Result<Vec<Value>, LaneError>;
+
+fn lane_failure(traps: &Option<metal::Buffer>, lane: usize) -> Option<LaneError> {
+    let code = traps.as_ref().map_or(0, |buffer| unsafe {
+        *buffer.contents().cast::<u32>().add(lane)
+    });
+    let reason = match code {
+        0 => return None,
+        11 => return Some(LaneError::UncaughtException),
+        1 => "integer divide by zero",
+        2 => "integer overflow",
+        3 => "unreachable executed",
+        4 => "out of bounds memory access",
+        5 => "invalid conversion to integer",
+        6 => "undefined or uninitialized table element",
+        7 => "indirect call type mismatch",
+        8 => "call depth limit exceeded",
+        9 => "null reference",
+        10 => "exception record limit exceeded",
+        12 => "null function reference",
+        13 => "cast failure",
+        14 => "out of bounds table access",
+        15 => "GC resource limit exceeded",
+        16 => "out of bounds array access",
+        17 => "fuel exhausted",
+        _ => "unknown trap",
+    };
+    Some(LaneError::Trap { reason })
+}
+
+// The lease generation belongs to the public handle. The stored identity stays
+// available to Wasm and other retained graphs after that public lease is released.
+#[derive(Clone)]
+struct Lease<T> {
+    generation: u64,
+    retained: bool,
+    value: Option<T>,
+}
+impl<T> Lease<T> {
+    fn valid(&self, generation: u64) -> bool {
+        self.retained && self.generation == generation && self.value.is_some()
+    }
+    fn release(&mut self, generation: u64) -> Result<(), Error> {
+        if !self.valid(generation) {
+            return Err(Error::Unsupported(
+                "invalid or released reference for this owner".into(),
+            ));
+        }
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Unsupported("reference generation exhausted".into()))?;
+        self.retained = false;
+        Ok(())
+    }
+}
+fn lease_insert<T>(values: &mut Vec<Lease<T>>, value: T) -> Result<usize, Error> {
+    if let Some(index) = values.iter().position(|v| v.value.is_none()) {
+        values[index].value = Some(value);
+        values[index].retained = true;
+        return Ok(index);
+    }
+    if values.len() >= u32::MAX as usize {
+        return Err(Error::Unsupported("too many retained references".into()));
+    }
+    values.push(Lease {
+        generation: 1,
+        retained: true,
+        value: Some(value),
+    });
+    Ok(values.len() - 1)
+}
+// Plan record slots before decoding a cyclic graph; publish only after validation.
+fn lease_slots<T>(values: &[Lease<T>], count: usize) -> Result<Vec<usize>, Error> {
+    let mut slots = values
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| v.value.is_none().then_some(i))
+        .take(count)
+        .collect::<Vec<_>>();
+    let end = values
+        .len()
+        .checked_add(count - slots.len())
+        .filter(|&n| n <= u32::MAX as usize)
+        .ok_or_else(|| Error::Unsupported("too many retained references".into()))?;
+    slots.extend(values.len()..end);
+    Ok(slots)
+}
+
 /// A compiled WebAssembly export, run once per Metal thread.
 pub struct Kernel {
     id: u64,
-    external_values: Mutex<Vec<Arc<dyn Any + Send + Sync>>>,
-    exception_values: Mutex<Vec<ExceptionRecord>>,
-    gc_values: Mutex<Vec<GcRecord>>,
+    external_values: Mutex<Vec<Lease<Arc<dyn Any + Send + Sync>>>>,
+    exception_values: Mutex<Vec<Lease<ExceptionRecord>>>,
+    gc_values: Mutex<Vec<Lease<GcRecord>>>,
     exception_tags: HashMap<String, u32>,
     tag_payload_types: Vec<Vec<ValType>>,
     exception_io: Option<ExceptionIo>,
@@ -342,12 +451,18 @@ impl Kernel {
             return Err(Error::Unsupported("invalid kernel resource limits".into()));
         }
         let translation = translate_with_limits(wasm, export, providers, limits)?;
-        Self::from_translation(translation, limits)
-    }
-
-    fn from_translation(translation: Translation, limits: KernelLimits) -> Result<Self, Error> {
         let device = Device::system_default()
             .ok_or_else(|| Error::Metal("no Metal device is available".into()))?;
+        let queue = device.new_command_queue();
+        Self::from_translation(translation, limits, device, queue)
+    }
+
+    fn from_translation(
+        translation: Translation,
+        limits: KernelLimits,
+        device: Device,
+        queue: metal::CommandQueue,
+    ) -> Result<Self, Error> {
         let options = CompileOptions::new();
         options.set_fast_math_enabled(false);
         let library = device
@@ -365,7 +480,6 @@ impl Kernel {
             device.new_compute_pipeline_state_with_function(&function)
         }
         .map_err(Error::Metal)?;
-        let queue = device.new_command_queue();
         let mut instances = Vec::new();
         for (template, slots) in translation.instances.into_iter().zip(translation.slots) {
             let tables = template
@@ -428,7 +542,7 @@ impl Kernel {
         match (value, expected) {
             (Value::ExnRef(None), ValType::Ref(ty)) => ty.is_nullable() && is_exception_ref(ty),
             (Value::ExnRef(Some(reference)), ValType::Ref(ty)) => {
-                reference.kernel == self.id
+                self.validate_exception_reference(reference)
                     && matches!(
                         ty.heap_type(),
                         HeapType::Abstract {
@@ -476,15 +590,11 @@ impl Kernel {
             .external_values
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let index = u32::try_from(values.len())
-            .ok()
-            .and_then(|n| n.checked_add(1))
-            .ok_or_else(|| Error::Unsupported("too many external references".into()))?;
-        values.push(Arc::new(value));
+        let index = lease_insert(&mut values, Arc::new(value) as Arc<dyn Any + Send + Sync>)?;
         Ok(ExternalRef {
-            generation: 0,
+            generation: values[index].generation,
             kernel: self.id,
-            index: u64::from(index),
+            index: index as u64 + 1,
         })
     }
 
@@ -493,17 +603,18 @@ impl Kernel {
         &self,
         reference: ExternalRef,
     ) -> Result<Arc<T>, Error> {
-        if reference.kernel != self.id {
+        if reference.kernel != self.id || reference.index >> 32 != 0 {
             return Err(Error::Unsupported(
-                "external reference belongs to another kernel".into(),
+                "invalid external reference for this kernel".into(),
             ));
         }
         self.external_values
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(reference.index as usize - 1)
-            .cloned()
-            .ok_or_else(|| Error::Unsupported("unknown external reference".into()))?
+            .unwrap_or_else(|e| e.into_inner())
+            .get((reference.index as usize).wrapping_sub(1))
+            .filter(|v| v.valid(reference.generation))
+            .and_then(|v| v.value.clone())
+            .ok_or_else(|| Error::Unsupported("invalid or released external reference".into()))?
             .downcast::<T>()
             .map_err(|_| Error::Unsupported("external reference host type mismatch".into()))
     }
@@ -529,42 +640,273 @@ impl Kernel {
                 "exception payload does not match the tag signature".into(),
             ));
         }
-        self.retain_exception(ExceptionRecord {
-            tag,
-            payload: payload.to_vec(),
-        })
+        self.retain_exception(
+            ExceptionRecord {
+                tag,
+                payload: payload.to_vec(),
+            },
+            true,
+        )
     }
 
-    fn retain_exception(&self, record: ExceptionRecord) -> Result<ExceptionRef, Error> {
+    fn retain_exception(
+        &self,
+        record: ExceptionRecord,
+        retain: bool,
+    ) -> Result<ExceptionRef, Error> {
         let mut records = self
             .exception_values
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let index = u32::try_from(records.len())
-            .ok()
-            .and_then(|n| n.checked_add(1))
-            .ok_or_else(|| Error::Unsupported("too many retained exceptions".into()))?;
-        records.push(record);
+        let index = lease_insert(&mut records, record)?;
+        records[index].retained = retain;
         Ok(ExceptionRef {
-            generation: 0,
+            generation: records[index].generation,
             kernel: self.id,
-            index,
+            index: index as u32 + 1,
         })
     }
 
-    /// Read an immutable payload, including any retained reference values.
+    fn validate_exception_reference(&self, reference: ExceptionRef) -> bool {
+        reference.kernel == self.id
+            && self
+                .exception_values
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get((reference.index as usize).wrapping_sub(1))
+                .is_some_and(|v| v.valid(reference.generation))
+    }
+
+    /// Read an immutable payload and obtain active leases for its reference values.
     pub fn exception_payload(&self, reference: ExceptionRef) -> Result<Vec<Value>, Error> {
-        if reference.kernel != self.id {
+        if !self.validate_exception_reference(reference) {
             return Err(Error::Unsupported(
-                "exception reference belongs to another kernel".into(),
+                "invalid or released exception reference".into(),
             ));
         }
-        self.exception_values
+        let payload = self
+            .exception_values
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(reference.index as usize - 1)
-            .map(|record| record.payload.clone())
-            .ok_or_else(|| Error::Unsupported("unknown exception reference".into()))
+            .unwrap_or_else(|e| e.into_inner())[reference.index as usize - 1]
+            .value
+            .as_ref()
+            .unwrap()
+            .payload
+            .clone();
+        payload
+            .into_iter()
+            .map(|v| self.refresh_reference(v, true))
+            .collect()
+    }
+
+    fn refresh_reference(&self, mut value: Value, retain: bool) -> Result<Value, Error> {
+        fn refresh<T>(
+            values: &Mutex<Vec<Lease<T>>>,
+            index: usize,
+            retain: bool,
+        ) -> Result<u64, Error> {
+            let mut values = values.lock().unwrap_or_else(|e| e.into_inner());
+            let lease = values
+                .get_mut(index)
+                .filter(|v| v.value.is_some())
+                .ok_or_else(|| Error::Metal("missing retained reference graph node".into()))?;
+            lease.retained |= retain;
+            Ok(lease.generation)
+        }
+        match &mut value {
+            Value::GcRef(Some(r)) if r.index >> 32 == 3 => {
+                r.generation = refresh(
+                    &self.gc_values,
+                    (r.index as u32 as usize).wrapping_sub(1),
+                    retain,
+                )?
+            }
+            Value::ExternRef(Some(r)) if r.index >> 32 == 3 => {
+                r.generation = refresh(
+                    &self.gc_values,
+                    (r.index as u32 as usize).wrapping_sub(1),
+                    retain,
+                )?
+            }
+            Value::GcRef(Some(r)) if r.index >> 32 == 2 => {
+                r.generation = refresh(
+                    &self.external_values,
+                    (r.index as u32 as usize).wrapping_sub(1),
+                    retain,
+                )?
+            }
+            Value::ExternRef(Some(r)) if r.index >> 32 == 0 => {
+                r.generation = refresh(
+                    &self.external_values,
+                    (r.index as usize).wrapping_sub(1),
+                    retain,
+                )?
+            }
+            Value::ExnRef(Some(r)) => {
+                r.generation = refresh(
+                    &self.exception_values,
+                    (r.index as usize).wrapping_sub(1),
+                    retain,
+                )?
+            }
+            _ => {}
+        }
+        Ok(value)
+    }
+
+    /// End this reference's public lease, including copied handles and conversion aliases.
+    /// Other retained graphs keep reachable records alive. Function references cannot be released.
+    pub fn release_reference(&mut self, value: Value) -> Result<(), Error> {
+        let invalid = || Error::Unsupported("invalid or released reference for this kernel".into());
+        match value {
+            Value::GcRef(None)
+            | Value::ExternRef(None)
+            | Value::ExnRef(None)
+            | Value::FuncRef(None)
+            | Value::I31(_) => return Ok(()),
+            Value::GcRef(Some(r)) if r.kernel == self.id && r.index >> 32 == 3 => self
+                .gc_values
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut((r.index as u32 as usize).wrapping_sub(1))
+                .ok_or_else(invalid)?
+                .release(r.generation)?,
+            Value::GcRef(Some(r)) if r.kernel == self.id && r.index >> 32 == 2 => self
+                .external_values
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut((r.index as u32 as usize).wrapping_sub(1))
+                .ok_or_else(invalid)?
+                .release(r.generation)?,
+            Value::ExternRef(Some(r)) if r.kernel == self.id && r.index >> 32 == 0 => self
+                .external_values
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut((r.index as usize).wrapping_sub(1))
+                .ok_or_else(invalid)?
+                .release(r.generation)?,
+            Value::ExternRef(Some(r)) if r.kernel == self.id && r.index >> 32 == 3 => self
+                .gc_values
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut((r.index as u32 as usize).wrapping_sub(1))
+                .ok_or_else(invalid)?
+                .release(r.generation)?,
+            Value::ExternRef(Some(r))
+                if self.validate_external_reference(r) && r.index >> 32 == 1 =>
+            {
+                return Ok(());
+            }
+            Value::ExnRef(Some(r)) if r.kernel == self.id => self
+                .exception_values
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut((r.index as usize).wrapping_sub(1))
+                .ok_or_else(invalid)?
+                .release(r.generation)?,
+            _ => return Err(invalid()),
+        }
+        self.collect_garbage()
+    }
+
+    /// Reclaim host records unreachable from active leases, including snapshot cycles.
+    pub fn collect_garbage(&mut self) -> Result<(), Error> {
+        let mut objects = self.gc_values.lock().unwrap_or_else(|e| e.into_inner());
+        let mut exceptions = self
+            .exception_values
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut externals = self
+            .external_values
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut pending = Vec::new();
+        for (index, lease) in objects
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.retained && v.value.is_some())
+        {
+            pending.push(Value::GcRef(Some(GcRef {
+                kernel: self.id,
+                index: 0x300000000 | (index as u64 + 1),
+                generation: lease.generation,
+                ty: self.gc_types[lease.value.as_ref().unwrap().type_index].reference,
+            })));
+        }
+        for (index, lease) in exceptions
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.retained && v.value.is_some())
+        {
+            pending.push(Value::ExnRef(Some(ExceptionRef {
+                kernel: self.id,
+                index: index as u32 + 1,
+                generation: lease.generation,
+            })));
+        }
+        let mut live_objects = HashSet::new();
+        let mut live_exceptions = HashSet::new();
+        let mut live_externals = externals
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| (v.retained && v.value.is_some()).then_some(i))
+            .collect::<HashSet<_>>();
+        while let Some(value) = pending.pop() {
+            let word = match value {
+                Value::GcRef(Some(r)) => r.index,
+                Value::ExternRef(Some(r)) => {
+                    if r.index >> 32 == 0 {
+                        0x200000000 | r.index
+                    } else {
+                        r.index
+                    }
+                }
+                Value::ExnRef(Some(r)) => {
+                    let index = r.index as usize - 1;
+                    if live_exceptions.insert(index) {
+                        let record = exceptions
+                            .get(index)
+                            .and_then(|v| v.value.as_ref())
+                            .ok_or_else(|| {
+                                Error::Metal("missing retained exception graph node".into())
+                            })?;
+                        pending.extend_from_slice(&record.payload);
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            let index = (word as u32 as usize).wrapping_sub(1);
+            match word >> 32 {
+                2 => {
+                    live_externals.insert(index);
+                }
+                3 if live_objects.insert(index) => {
+                    let record = objects
+                        .get(index)
+                        .and_then(|v| v.value.as_ref())
+                        .ok_or_else(|| Error::Metal("missing retained GC graph node".into()))?;
+                    pending.extend_from_slice(&record.values);
+                }
+                _ => {}
+            }
+        }
+        for (index, lease) in objects.iter_mut().enumerate() {
+            if !live_objects.contains(&index) {
+                lease.value = None;
+            }
+        }
+        for (index, lease) in exceptions.iter_mut().enumerate() {
+            if !live_exceptions.contains(&index) {
+                lease.value = None;
+            }
+        }
+        for (index, lease) in externals.iter_mut().enumerate() {
+            if !live_externals.contains(&index) {
+                lease.value = None;
+            }
+        }
+        Ok(())
     }
 
     /// Run one independent invocation for each input. Values are raw i32 bit patterns.
@@ -691,16 +1033,21 @@ impl Kernel {
             .exception_values
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let mut pending: Vec<_> = row
+        let mut pending = row
             .iter()
             .filter_map(|value| match value {
-                Value::ExnRef(Some(reference)) => Some(*reference),
+                Value::ExnRef(Some(r)) => Some((r.index, false)),
                 _ => None,
             })
-            .collect();
+            .collect::<Vec<_>>();
         let mut needed = HashSet::new();
-        while let Some(reference) = pending.pop() {
-            if !needed.insert(reference.index) {
+        let mut ids = Vec::new();
+        while let Some((id, exit)) = pending.pop() {
+            if exit {
+                ids.push(id);
+                continue;
+            }
+            if !needed.insert(id) {
                 continue;
             }
             if needed.len() > io.records {
@@ -710,17 +1057,16 @@ impl Kernel {
                 });
             }
             let record = records
-                .get(reference.index as usize - 1)
+                .get((id as usize).wrapping_sub(1))
+                .and_then(|v| v.value.as_ref())
                 .ok_or_else(|| Error::Unsupported("unknown exception reference".into()))?;
+            pending.push((id, true));
             pending.extend(record.payload.iter().filter_map(|value| match value {
-                Value::ExnRef(Some(reference)) => Some(*reference),
+                Value::ExnRef(Some(r)) => Some((r.index, false)),
                 _ => None,
             }));
         }
-        // Immutable records refer only to older records. Increasing host IDs give
-        // a topological order without recursion or a host stack-depth limit.
-        let mut ids: Vec<_> = needed.into_iter().collect();
-        ids.sort_unstable();
+        // Child-first order is independent of recycled host slot numbers.
         let mapping: HashMap<_, _> = ids
             .iter()
             .enumerate()
@@ -733,7 +1079,7 @@ impl Kernel {
         let mut arena = vec![0; io.words()?];
         arena[0] = ids.len() as u64;
         for (slot, &id) in ids.iter().enumerate() {
-            let record = &records[id as usize - 1];
+            let record = records[id as usize - 1].value.as_ref().unwrap();
             let offset = 1 + slot * (io.payload_words + 1);
             arena[offset] = u64::from(record.tag);
             let payload: Vec<_> = record.payload.iter().copied().flat_map(&encode).collect();
@@ -743,7 +1089,7 @@ impl Kernel {
         let handles = ids
             .into_iter()
             .map(|index| ExceptionRef {
-                generation: 0,
+                generation: records[index as usize - 1].generation,
                 kernel: self.id,
                 index,
             })
@@ -758,7 +1104,7 @@ impl Kernel {
         exceptions: &[Option<ExceptionRef>],
     ) -> Result<Value, Error> {
         let low = words[0];
-        Ok(match ty {
+        let value = match ty {
             ValType::I32 => Value::I32(low as u32),
             ValType::I64 => Value::I64(low),
             ValType::F32 => Value::F32(low as u32),
@@ -808,7 +1154,8 @@ impl Kernel {
                     "unsupported reference result type".into(),
                 ));
             }
-        })
+        };
+        self.refresh_reference(value, false)
     }
 
     fn decode_exceptions(
@@ -830,19 +1177,30 @@ impl Kernel {
         let mut word = 0;
         for &ty in &self.results {
             if matches!(ty, ValType::Ref(ty) if is_exception_ref(ty)) && results[word] != 0 {
-                pending.push(results[word]);
+                pending.push((results[word], false));
             }
             word += value_words(ty);
         }
         let mut needed = HashSet::new();
-        while let Some(id) = pending.pop() {
+        let mut active = HashSet::new();
+        let mut order = Vec::new();
+        while let Some((id, exit)) = pending.pop() {
             let slot = usize::try_from(id)
                 .ok()
                 .filter(|&n| n > 0 && n <= count)
                 .ok_or_else(|| Error::Metal("invalid exception reference result".into()))?
                 - 1;
-            if handles[slot].is_some() || !needed.insert(slot) {
+            if exit {
+                active.remove(&slot);
+                needed.insert(slot);
+                order.push(slot);
                 continue;
+            }
+            if handles[slot].is_some() || needed.contains(&slot) {
+                continue;
+            }
+            if !active.insert(slot) {
+                return Err(Error::Metal("cyclic immutable exception payload".into()));
             }
             let offset = 1 + slot * (io.payload_words + 1);
             let tag = usize::try_from(arena[offset])
@@ -850,22 +1208,16 @@ impl Kernel {
                 .filter(|&n| n != 0)
                 .and_then(|n| self.tag_payload_types.get(n))
                 .ok_or_else(|| Error::Metal("invalid exception tag result".into()))?;
+            pending.push((id, true));
             let mut word = offset + 1;
             for &ty in tag {
                 if matches!(ty, ValType::Ref(ty) if is_exception_ref(ty)) && arena[word] != 0 {
-                    if arena[word] > slot as u64 {
-                        return Err(Error::Metal(
-                            "exception payload does not refer to an older record".into(),
-                        ));
-                    }
-                    pending.push(arena[word]);
+                    pending.push((arena[word], false));
                 }
                 word += value_words(ty);
             }
         }
-        let mut needed: Vec<_> = needed.into_iter().collect();
-        needed.sort_unstable();
-        for slot in needed {
+        for slot in order {
             let offset = 1 + slot * (io.payload_words + 1);
             let tag = arena[offset] as u32;
             let mut word = offset + 1;
@@ -874,9 +1226,16 @@ impl Kernel {
                 payload.push(self.decode_value(ty, &arena[word..], &handles)?);
                 word += value_words(ty);
             }
-            handles[slot] = Some(self.retain_exception(ExceptionRecord { tag, payload })?);
+            handles[slot] = Some(self.retain_exception(ExceptionRecord { tag, payload }, false)?);
         }
         Ok(handles)
+    }
+
+    /// Run all lanes and return each lane's values, trap, or uncaught exception.
+    /// Invalid inputs, serialization failures, and Metal failures reject the batch.
+    pub fn run_values_outcomes(&self, inputs: &[Vec<Value>]) -> Result<Vec<LaneResult>, Error> {
+        self.run_values_lanes_impl(inputs, None, None, false)
+            .map(|(rows, _)| rows)
     }
 
     fn run_values_impl(
@@ -885,6 +1244,22 @@ impl Kernel {
         capture: Option<((usize, usize), Range<usize>)>,
         memory_input: Option<MemoryInput<'_>>,
     ) -> Result<(Vec<Vec<Value>>, Vec<Vec<u8>>), Error> {
+        let (rows, memory) = self.run_values_lanes_impl(inputs, capture, memory_input, true)?;
+        let rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| row.map_err(|e| e.at(i)))
+            .collect::<Result<_, _>>()?;
+        Ok((rows, memory))
+    }
+
+    fn run_values_lanes_impl(
+        &self,
+        inputs: &[Vec<Value>],
+        capture: Option<((usize, usize), Range<usize>)>,
+        memory_input: Option<MemoryInput<'_>>,
+        fail_fast: bool,
+    ) -> Result<(Vec<LaneResult>, Vec<Vec<u8>>), Error> {
         for row in inputs {
             if row.len() != self.params.len()
                 || row
@@ -900,7 +1275,8 @@ impl Kernel {
         if inputs.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
-        if capture.is_none()
+        if fail_fast
+            && capture.is_none()
             && memory_input.is_none()
             && self.params == [ValType::I32]
             && self.results == [ValType::I32]
@@ -915,7 +1291,7 @@ impl Kernel {
             return Ok((
                 self.run(&flat)?
                     .into_iter()
-                    .map(|bits| vec![Value::I32(bits)])
+                    .map(|bits| Ok(vec![Value::I32(bits)]))
                     .collect(),
                 Vec::new(),
             ));
@@ -1053,8 +1429,8 @@ impl Kernel {
                 packed
             });
             let input = packed.as_deref().unwrap_or(arguments);
-            let (output, _) = self
-                .dispatch(
+            let (output, _, traps) = self
+                .dispatch_lanes(
                     input,
                     (end - start) * transfer_output_stride,
                     (end - start) as u32,
@@ -1065,11 +1441,19 @@ impl Kernel {
                     exception_input_offset,
                 )
                 .map_err(|error| shift_trap(error, start))?;
+            if fail_fast
+                && let Some((lane, error)) =
+                    (0..end - start).find_map(|lane| lane_failure(&traps, lane).map(|e| (lane, e)))
+            {
+                return Err(error.at(start + lane));
+            }
             if fast_i32 {
                 let values = unsafe {
                     std::slice::from_raw_parts(output.contents().cast::<u32>(), end - start)
                 };
-                rows.extend(values.iter().map(|&value| vec![Value::I32(value)]));
+                rows.extend(values.iter().enumerate().map(|(lane, &value)| {
+                    lane_failure(&traps, lane).map_or_else(|| Ok(vec![Value::I32(value)]), Err)
+                }));
             } else {
                 let values = unsafe {
                     std::slice::from_raw_parts(
@@ -1079,6 +1463,10 @@ impl Kernel {
                 };
                 let result_words = output_stride / size_of::<u64>();
                 for index in 0..end - start {
+                    if let Some(error) = lane_failure(&traps, index) {
+                        rows.push(Err(error));
+                        continue;
+                    }
                     let result = &values[index * result_words..(index + 1) * result_words];
                     if let Some(gc) = self.gc {
                         let buffer = &instance_buffers.last().unwrap()[0].1;
@@ -1095,18 +1483,16 @@ impl Kernel {
                         } else {
                             &[]
                         };
-                        rows.push(
-                            self.decode_gc_row(
-                                result,
-                                &heaps[index * stride..index * stride + gc.heap_words],
-                                arena,
-                                self.exception_io,
-                                exception_handles
-                                    .get(index)
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[]),
-                            )?,
-                        );
+                        rows.push(Ok(self.decode_gc_row(
+                            result,
+                            &heaps[index * stride..index * stride + gc.heap_words],
+                            arena,
+                            self.exception_io,
+                            exception_handles
+                                .get(index)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
+                        )?));
                         continue;
                     }
                     let handles = if let Some(io) = self.exception_io.filter(|io| io.output) {
@@ -1129,7 +1515,7 @@ impl Kernel {
                         row.push(self.decode_value(ty, &result[word..], &handles)?);
                         word += value_words(ty);
                     }
-                    rows.push(row);
+                    rows.push(Ok(row));
                 }
             }
             if let Some(((owner, resource), range)) = &capture {
@@ -1166,6 +1552,11 @@ impl Kernel {
                         bytes[lane * stride + range.start..lane * stride + range.end].to_vec(),
                     );
                 }
+            }
+        }
+        for row in rows.iter_mut().filter_map(|r| r.as_mut().ok()) {
+            for value in row {
+                *value = self.refresh_reference(*value, true)?;
             }
         }
         Ok((rows, memories))
@@ -1256,6 +1647,31 @@ impl Kernel {
         memory_input: Option<((usize, usize), usize, usize)>,
         exception_input_offset: usize,
     ) -> Result<(metal::Buffer, Option<Duration>), Error> {
+        let (output, time, traps) = self.dispatch_lanes(
+            input_data,
+            output_bytes,
+            count,
+            instance_buffers,
+            memory_input,
+            exception_input_offset,
+        )?;
+        if let Some((lane, error)) = (0..count as usize)
+            .find_map(|lane| lane_failure(&traps, lane).map(|error| (lane, error)))
+        {
+            return Err(error.at(lane));
+        }
+        Ok((output, time))
+    }
+
+    fn dispatch_lanes(
+        &self,
+        input_data: &[u8],
+        output_bytes: usize,
+        count: u32,
+        instance_buffers: &[Vec<(u64, metal::Buffer)>],
+        memory_input: Option<((usize, usize), usize, usize)>,
+        exception_input_offset: usize,
+    ) -> Result<(metal::Buffer, Option<Duration>, Option<metal::Buffer>), Error> {
         autoreleasepool(|| {
             let input_bytes = u64::try_from(input_data.len().max(4))
                 .map_err(|_| Error::Unsupported("input buffer size overflow".into()))?;
@@ -1347,42 +1763,6 @@ impl Kernel {
                     command.status(),
                 )));
             }
-            if let Some(traps) = &traps {
-                let codes = unsafe {
-                    std::slice::from_raw_parts(traps.contents().cast::<u32>(), count as usize)
-                };
-                if let Some((input_index, code)) =
-                    codes.iter().enumerate().find(|(_, code)| **code != 0)
-                {
-                    if *code == 11 {
-                        return Err(Error::UncaughtException { input_index });
-                    }
-                    let reason = match code {
-                        1 => "integer divide by zero",
-                        2 => "integer overflow",
-                        3 => "unreachable executed",
-                        4 => "out of bounds memory access",
-                        5 => "invalid conversion to integer",
-                        6 => "undefined or uninitialized table element",
-                        7 => "indirect call type mismatch",
-                        8 => "call depth limit exceeded",
-                        9 => "null reference",
-                        10 => "exception record limit exceeded",
-                        15 => "GC resource limit exceeded",
-                        16 => "out of bounds array access",
-                        17 => "fuel exhausted",
-                        12 => "null function reference",
-                        13 => "cast failure",
-                        14 => "out of bounds table access",
-                        _ => "unknown trap",
-                    };
-                    return Err(Error::Trap {
-                        input_index,
-                        reason,
-                    });
-                }
-            }
-
             // Metal-rs does not wrap these MTLCommandBuffer properties.
             let gpu_start: Option<f64> =
                 unsafe { command.send_message(Sel::register("GPUStartTime"), ()) }.ok();
@@ -1393,7 +1773,7 @@ impl Kernel {
                     .then(|| Duration::from_secs_f64(end - start))
             });
 
-            Ok((output, gpu_time))
+            Ok((output, gpu_time, traps))
         })
     }
 }
