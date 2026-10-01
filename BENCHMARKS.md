@@ -10,7 +10,7 @@ All five benchmark modes completed successfully. All returned results or final l
 - CPU engines: Wasmtime 49.0.1 and Wasmi 2.0.0. Wasmtime uses `gc-drc` for GC workloads.
 - Metal binding: `objc2-metal` 0.3.2. Shader compilation uses safe math and precise floating-point functions.
 - Full tests on this revision: **384 passed, zero failed**, including **58,001 official runtime cases** and **7,196 validation cases**. Metal API Validation was enabled.
-- Doc-test check passed; the library has zero doc tests.
+- Doc-test check passed; that revision had no doc tests.
 - Benchmarks ran sequentially after tests, with Metal API Validation disabled.
 
 ```sh
