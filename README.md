@@ -182,6 +182,8 @@ handles, retained graphs, and cyclic record reclamation.
 
 ## Performance comparison
 
+See the [complete benchmark overview](BENCHMARKS.md) for the 2026-10-01 run on the `objc2-metal` backend: all 89 rows, invocation counts, Metal total and GPU-only times, CPU comparisons, and methodology. The historical results below remain available.
+
 Run `cargo run --release --example compare -- --wide-arithmetic` or
 `--byte-pages` for the new feature workloads. Both also run in `--suite`.
 `wide_arithmetic` executes 128 dependent rounds of signed and unsigned wide
