@@ -28,6 +28,50 @@ fn exhausted<T: std::fmt::Debug>(result: Result<T, Error>, lane: usize) {
 }
 
 #[test]
+fn constructors_reject_invalid_resource_limits() {
+    let bytes = wasm("(module (func (export \"calculate\") (param i32) (result i32) local.get 0))");
+    for invalid in [
+        KernelLimits {
+            memory_bytes: (1usize << 32) + 1,
+            ..KernelLimits::default()
+        },
+        KernelLimits {
+            exception_records: 0,
+            ..KernelLimits::default()
+        },
+        KernelLimits {
+            exception_records: u32::MAX as usize + 1,
+            ..KernelLimits::default()
+        },
+        KernelLimits {
+            gc_heap_words: 3,
+            ..KernelLimits::default()
+        },
+        KernelLimits {
+            gc_heap_words: u32::MAX as usize + 1,
+            ..KernelLimits::default()
+        },
+        KernelLimits {
+            call_depth: 0,
+            ..KernelLimits::default()
+        },
+        KernelLimits {
+            call_depth: u32::MAX as usize + 1,
+            ..KernelLimits::default()
+        },
+    ] {
+        assert!(matches!(
+            Kernel::new_with_limits(&bytes, "calculate", invalid),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            Store::new_with_limits(1, invalid),
+            Err(Error::Unsupported(_))
+        ));
+    }
+}
+
+#[test]
 fn fuel_charges_entries_and_executed_loop_iterations() {
     let _lock = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let bytes = wasm(

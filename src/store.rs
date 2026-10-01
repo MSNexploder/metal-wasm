@@ -263,25 +263,19 @@ unsafe impl Send for Store {}
 unsafe impl Sync for Store {}
 
 impl Store {
+    /// Create a store with a fixed number of independent lanes and default limits.
+    /// `lanes` must be between 1 and `u32::MAX`. Requires a Metal device.
     pub fn new(lanes: usize) -> Result<Self, Error> {
         Self::new_with_limits(lanes, KernelLimits::default())
     }
+    /// Create a store with a fixed lane count and custom per-lane resource limits.
     pub fn new_with_limits(lanes: usize, limits: KernelLimits) -> Result<Self, Error> {
         if lanes == 0 || lanes > u32::MAX as usize {
             return Err(Error::Unsupported(
                 "store lane count must be between 1 and u32::MAX".into(),
             ));
         }
-        if limits.memory_bytes as u64 > (1u64 << 32)
-            || limits.exception_records == 0
-            || limits.exception_records > u32::MAX as usize
-            || limits.gc_heap_words < 4
-            || limits.gc_heap_words > u32::MAX as usize
-            || limits.call_depth == 0
-            || limits.call_depth > u32::MAX as usize
-        {
-            return Err(Error::Unsupported("invalid kernel resource limits".into()));
-        }
+        limits.validate()?;
         let device = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| Error::Metal("no Metal device is available".into()))?;
         let queue = device
@@ -411,6 +405,10 @@ impl Store {
             metadata,
         ))
     }
+    /// Instantiate a module in every lane and run its initialization once.
+    /// `imports` maps namespaces to existing instances in this store. Imported
+    /// resources retain their provider state. A failed start retains any writes
+    /// already made, but does not return an instance handle.
     pub fn instantiate(
         &mut self,
         wasm: &[u8],
@@ -652,6 +650,11 @@ impl Store {
         self.metadata_buffer = Some(metadata_buffer);
         Ok(())
     }
+    /// Call an export with one argument row per lane and retain the resulting state.
+    /// Signatures accept all supported [`Value`] types. Returns the first
+    /// Wasm trap or uncaught exception in lane order. Writes made before failure
+    /// remain visible.
+    /// Use [`Self::call_outcomes`] to receive successful and failed lane results.
     pub fn call(
         &mut self,
         instance: Instance,
@@ -661,6 +664,8 @@ impl Store {
         self.call_timed(instance, export, inputs, false)
             .map(|(v, _)| v)
     }
+    /// Call an `(i32) -> i32` export with one input per lane.
+    /// State persists across calls, including writes made before a Wasm failure.
     pub fn call_i32(
         &mut self,
         instance: Instance,
@@ -670,6 +675,9 @@ impl Store {
         self.call_i32_timed(instance, export, inputs)
             .map(|(v, _)| v)
     }
+    /// Call an `(i32) -> i32` export and report GPU command execution time.
+    /// The duration excludes host copies and submission. It is `None` when Metal
+    /// does not provide usable timestamps. Requires one input per lane.
     pub fn call_i32_timed(
         &mut self,
         instance: Instance,
@@ -926,6 +934,8 @@ impl Store {
         self.collect_garbage()?;
         Ok((rows, time))
     }
+    /// Read one value per lane from an exported global, including provider globals.
+    /// Returned references receive host leases and retain their lane identity.
     pub fn get_global(&self, instance: Instance, export: &str) -> Result<Vec<Value>, Error> {
         let (m, g) = self.export(instance, export, ExternalKind::Global)?;
         let (owner, slot) = self.modules[m].globals[g];
@@ -1119,6 +1129,8 @@ impl Store {
         self.host_exception_slots = host_slots;
     }
 
+    /// Copy the same byte range from each lane's current exported memory.
+    /// The range must fit every lane. Imported memories resolve to provider state.
     pub fn read_memory(
         &self,
         instance: Instance,
@@ -1143,6 +1155,9 @@ impl Store {
             .map(|lane| bytes[lane * r.size + range.start..lane * r.size + range.end].to_vec())
             .collect())
     }
+    /// Copy one byte row per lane into current exported memory at `offset`.
+    /// Rows can differ in length. All ranges are checked before writing; an invalid
+    /// batch leaves every lane unchanged. Imported memories use provider state.
     pub fn write_memory(
         &mut self,
         instance: Instance,
@@ -1185,6 +1200,9 @@ impl Store {
         }
         Ok(())
     }
+    /// Obtain an opaque identity for an exported function, including a reexport.
+    /// The reference can be used in any lane of this store and remains valid for
+    /// the store's lifetime. It cannot be used in another store or kernel.
     pub fn function_reference(
         &self,
         instance: Instance,
@@ -1214,6 +1232,9 @@ impl Store {
             ty: self.function_types[index as usize - 1],
         })
     }
+    /// Retain a Rust host value and return a reference usable in every store lane.
+    /// Metal can pass its identity but cannot access the Rust value. End its host
+    /// lease with [`Self::release_reference`]; dropping a copied handle is insufficient.
     pub fn external_reference<T: Any + Send + Sync>(&self, value: T) -> Result<ExternalRef, Error> {
         self.check()?;
         let mut values = self.externals.lock().unwrap();
@@ -1224,6 +1245,9 @@ impl Store {
             generation: values[index].generation,
         })
     }
+    /// Read the original Rust value through an active external reference lease.
+    /// Rejects foreign, stale, converted object, and mismatched host-type handles.
+    /// The returned `Arc` remains valid after the lease is released.
     pub fn external_reference_value<T: Any + Send + Sync>(
         &self,
         reference: ExternalRef,
@@ -1642,6 +1666,8 @@ impl Store {
             },
         })
     }
+    /// Return the abstract heap kind of a live GC reference owned by this store.
+    /// Host values converted to `anyref` report [`AbstractHeapType::Any`].
     pub fn gc_reference_kind(&self, reference: GcRef) -> Result<AbstractHeapType, Error> {
         self.check()?;
         if reference.index >> 32 == 2
@@ -1667,6 +1693,9 @@ impl Store {
             .map(|(_, kind)| *kind)
             .ok_or_else(|| Error::Metal("unknown GC reference type".into()))
     }
+    /// Convert an external reference to its Wasm `anyref` representation.
+    /// Preserves object identity and its lease; null becomes [`Value::GcRef`] with `None`.
+    /// A converted GC object retains its original lane identity.
     pub fn internalize_reference(&self, reference: Option<ExternalRef>) -> Result<Value, Error> {
         self.check()?;
         let Some(r) = reference else {
@@ -1708,6 +1737,9 @@ impl Store {
             }
         })
     }
+    /// Convert an `anyref` value to its Wasm external representation.
+    /// Accepts null GC references, `i31`, and live GC references from this store.
+    /// Object aliases share a lease and retain their original lane identity.
     pub fn externalize_reference(&self, value: Value) -> Result<Option<ExternalRef>, Error> {
         self.check()?;
         let (index, generation) = match value {
@@ -1744,6 +1776,9 @@ impl Store {
             generation,
         }))
     }
+    /// Create a host exception for an exported tag and a matching payload.
+    /// The handle can be used in lanes that accept every payload reference.
+    /// Imported tags retain their provider identity.
     pub fn exception_reference(
         &self,
         instance: Instance,
@@ -1777,6 +1812,9 @@ impl Store {
             generation: records[index].generation,
         })
     }
+    /// Read a live exception's payload and renew leases for returned references.
+    /// Rejects stale handles and handles from another owner. GC and exception
+    /// references in the payload retain their original lane identity.
     pub fn exception_payload(&self, reference: ExceptionRef) -> Result<Vec<Value>, Error> {
         self.check()?;
         let record = self.exception_record(reference).ok_or_else(|| {
