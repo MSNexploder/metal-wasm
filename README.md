@@ -42,7 +42,7 @@ let output = kernel.run(&[1, 2, 3])?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Requires macOS with a Metal device and the Rust toolchain. Run `cargo test` to validate GPU execution. The kernel compiles once and can run repeatedly with different input batches. `run_timed` sums GPU execution time across dispatches; it excludes host-side buffer copies and submission.
+Requires macOS 15 or later with a Metal device and the Rust toolchain. The backend uses `objc2-metal` 0.3.2 with retained Objective-C objects and typed Metal APIs. Shader compilation uses safe math and precise floating-point functions. Run `cargo test` to validate GPU execution. The kernel compiles once and can run repeatedly with different input batches. `run_timed` sums GPU execution time across dispatches; it excludes host-side buffer copies and submission.
 
 ## Persistent instances
 

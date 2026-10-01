@@ -73,7 +73,12 @@ fn exports_share_lane_state_and_start_runs_once() {
         store.get_global(instance, "counter").unwrap(),
         vec![Value::I32(11); 2]
     );
-    assert_eq!(store.call_i32(instance, "step", &[1, 9]).unwrap(), [12, 20]);
+    let mut store = std::thread::spawn(move || {
+        assert_eq!(store.call_i32(instance, "step", &[1, 9]).unwrap(), [12, 20]);
+        store
+    })
+    .join()
+    .unwrap();
     assert_eq!(
         store.call(instance, "read", &[vec![], vec![]]).unwrap(),
         [vec![Value::I32(12)], vec![Value::I32(20)]]
@@ -111,6 +116,17 @@ fn exports_share_lane_state_and_start_runs_once() {
         store.call(instance, "read", &[vec![], vec![]]).unwrap(),
         [vec![Value::I32(101)], vec![Value::I32(202)]]
     );
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(|| store.read_memory(instance, "memory", 0..4).unwrap());
+        assert_eq!(
+            store.get_global(instance, "counter").unwrap(),
+            [Value::I32(101), Value::I32(202)]
+        );
+        assert_eq!(
+            reader.join().unwrap(),
+            [101u32.to_le_bytes().to_vec(), 202u32.to_le_bytes().to_vec()]
+        );
+    });
 }
 
 #[test]

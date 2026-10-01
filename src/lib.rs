@@ -3,22 +3,35 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
-use std::ffi::CStr;
 use std::fmt;
 use std::ops::Range;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use metal::objc::{
-    Message,
-    rc::autoreleasepool,
-    runtime::{Object, Sel},
+use objc2::{
+    rc::{Retained, autoreleasepool},
+    runtime::ProtocolObject,
 };
-use metal::{
-    CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
+use objc2_foundation::NSString;
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineDescriptor,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
+    MTLMathFloatingPointFunctions, MTLMathMode, MTLPipelineOption, MTLResourceOptions, MTLSize,
 };
+
+// MTLCreateSystemDefaultDevice requires CoreGraphics linkage on macOS.
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {}
+
+type Device = Retained<ProtocolObject<dyn MTLDevice>>;
+type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
+type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
+type ComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+
 use wasmparser::types::CoreTypeId;
 use wasmparser::{
     AbstractHeapType, BlockType, Catch, CompositeInnerType, ConstExpr, DataKind, ElementItems,
@@ -45,6 +58,8 @@ const MAX_TABLE_ELEMENTS: usize = 65536;
 const MAX_TABLE_GROWTH: usize = 256;
 const MAX_CALL_DEPTH: usize = 32;
 const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
+// Empty and short buffers must still fit the widest scalar shader argument.
+const MIN_BUFFER_BYTES: usize = size_of::<u64>();
 
 /// Per-lane resource limits reserved when compiling a kernel.
 #[derive(Clone, Copy, Debug)]
@@ -219,9 +234,9 @@ pub type LaneResult = Result<Vec<Value>, LaneError>;
 /// Returned values and exported memory bytes, with one row per invocation.
 pub type MemoryResults = (Vec<Vec<Value>>, Vec<Vec<u8>>);
 
-fn lane_failure(traps: &Option<metal::Buffer>, lane: usize) -> Option<LaneError> {
+fn lane_failure(traps: &Option<Buffer>, lane: usize) -> Option<LaneError> {
     let code = traps.as_ref().map_or(0, |buffer| unsafe {
-        *buffer.contents().cast::<u32>().add(lane)
+        *buffer.contents().as_ptr().cast::<u32>().add(lane)
     });
     let reason = match code {
         0 => return None,
@@ -321,7 +336,7 @@ pub struct Kernel {
     gc: Option<GcLayout>,
     gc_types: Vec<GcType>,
     device: Device,
-    queue: metal::CommandQueue,
+    queue: CommandQueue,
     pipeline: ComputePipelineState,
     can_trap: bool,
     params: Vec<ValType>,
@@ -329,6 +344,13 @@ pub struct Kernel {
     instances: Vec<InstanceBuffers>,
     memory_exports: HashMap<String, (usize, usize)>,
 }
+
+// SAFETY: Metal devices, queues, and pipelines are thread-safe. Kernel-owned
+// buffers are immutable tables/data shared for GPU reads only. Each invocation
+// owns its writable buffers and waits for GPU completion before CPU reads or
+// release. Host reference leases are protected by mutexes. No buffer escapes.
+unsafe impl Send for Kernel {}
+unsafe impl Sync for Kernel {}
 
 struct Translation {
     persistent_metadata: Option<store::MetadataLayout>,
@@ -384,8 +406,8 @@ struct BufferSlots {
 struct InstanceBuffers {
     template: InstanceTemplate,
     slots: BufferSlots,
-    tables: Vec<Option<metal::Buffer>>,
-    passive_data: Option<metal::Buffer>,
+    tables: Vec<Option<Buffer>>,
+    passive_data: Option<Buffer>,
 }
 
 struct MemoryInput<'a> {
@@ -460,9 +482,11 @@ impl Kernel {
             return Err(Error::Unsupported("invalid kernel resource limits".into()));
         }
         let translation = translate_with_limits(wasm, export, providers, limits)?;
-        let device = Device::system_default()
+        let device = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| Error::Metal("no Metal device is available".into()))?;
-        let queue = device.new_command_queue();
+        let queue = device
+            .newCommandQueue()
+            .ok_or_else(|| Error::Metal("could not create a Metal command queue".into()))?;
         Self::from_translation(translation, limits, device, queue)
     }
 
@@ -470,67 +494,82 @@ impl Kernel {
         translation: Translation,
         limits: KernelLimits,
         device: Device,
-        queue: metal::CommandQueue,
+        queue: CommandQueue,
     ) -> Result<Self, Error> {
-        let options = CompileOptions::new();
-        options.set_fast_math_enabled(false);
-        let library = device
-            .new_library_with_source(&translation.source, &options)
-            .map_err(Error::Metal)?;
-        let function = library
-            .get_function("run_wasm", None)
-            .map_err(Error::Metal)?;
-        let pipeline = if translation.recursive {
-            let descriptor = ComputePipelineDescriptor::new();
-            descriptor.set_compute_function(Some(&function));
-            descriptor.set_max_call_stack_depth(limits.call_depth as u64 + 2);
-            device.new_compute_pipeline_state(&descriptor)
-        } else {
-            device.new_compute_pipeline_state_with_function(&function)
+        if !objc2::available!(macos = 15.0) {
+            return Err(Error::Unsupported(
+                "Metal execution requires macOS 15 or later".into(),
+            ));
         }
-        .map_err(Error::Metal)?;
-        let mut instances = Vec::new();
-        for (template, slots) in translation.instances.into_iter().zip(translation.slots) {
-            let tables = template
-                .tables
-                .iter()
-                .map(|table| {
-                    (!table.info.mutable)
-                        .then(|| make_buffer(&device, &table.values))
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let passive_data = (!template.data_lengths.is_empty())
-                .then(|| make_buffer(&device, &template.passive_data))
-                .transpose()?;
-            instances.push(InstanceBuffers {
-                template,
-                slots,
-                tables,
-                passive_data,
-            });
-        }
-        Ok(Self {
-            id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed),
-            external_values: Mutex::new(Vec::new()),
-            exception_values: Mutex::new(Vec::new()),
-            gc_values: Mutex::new(Vec::new()),
-            gc: translation.gc,
-            gc_types: translation.gc_types,
-            exception_tags: translation.exception_tags,
-            tag_payload_types: translation.tag_payload_types,
-            exception_io: translation.exception_io,
-            function_reference_types: translation.function_reference_types,
-            exported_functions: translation.exported_functions,
-            reference_supertypes: translation.reference_supertypes,
-            device,
-            queue,
-            pipeline,
-            can_trap: translation.can_trap,
-            params: translation.params,
-            results: translation.results,
-            instances,
-            memory_exports: translation.memory_exports,
+        autoreleasepool(|_| {
+            let options = MTLCompileOptions::new();
+            options.setMathMode(MTLMathMode::Safe);
+            options.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Precise);
+            let library = device
+                .newLibraryWithSource_options_error(
+                    &NSString::from_str(&translation.source),
+                    Some(&options),
+                )
+                .map_err(|error| Error::Metal(error.localizedDescription().to_string()))?;
+            let function = library
+                .newFunctionWithName(&NSString::from_str("run_wasm"))
+                .ok_or_else(|| Error::Metal("compiled library has no run_wasm function".into()))?;
+            let pipeline = if translation.recursive {
+                let descriptor = MTLComputePipelineDescriptor::new();
+                descriptor.setComputeFunction(Some(&function));
+                descriptor.setMaxCallStackDepth(limits.call_depth + 2);
+                device.newComputePipelineStateWithDescriptor_options_reflection_error(
+                    &descriptor,
+                    MTLPipelineOption::None,
+                    None,
+                )
+            } else {
+                device.newComputePipelineStateWithFunction_error(&function)
+            }
+            .map_err(|error| Error::Metal(error.localizedDescription().to_string()))?;
+            let mut instances = Vec::new();
+            for (template, slots) in translation.instances.into_iter().zip(translation.slots) {
+                let tables = template
+                    .tables
+                    .iter()
+                    .map(|table| {
+                        (!table.info.mutable)
+                            .then(|| make_buffer(&device, &table.values))
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let passive_data = (!template.data_lengths.is_empty())
+                    .then(|| make_buffer(&device, &template.passive_data))
+                    .transpose()?;
+                instances.push(InstanceBuffers {
+                    template,
+                    slots,
+                    tables,
+                    passive_data,
+                });
+            }
+            Ok(Self {
+                id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed),
+                external_values: Mutex::new(Vec::new()),
+                exception_values: Mutex::new(Vec::new()),
+                gc_values: Mutex::new(Vec::new()),
+                gc: translation.gc,
+                gc_types: translation.gc_types,
+                exception_tags: translation.exception_tags,
+                tag_payload_types: translation.tag_payload_types,
+                exception_io: translation.exception_io,
+                function_reference_types: translation.function_reference_types,
+                exported_functions: translation.exported_functions,
+                reference_supertypes: translation.reference_supertypes,
+                device,
+                queue,
+                pipeline,
+                can_trap: translation.can_trap,
+                params: translation.params,
+                results: translation.results,
+                instances,
+                memory_exports: translation.memory_exports,
+            })
         })
     }
 
@@ -950,8 +989,9 @@ impl Kernel {
             let (output, elapsed) = self
                 .dispatch(input, bytes, chunk.len() as u32, &instance_buffers, None, 0)
                 .map_err(|error| shift_trap(error, values.len()))?;
-            let result =
-                unsafe { std::slice::from_raw_parts(output.contents().cast::<u32>(), chunk.len()) };
+            let result = unsafe {
+                std::slice::from_raw_parts(output.contents().as_ptr().cast::<u32>(), chunk.len())
+            };
             values.extend_from_slice(result);
             gpu_time = gpu_time.and_then(|total| elapsed.and_then(|time| total.checked_add(time)));
         }
@@ -1383,7 +1423,7 @@ impl Kernel {
                     let stride = gc.heap_words + gc.root_words;
                     let heap_words = unsafe {
                         std::slice::from_raw_parts_mut(
-                            buffer.contents().cast::<u64>(),
+                            buffer.contents().as_ptr().cast::<u64>(),
                             stride * (end - start),
                         )
                     };
@@ -1462,7 +1502,10 @@ impl Kernel {
             }
             if fast_i32 {
                 let values = unsafe {
-                    std::slice::from_raw_parts(output.contents().cast::<u32>(), end - start)
+                    std::slice::from_raw_parts(
+                        output.contents().as_ptr().cast::<u32>(),
+                        end - start,
+                    )
                 };
                 rows.extend(values.iter().enumerate().map(|(lane, &value)| {
                     lane_failure(&traps, lane).map_or_else(|| Ok(vec![Value::I32(value)]), Err)
@@ -1470,7 +1513,7 @@ impl Kernel {
             } else {
                 let values = unsafe {
                     std::slice::from_raw_parts(
-                        output.contents().cast::<u64>(),
+                        output.contents().as_ptr().cast::<u64>(),
                         (end - start) * (transfer_output_stride / size_of::<u64>()),
                     )
                 };
@@ -1486,7 +1529,7 @@ impl Kernel {
                         let stride = gc.heap_words + gc.root_words;
                         let heaps = unsafe {
                             std::slice::from_raw_parts(
-                                buffer.contents().cast::<u64>(),
+                                buffer.contents().as_ptr().cast::<u64>(),
                                 stride * (end - start),
                             )
                         };
@@ -1539,6 +1582,7 @@ impl Kernel {
                     std::slice::from_raw_parts(
                         buffer(instance.slots.memories[*resource].1)
                             .contents()
+                            .as_ptr()
                             .cast::<u64>(),
                         end - start,
                     )
@@ -1548,6 +1592,7 @@ impl Kernel {
                     std::slice::from_raw_parts(
                         buffer(instance.slots.memories[*resource].0)
                             .contents()
+                            .as_ptr()
                             .cast::<u8>(),
                         stride * (end - start),
                     )
@@ -1576,7 +1621,7 @@ impl Kernel {
     }
 
     fn batch_limit(&self, input_stride: usize, output_stride: usize) -> Result<usize, Error> {
-        let max_buffer = usize::try_from(self.device.max_buffer_length()).unwrap_or(usize::MAX);
+        let max_buffer = self.device.maxBufferLength();
         let mut limit = u32::MAX as usize;
         let mut per_lane = 0usize;
         let mut include = |stride: usize| -> Result<(), Error> {
@@ -1617,7 +1662,7 @@ impl Kernel {
         Ok(limit.min((MAX_BATCH_BYTES / per_lane).max(1)))
     }
 
-    fn prepare_batch(&self, count: u32) -> Result<Vec<Vec<(u64, metal::Buffer)>>, Error> {
+    fn prepare_batch(&self, count: u32) -> Result<Vec<Vec<(u64, Buffer)>>, Error> {
         let mut buffers = self
             .instances
             .iter()
@@ -1637,7 +1682,7 @@ impl Kernel {
         Ok(buffers)
     }
 
-    fn reset_batch(&self, buffers: &[Vec<(u64, metal::Buffer)>], count: u32) {
+    fn reset_batch(&self, buffers: &[Vec<(u64, Buffer)>], count: u32) {
         for (instance, buffers) in self.instances.iter().zip(buffers) {
             instance.reset_batch(buffers, count);
         }
@@ -1656,10 +1701,10 @@ impl Kernel {
         input_data: &[u8],
         output_bytes: usize,
         count: u32,
-        instance_buffers: &[Vec<(u64, metal::Buffer)>],
+        instance_buffers: &[Vec<(u64, Buffer)>],
         memory_input: Option<((usize, usize), usize, usize)>,
         exception_input_offset: usize,
-    ) -> Result<(metal::Buffer, Option<Duration>), Error> {
+    ) -> Result<(Buffer, Option<Duration>), Error> {
         let (output, time, traps) = self.dispatch_lanes(
             input_data,
             output_bytes,
@@ -1681,44 +1726,47 @@ impl Kernel {
         input_data: &[u8],
         output_bytes: usize,
         count: u32,
-        instance_buffers: &[Vec<(u64, metal::Buffer)>],
+        instance_buffers: &[Vec<(u64, Buffer)>],
         memory_input: Option<((usize, usize), usize, usize)>,
         exception_input_offset: usize,
-    ) -> Result<(metal::Buffer, Option<Duration>, Option<metal::Buffer>), Error> {
-        autoreleasepool(|| {
-            let input_bytes = u64::try_from(input_data.len().max(4))
-                .map_err(|_| Error::Unsupported("input buffer size overflow".into()))?;
-            let output_bytes = u64::try_from(output_bytes.max(4))
-                .map_err(|_| Error::Unsupported("output buffer size overflow".into()))?;
-            let trap_bytes = u64::from(count) * size_of::<u32>() as u64;
-            if input_bytes.max(output_bytes).max(trap_bytes) > self.device.max_buffer_length() {
+    ) -> Result<(Buffer, Option<Duration>, Option<Buffer>), Error> {
+        autoreleasepool(|_| {
+            let trap_bytes = if self.can_trap {
+                count as usize * size_of::<u32>()
+            } else {
+                0
+            };
+            if input_data
+                .len()
+                .max(output_bytes)
+                .max(trap_bytes)
+                .max(MIN_BUFFER_BYTES)
+                > self.device.maxBufferLength()
+            {
                 return Err(Error::Unsupported(
                     "batch exceeds the Metal buffer limit".into(),
                 ));
             }
-            let empty = [0u8; 4];
-            let input_ptr = if input_data.is_empty() {
-                empty.as_ptr()
-            } else {
-                input_data.as_ptr()
-            };
-            let input = self.device.new_buffer_with_data(
-                input_ptr.cast(),
-                input_bytes,
-                MTLResourceOptions::StorageModeShared,
-            );
-            let output = self
-                .device
-                .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
-            let traps = self.can_trap.then(|| {
-                self.device
-                    .new_buffer(trap_bytes, MTLResourceOptions::StorageModeShared)
-            });
-            let command = self.queue.new_command_buffer();
-            let encoder = command.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&self.pipeline);
-            encoder.set_buffer(0, Some(&input), 0);
-            encoder.set_buffer(1, Some(&output), 0);
+            let output = allocate_buffer(&self.device, output_bytes)?;
+            let input = make_buffer(&self.device, input_data)?;
+            let traps = self
+                .can_trap
+                .then(|| allocate_buffer(&self.device, trap_bytes))
+                .transpose()?;
+            let command = self
+                .queue
+                .commandBuffer()
+                .ok_or_else(|| Error::Metal("could not create a Metal command buffer".into()))?;
+            let encoder = command
+                .computeCommandEncoder()
+                .ok_or_else(|| Error::Metal("could not create a Metal compute encoder".into()))?;
+            encoder.setComputePipelineState(&self.pipeline);
+            // Shared buffers remain alive until completion. Their sizes and slots
+            // were checked by the batch planner and shader translation.
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&input), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&output), 0, 1);
+            }
             let ((owner, resource), offset, width) = memory_input.unwrap_or(((0, 0), 0, 0));
             let config = [
                 count as u64,
@@ -1728,63 +1776,56 @@ impl Kernel {
                 resource as u64,
                 exception_input_offset as u64,
             ];
-            encoder.set_bytes(2, size_of_val(&config) as u64, config.as_ptr().cast());
-            if let Some(traps) = &traps {
-                encoder.set_buffer(3, Some(traps), 0);
-            }
-            for buffers in instance_buffers {
-                for (slot, buffer) in buffers {
-                    encoder.set_buffer(*slot, Some(buffer), 0);
+            // setBytes copies this initialized configuration before returning.
+            unsafe {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(&config).cast(),
+                    size_of_val(&config),
+                    2,
+                );
+                if let Some(traps) = &traps {
+                    encoder.setBuffer_offset_atIndex(Some(traps), 0, 3);
+                }
+                for buffers in instance_buffers {
+                    for (slot, buffer) in buffers {
+                        encoder.setBuffer_offset_atIndex(Some(buffer), 0, *slot as usize);
+                    }
                 }
             }
             let width = self
                 .pipeline
-                .thread_execution_width()
-                .min(self.pipeline.max_total_threads_per_threadgroup());
-            let groups = (count as u64).div_ceil(width);
-            encoder.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(width, 1, 1));
-            encoder.end_encoding();
+                .threadExecutionWidth()
+                .min(self.pipeline.maxTotalThreadsPerThreadgroup());
+            let groups = (count as usize).div_ceil(width);
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: groups,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
             command.commit();
-            command.wait_until_completed();
+            command.waitUntilCompleted();
             if command.status() != MTLCommandBufferStatus::Completed {
-                let detail = unsafe {
-                    let error: *mut Object = command
-                        .send_message(Sel::register("error"), ())
-                        .unwrap_or(std::ptr::null_mut());
-                    if error.is_null() {
-                        String::new()
-                    } else {
-                        let description: *mut Object = (&*error)
-                            .send_message(Sel::register("localizedDescription"), ())
-                            .unwrap_or(std::ptr::null_mut());
-                        if description.is_null() {
-                            String::new()
-                        } else {
-                            let bytes: *const std::ffi::c_char = (&*description)
-                                .send_message(Sel::register("UTF8String"), ())
-                                .unwrap_or(std::ptr::null());
-                            if bytes.is_null() {
-                                String::new()
-                            } else {
-                                format!(": {}", CStr::from_ptr(bytes).to_string_lossy())
-                            }
-                        }
-                    }
-                };
+                let detail = command
+                    .error()
+                    .map(|error| format!(": {}", error.localizedDescription()))
+                    .unwrap_or_default();
                 return Err(Error::Metal(format!(
                     "Metal command failed: {:?}{detail}",
                     command.status(),
                 )));
             }
-            // Metal-rs does not wrap these MTLCommandBuffer properties.
-            let gpu_start: Option<f64> =
-                unsafe { command.send_message(Sel::register("GPUStartTime"), ()) }.ok();
-            let gpu_end: Option<f64> =
-                unsafe { command.send_message(Sel::register("GPUEndTime"), ()) }.ok();
-            let gpu_time = gpu_start.zip(gpu_end).and_then(|(start, end)| {
-                (start > 0.0 && end.is_finite() && end >= start)
-                    .then(|| Duration::from_secs_f64(end - start))
-            });
+            let start = command.GPUStartTime();
+            let end = command.GPUEndTime();
+            let gpu_time = (start > 0.0 && start.is_finite() && end.is_finite() && end >= start)
+                .then(|| Duration::from_secs_f64(end - start));
 
             Ok((output, gpu_time, traps))
         })
@@ -1807,23 +1848,50 @@ fn shift_trap(error: Error, offset: usize) -> Error {
     }
 }
 
-fn make_buffer<T>(device: &Device, data: &[T]) -> Result<metal::Buffer, Error> {
-    let bytes = size_of_val(data).max(4) as u64;
-    if bytes > device.max_buffer_length() {
+fn allocate_buffer(device: &Device, bytes: usize) -> Result<Buffer, Error> {
+    let bytes = bytes.max(MIN_BUFFER_BYTES);
+    if bytes > device.maxBufferLength() {
         return Err(Error::Unsupported(
             "batch exceeds the Metal buffer limit".into(),
         ));
     }
-    let empty = [0u8; 4];
-    Ok(device.new_buffer_with_data(
-        if data.is_empty() {
-            empty.as_ptr().cast()
-        } else {
-            data.as_ptr().cast()
-        },
-        bytes,
-        MTLResourceOptions::StorageModeShared,
-    ))
+    device
+        .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+        .ok_or_else(|| Error::Metal(format!("could not allocate a {bytes}-byte Metal buffer")))
+}
+
+fn make_buffer<T>(device: &Device, data: &[T]) -> Result<Buffer, Error> {
+    let data_bytes = size_of_val(data);
+    let bytes = data_bytes.max(MIN_BUFFER_BYTES);
+    if bytes > device.maxBufferLength() {
+        return Err(Error::Unsupported(
+            "batch exceeds the Metal buffer limit".into(),
+        ));
+    }
+    let mut padded = [0u8; MIN_BUFFER_BYTES];
+    let pointer = if data_bytes < padded.len() {
+        // Metal copies `bytes` bytes. Tiny input slices need actual backing
+        // storage for the shader argument minimum, not just a larger length argument.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().cast::<u8>(),
+                padded.as_mut_ptr(),
+                data_bytes,
+            );
+        }
+        NonNull::from(&padded).cast()
+    } else {
+        NonNull::new(data.as_ptr().cast_mut()).unwrap().cast()
+    };
+    // The source contains `bytes` initialized bytes and is copied synchronously.
+    unsafe {
+        device.newBufferWithBytes_length_options(
+            pointer,
+            bytes,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .ok_or_else(|| Error::Metal(format!("could not allocate a {bytes}-byte Metal buffer")))
 }
 
 fn lane_buffer<T: Copy + Default>(
@@ -1831,7 +1899,7 @@ fn lane_buffer<T: Copy + Default>(
     template: &[T],
     capacity: usize,
     count: u32,
-) -> Result<metal::Buffer, Error> {
+) -> Result<Buffer, Error> {
     let stride = capacity.max(1);
     let len = stride
         .checked_mul(count as usize)
@@ -1839,19 +1907,13 @@ fn lane_buffer<T: Copy + Default>(
     let bytes = len
         .checked_mul(size_of::<T>())
         .ok_or_else(|| Error::Unsupported("instance buffer size overflow".into()))?;
-    let bytes = bytes.max(4) as u64;
-    if bytes > device.max_buffer_length() {
-        return Err(Error::Unsupported(
-            "batch exceeds the Metal buffer limit".into(),
-        ));
-    }
-    let buffer = device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+    let buffer = allocate_buffer(device, bytes)?;
     reset_lane_buffer(&buffer, template, capacity, count);
     Ok(buffer)
 }
 
 fn reset_lane_buffer<T: Copy + Default>(
-    buffer: &metal::Buffer,
+    buffer: &Buffer,
     template: &[T],
     capacity: usize,
     count: u32,
@@ -1859,7 +1921,10 @@ fn reset_lane_buffer<T: Copy + Default>(
     let stride = capacity.max(1);
     // The buffer was allocated for at least `count` lanes with this stride.
     let data = unsafe {
-        std::slice::from_raw_parts_mut(buffer.contents().cast::<T>(), stride * count as usize)
+        std::slice::from_raw_parts_mut(
+            buffer.contents().as_ptr().cast::<T>(),
+            stride * count as usize,
+        )
     };
     for lane in data.chunks_mut(stride) {
         lane.fill(T::default());
@@ -1868,7 +1933,7 @@ fn reset_lane_buffer<T: Copy + Default>(
 }
 
 impl InstanceBuffers {
-    fn for_batch(&self, device: &Device, count: u32) -> Result<Vec<(u64, metal::Buffer)>, Error> {
+    fn for_batch(&self, device: &Device, count: u32) -> Result<Vec<(u64, Buffer)>, Error> {
         let mut buffers = Vec::new();
         let template = &self.template;
         for (memory, &(slot, pages)) in template.memories.iter().zip(&self.slots.memories) {
@@ -1909,7 +1974,7 @@ impl InstanceBuffers {
         Ok(buffers)
     }
 
-    fn reset_batch(&self, buffers: &[(u64, metal::Buffer)], count: u32) {
+    fn reset_batch(&self, buffers: &[(u64, Buffer)], count: u32) {
         let buffer = |slot| &buffers.iter().find(|(index, _)| *index == slot).unwrap().1;
         let template = &self.template;
         for (memory, &(slot, pages)) in template.memories.iter().zip(&self.slots.memories) {
@@ -8909,6 +8974,44 @@ mod tests {
             .unwrap();
         assert_eq!(values, [vec![Value::I32(11)], vec![Value::I32(21)]]);
         assert_eq!(memories, [vec![10, 11], vec![20, 21]]);
+        // One no-argument invocation makes the packed dispatch input smaller
+        // than the shader's ulong argument, including a zero-length input.
+        for width in 0..=7 {
+            let bytes = [10, 11, 12, 13, 14, 15, 16][..width].to_vec();
+            let (values, memories) = kernel
+                .run_values_with_memory_io(&[vec![]], "mem", 2, &[bytes], 2..9)
+                .unwrap();
+            assert_eq!(values, [vec![Value::I32(if width >= 2 { 11 } else { 0 })]]);
+            let mut expected = vec![0; 7];
+            expected[..width].copy_from_slice(&[10, 11, 12, 13, 14, 15, 16][..width]);
+            assert_eq!(memories, [expected]);
+        }
+    }
+
+    #[test]
+    fn shared_kernel_runs_independent_batches_on_host_threads() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (global $g (mut i32) (i32.const 1))
+                (func (export "f") (param i32) (result i32)
+                    global.get $g local.get 0 i32.add
+                    global.set $g global.get $g))"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new(&wasm, "f").unwrap();
+        std::thread::scope(|scope| {
+            for thread in 0..4 {
+                let kernel = &kernel;
+                scope.spawn(move || {
+                    for run in 0..3 {
+                        let inputs: Vec<_> =
+                            (0..8).map(|lane| thread * 100 + run * 10 + lane).collect();
+                        let expected: Vec<_> = inputs.iter().map(|input| input + 1).collect();
+                        assert_eq!(kernel.run(&inputs).unwrap(), expected);
+                    }
+                });
+            }
+        });
     }
 
     #[test]

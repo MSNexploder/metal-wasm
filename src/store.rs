@@ -236,14 +236,14 @@ pub struct Store {
     lanes: usize,
     limits: KernelLimits,
     device: Device,
-    queue: metal::CommandQueue,
+    queue: CommandQueue,
     modules: Vec<Module>,
     entries: HashMap<(usize, String), Kernel>,
     resources: Vec<Vec<Resource>>,
-    resource_buffer: Option<metal::Buffer>,
+    resource_buffer: Option<Buffer>,
     metadata: MetadataLayout,
-    metadata_buffer: Option<metal::Buffer>,
-    heap: Option<(metal::Buffer, usize)>,
+    metadata_buffer: Option<Buffer>,
+    heap: Option<(Buffer, usize)>,
     gc_values: Mutex<Vec<Lease<LiveGc>>>,
     exceptions: Mutex<Vec<Lease<LiveException>>>,
     host_exception_slots: HashMap<(usize, u32), usize>,
@@ -254,6 +254,13 @@ pub struct Store {
     tag_types: Vec<Vec<ValType>>,
     poisoned: bool,
 }
+
+// SAFETY: Buffer mutation and GPU dispatch require exclusive access to Store.
+// Dispatch waits for GPU completion before returning, so shared access only
+// reads idle buffers. Reference leases use mutexes; no buffer escapes the store.
+// Metal objects can be retained, used, and released on any host thread.
+unsafe impl Send for Store {}
+unsafe impl Sync for Store {}
 
 impl Store {
     pub fn new(lanes: usize) -> Result<Self, Error> {
@@ -275,9 +282,11 @@ impl Store {
         {
             return Err(Error::Unsupported("invalid kernel resource limits".into()));
         }
-        let device = Device::system_default()
+        let device = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| Error::Metal("no Metal device is available".into()))?;
-        let queue = device.new_command_queue();
+        let queue = device
+            .newCommandQueue()
+            .ok_or_else(|| Error::Metal("could not create a Metal command queue".into()))?;
         Ok(Self {
             id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed),
             lanes,
@@ -499,6 +508,7 @@ impl Store {
                     .as_ref()
                     .unwrap()
                     .contents()
+                    .as_ptr()
                     .cast::<u8>()
                     .add(r.offset(self.lanes)),
                 r.size * if r.shared { 1 } else { self.lanes },
@@ -516,7 +526,12 @@ impl Store {
     fn metadata_words(&self) -> &[u64] {
         unsafe {
             std::slice::from_raw_parts(
-                self.metadata_buffer.as_ref().unwrap().contents().cast(),
+                self.metadata_buffer
+                    .as_ref()
+                    .unwrap()
+                    .contents()
+                    .as_ptr()
+                    .cast(),
                 self.metadata.stride() * self.lanes,
             )
         }
@@ -548,24 +563,22 @@ impl Store {
             .and_then(|words| words.checked_mul(size_of::<u64>()))
             .ok_or_else(|| Error::Unsupported("store metadata size overflow".into()))?;
         if total.max(metadata_bytes) > isize::MAX as usize
-            || total.max(metadata_bytes) as u64 > self.device.max_buffer_length()
+            || total.max(metadata_bytes) > self.device.maxBufferLength()
         {
             return Err(Error::Unsupported(
                 "store exceeds the Metal buffer limit".into(),
             ));
         }
-        let buffer = self
-            .device
-            .new_buffer(total as u64, MTLResourceOptions::StorageModeShared);
+        let buffer = allocate_buffer(&self.device, total)?;
         unsafe {
-            std::ptr::write_bytes(buffer.contents().cast::<u8>(), 0, total);
+            std::ptr::write_bytes(buffer.contents().as_ptr().cast::<u8>(), 0, total);
         }
         if let Some(old) = &self.resource_buffer {
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    old.contents().cast::<u8>(),
-                    buffer.contents().cast::<u8>(),
-                    old.length() as usize,
+                    old.contents().as_ptr().cast::<u8>(),
+                    buffer.contents().as_ptr().cast::<u8>(),
+                    old.length(),
                 );
             }
         }
@@ -580,6 +593,7 @@ impl Store {
                             bytes.as_ptr(),
                             buffer
                                 .contents()
+                                .as_ptr()
                                 .cast::<u8>()
                                 .add(r.offset(self.lanes) + lane * r.size),
                             bytes.len(),
@@ -814,8 +828,8 @@ impl Store {
                     for lane in 0..self.lanes {
                         unsafe {
                             std::ptr::copy_nonoverlapping(
-                                old.contents().cast::<u64>().add(lane * old_stride),
-                                buffer.contents().cast::<u64>().add(lane * stride),
+                                old.contents().as_ptr().cast::<u64>().add(lane * old_stride),
+                                buffer.contents().as_ptr().cast::<u64>().add(lane * stride),
                                 gc.heap_words,
                             );
                         }
@@ -843,6 +857,7 @@ impl Store {
                 unsafe {
                     let ptr = heap
                         .contents()
+                        .as_ptr()
                         .cast::<u64>()
                         .add(lane * stride + gc.heap_words + gc.root_words);
                     std::ptr::copy_nonoverlapping(roots.as_ptr(), ptr, roots.len());
@@ -889,12 +904,13 @@ impl Store {
             let mut offset = 0;
             for &ty in &kernel.results {
                 let words = if fast {
-                    vec![unsafe { *output.contents().cast::<u32>().add(lane) } as u64]
+                    vec![unsafe { *output.contents().as_ptr().cast::<u32>().add(lane) } as u64]
                 } else {
                     unsafe {
                         std::slice::from_raw_parts(
                             output
                                 .contents()
+                                .as_ptr()
                                 .cast::<u64>()
                                 .add(lane * result_words + offset),
                             value_words(ty),
@@ -970,6 +986,7 @@ impl Store {
                         .as_ref()
                         .unwrap()
                         .contents()
+                        .as_ptr()
                         .cast::<u8>()
                         .add(r.offset(self.lanes) + lane * r.size + slot * 8)
                         .cast::<u64>(),
@@ -1074,6 +1091,7 @@ impl Store {
                         .as_ref()
                         .unwrap()
                         .contents()
+                        .as_ptr()
                         .cast::<u8>()
                         .add(r.offset(self.lanes) + lane * r.size + offset as usize * 8)
                         .cast::<u64>(),
@@ -1093,6 +1111,7 @@ impl Store {
                     .as_ref()
                     .unwrap()
                     .contents()
+                    .as_ptr()
                     .cast::<u64>(),
                 metadata.len(),
             );
@@ -1157,6 +1176,7 @@ impl Store {
                         .as_ref()
                         .unwrap()
                         .contents()
+                        .as_ptr()
                         .cast::<u8>()
                         .add(r.offset(self.lanes) + lane * r.size + offset),
                     row.len(),
@@ -1507,7 +1527,12 @@ impl Store {
         if offset + 3 > self.limits.gc_heap_words {
             return Err(Error::Metal("invalid GC reference".into()));
         }
-        let ptr = unsafe { heap.contents().cast::<u64>().add(lane * stride + offset) };
+        let ptr = unsafe {
+            heap.contents()
+                .as_ptr()
+                .cast::<u64>()
+                .add(lane * stride + offset)
+        };
         let type_id = unsafe { *ptr.add(1) } as usize;
         let ty = self
             .gc_types
@@ -2031,7 +2056,7 @@ impl Store {
                         }
                         let words = unsafe {
                             std::slice::from_raw_parts(
-                                heap.contents().cast::<u64>().add(lane * stride),
+                                heap.contents().as_ptr().cast::<u64>().add(lane * stride),
                                 self.limits.gc_heap_words,
                             )
                         };
@@ -2079,7 +2104,7 @@ impl Store {
             for lane in 0..self.lanes {
                 let words = unsafe {
                     std::slice::from_raw_parts_mut(
-                        heap.contents().cast::<u64>().add(lane * stride),
+                        heap.contents().as_ptr().cast::<u64>().add(lane * stride),
                         self.limits.gc_heap_words,
                     )
                 };
@@ -2116,6 +2141,7 @@ impl Store {
                         .as_ref()
                         .unwrap()
                         .contents()
+                        .as_ptr()
                         .cast::<u64>(),
                     self.metadata.stride() * self.lanes,
                 )

@@ -5,7 +5,13 @@ edition = "2024"
 description = "Run independent WebAssembly functions in parallel on Metal"
 
 [dependencies]
-metal = "0.33"
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSString"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+    "std", "MTLAllocation", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder",
+    "MTLCommandQueue", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLDevice",
+    "MTLLibrary", "MTLResource", "MTLTypes", "objc2-core-foundation",
+] }
 wasmparser = { version = "0.259", default-features = false, features = ["std", "validate", "features", "simd"] }
 
 [dev-dependencies]
