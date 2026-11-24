@@ -1,11 +1,11 @@
 # WebAssembly spec runtime cases
 
-All 258 `.wast` scripts in the pinned [official core tree](https://github.com/WebAssembly/spec/tree/608711107b7f1edb13efd57b7d79b49477462d36/test/core) are included, byte-for-byte, at commit `608711107b7f1edb13efd57b7d79b49477462d36`.
+All 259 `.wast` scripts in the pinned [official core tree](https://github.com/WebAssembly/spec/tree/fad6ff682c3dddf4dc35d9df6997ce91ebe15435/test/core) are included, byte-for-byte, at commit `fad6ff682c3dddf4dc35d9df6997ce91ebe15435`.
 They are covered by [`licenses/WebAssembly-spec-Apache-2.0.txt`](../../licenses/WebAssembly-spec-Apache-2.0.txt).
 
 The tree contains 97 root scripts, 59 SIMD scripts, 41 multi-memory scripts,
 25 memory64 scripts, 17 GC scripts, eight bulk-memory scripts, seven relaxed
-SIMD scripts, and four exception scripts. Earlier fixtures retain their flat
+SIMD scripts, and five exception scripts. Earlier fixtures retain their flat
 names. The remaining fixtures are under `core/` with their upstream paths.
 Flat prefixes identify the upstream subdirectory: `simd_`, `multi_memory_`,
 `memory64_`, `gc_`, `bulk_memory_`, and `exceptions_`. The renamed root scripts

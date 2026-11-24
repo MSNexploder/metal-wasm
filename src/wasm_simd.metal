@@ -366,28 +366,33 @@ inline ulong2 wasm_simd_relaxed_madd(ulong2 a, ulong2 b, ulong2 c, uint bits, bo
     return result;
 }
 
+inline int wasm_simd_signed_dot8(ulong2 a, ulong2 b, uint first, uint count) {
+    int sum = 0;
+    for (uint lane = first; lane < first + count; ++lane) {
+        int x = int(wasm_simd_signed(wasm_simd_lane(a, 8u, lane), 8u));
+        int y = int(wasm_simd_signed(wasm_simd_lane(b, 8u, lane), 8u));
+        sum += x * y;
+    }
+    return sum;
+}
+
+// Choose signed byte products for both relaxed instructions. Narrow the pair
+// sum for i16x8, and keep the full sum of four products for i32x4.
 inline ulong2 wasm_simd_relaxed_dot16(ulong2 a, ulong2 b) {
     ulong2 result = ulong2(0ul);
     for (uint i = 0u; i < 8u; ++i) {
-        long sum = 0l;
-        for (uint j = 0u; j < 2u; ++j) {
-            uint lane = i * 2u + j;
-            sum += wasm_simd_signed(wasm_simd_lane(a, 8u, lane), 8u)
-                 * wasm_simd_signed(wasm_simd_lane(b, 8u, lane), 8u);
-        }
-        result = wasm_simd_replace(result, 16u, i, ulong(clamp(sum, -32768l, 32767l)));
+        int sum = wasm_simd_signed_dot8(a, b, i * 2u, 2u);
+        result = wasm_simd_replace(result, 16u, i, ulong(uint(sum)));
     }
     return result;
 }
 
 inline ulong2 wasm_simd_relaxed_dot_add(ulong2 a, ulong2 b, ulong2 c) {
-    ulong2 pairs = wasm_simd_relaxed_dot16(a, b);
     ulong2 result = ulong2(0ul);
     for (uint i = 0u; i < 4u; ++i) {
-        long x = wasm_simd_signed(wasm_simd_lane(pairs, 16u, i * 2u), 16u);
-        long y = wasm_simd_signed(wasm_simd_lane(pairs, 16u, i * 2u + 1u), 16u);
-        ulong z = wasm_simd_lane(c, 32u, i);
-        result = wasm_simd_replace(result, 32u, i, ulong(x + y) + z);
+        int sum = wasm_simd_signed_dot8(a, b, i * 4u, 4u);
+        uint accumulator = uint(wasm_simd_lane(c, 32u, i));
+        result = wasm_simd_replace(result, 32u, i, ulong(uint(sum) + accumulator));
     }
     return result;
 }

@@ -2268,6 +2268,49 @@ fn varied_float_bits_match_wasmtime() {
 }
 
 #[test]
+fn relaxed_dot_products_use_signed_wrapping_arithmetic() {
+    let wasm = wat::parse_str(
+        r#"(module
+        (func (export "dot") (param v128 v128 v128) (result v128 v128)
+            local.get 0 local.get 1 i16x8.relaxed_dot_i8x16_i7x16_s
+            local.get 0 local.get 1 local.get 2 i32x4.relaxed_dot_i8x16_i7x16_add_s))"#,
+    )
+    .unwrap();
+    let kernel = Kernel::new(&wasm, "dot").unwrap();
+    let a = [
+        -128i8, -128, -128, -128, 127, 127, 2, -3, -128, -128, 4, 5, 127, 127, 0, -1,
+    ];
+    let b = [
+        -128i8, -128, -127, -127, 127, 127, -3, -4, -128, -128, 5, -7, -128, -128, -1, 15,
+    ];
+    let accumulators = [i32::MAX, i32::MAX - 1, -1, i32::MIN];
+    let mut input = Vec::new();
+    let mut expected = Vec::new();
+    for (a, b) in [(a, b), (b, a.map(|value| value.wrapping_neg()))] {
+        let mut accumulator = [0; 16];
+        let mut pairs = [0; 16];
+        let mut sums = [0; 16];
+        let products: [i32; 16] = std::array::from_fn(|i| i32::from(a[i]) * i32::from(b[i]));
+        for (i, pair) in pairs.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let sum = products[2 * i] + products[2 * i + 1];
+            pair.copy_from_slice(&(sum as i16).to_le_bytes());
+        }
+        for (i, addend) in accumulators.into_iter().enumerate() {
+            let sum: i32 = products[4 * i..4 * i + 4].iter().sum();
+            accumulator[4 * i..4 * i + 4].copy_from_slice(&addend.to_le_bytes());
+            sums[4 * i..4 * i + 4].copy_from_slice(&addend.wrapping_add(sum).to_le_bytes());
+        }
+        input.push(vec![
+            Value::V128(a.map(|value| value as u8)),
+            Value::V128(b.map(|value| value as u8)),
+            Value::V128(accumulator),
+        ]);
+        expected.push(vec![Value::V128(pairs), Value::V128(sums)]);
+    }
+    assert_eq!(kernel.run_values(&input).unwrap(), expected);
+}
+
+#[test]
 fn simd_values_calls_globals_and_memory_match_wasmtime() {
     let a = Value::V128([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
     let b = Value::V128([255, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]);

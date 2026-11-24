@@ -450,12 +450,25 @@ fn live_gc_handles_preserve_aliases_and_survive_collection_in_other_instances() 
                 i32.const 0 i32.const 8 array.new $a drop
                 local.get $i i32.const 1 i32.add local.tee $i
                 i32.const 100 i32.lt_u br_if $again)
+            local.get 0 i32.eqz if unreachable end
             local.get 0))"#,
             ),
             &[],
         )
         .unwrap();
-    store.call_i32(allocator, "allocate", &[1, 2]).unwrap();
+    assert!(matches!(
+        store.call_i32(allocator, "allocate", &[1, 0]),
+        Err(Error::Trap {
+            input_index: 1,
+            reason: "unreachable executed",
+        })
+    ));
+    assert_eq!(
+        store
+            .call_i32(allocator, "allocate", &[1, u32::MAX])
+            .unwrap(),
+        [1, u32::MAX]
+    );
     assert_eq!(
         store.call(instance, "get", &[vec![], vec![]]).unwrap(),
         [vec![Value::I32(30)], vec![Value::I32(40)]]
