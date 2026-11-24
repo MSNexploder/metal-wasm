@@ -769,6 +769,11 @@ fn spec_exceptions_throw_ref() {
 }
 
 #[test]
+fn spec_exceptions_cast() {
+    check_script(include_str!("spec/core/exceptions/cast.wast"), 4);
+}
+
+#[test]
 fn spec_exceptions_try_table() {
     check_script(include_str!("spec/exceptions_try_table.wast"), 35);
 }

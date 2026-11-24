@@ -224,6 +224,11 @@ enum TraceReference {
     Guest(usize, RefType, u64),
 }
 
+enum CallInputs<'a> {
+    I32(&'a [u32]),
+    Rows(&'a [Vec<Value>]),
+}
+
 /// A fixed collection of lanes with persistent WebAssembly state.
 /// Calls, initialization, and traps retain memory, table, global, and heap writes.
 /// GC and exception handles obtained from a lane can only be passed to that lane.
@@ -661,8 +666,9 @@ impl Store {
         export: &str,
         inputs: &[Vec<Value>],
     ) -> Result<Vec<Vec<Value>>, Error> {
-        self.call_timed(instance, export, inputs, false)
-            .map(|(v, _)| v)
+        self.with_entry(instance, export, inputs.len(), |store, kernel| {
+            store.execute(kernel, inputs)
+        })
     }
     /// Call an `(i32) -> i32` export with one input per lane.
     /// State persists across calls, including writes made before a Wasm failure.
@@ -684,26 +690,19 @@ impl Store {
         export: &str,
         inputs: &[u32],
     ) -> Result<(Vec<u32>, Option<Duration>), Error> {
-        let (values, time) = self.call_timed(
-            instance,
-            export,
-            &inputs
-                .iter()
-                .map(|&v| vec![Value::I32(v)])
-                .collect::<Vec<_>>(),
-            true,
-        )?;
-        let values = values
-            .into_iter()
-            .map(|row| match row.as_slice() {
-                [Value::I32(v)] => Ok(*v),
-                _ => Err(Error::Unsupported(
-                    "export must have signature (i32) -> i32".into(),
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((values, time))
+        self.with_entry(instance, export, inputs.len(), |store, kernel| {
+            let (output, time, _) = store.dispatch_call(kernel, CallInputs::I32(inputs), true)?;
+            // The command completed and no lane failed. The scalar signature
+            // writes one initialized u32 per lane into the shared output buffer.
+            let values = unsafe {
+                std::slice::from_raw_parts(output.contents().as_ptr().cast::<u32>(), inputs.len())
+            }
+            .to_vec();
+            store.collect_garbage()?;
+            Ok((values, time))
+        })
     }
+
     /// Call every lane and return individual Wasm outcomes.
     /// All lanes retain writes made before completion, a trap, or an exception.
     pub fn call_outcomes(
@@ -712,36 +711,20 @@ impl Store {
         export: &str,
         inputs: &[Vec<Value>],
     ) -> Result<Vec<LaneResult>, Error> {
-        self.call_lanes_timed(instance, export, inputs, false, false)
-            .map(|(rows, _)| rows)
+        self.with_entry(instance, export, inputs.len(), |store, kernel| {
+            store.execute_lanes(kernel, inputs, false)
+        })
     }
 
-    fn call_timed(
+    fn with_entry<T>(
         &mut self,
         instance: Instance,
         export: &str,
-        inputs: &[Vec<Value>],
-        i32_only: bool,
-    ) -> Result<(Vec<Vec<Value>>, Option<Duration>), Error> {
-        let (rows, time) = self.call_lanes_timed(instance, export, inputs, i32_only, true)?;
-        let rows = rows
-            .into_iter()
-            .enumerate()
-            .map(|(lane, row)| row.map_err(|e| e.at(lane)))
-            .collect::<Result<_, _>>()?;
-        Ok((rows, time))
-    }
-
-    fn call_lanes_timed(
-        &mut self,
-        instance: Instance,
-        export: &str,
-        inputs: &[Vec<Value>],
-        i32_only: bool,
-        fail_fast: bool,
-    ) -> Result<(Vec<LaneResult>, Option<Duration>), Error> {
+        input_count: usize,
+        call: impl FnOnce(&mut Self, &Kernel) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         let (index, _) = self.export(instance, export, ExternalKind::Func)?;
-        if inputs.len() != self.lanes {
+        if input_count != self.lanes {
             return Err(Error::Unsupported(
                 "input row count does not match store lane count".into(),
             ));
@@ -752,68 +735,80 @@ impl Store {
         } else {
             self.compile(index, Some(export))?.0
         };
-        let result =
-            if i32_only && (kernel.params != [ValType::I32] || kernel.results != [ValType::I32]) {
-                Err(Error::Unsupported(
-                    "export must have signature (i32) -> i32".into(),
-                ))
-            } else {
-                self.execute_lanes(&kernel, inputs, fail_fast)
-            };
+        let result = call(self, &kernel);
         self.entries.insert(key, kernel);
         result
     }
+
     fn execute(
         &mut self,
         kernel: &Kernel,
         inputs: &[Vec<Value>],
-    ) -> Result<(Vec<Vec<Value>>, Option<Duration>), Error> {
-        let (rows, time) = self.execute_lanes(kernel, inputs, true)?;
-        let rows = rows
+    ) -> Result<Vec<Vec<Value>>, Error> {
+        self.execute_lanes(kernel, inputs, true)?
             .into_iter()
             .enumerate()
-            .map(|(lane, row)| row.map_err(|e| e.at(lane)))
-            .collect::<Result<_, _>>()?;
-        Ok((rows, time))
+            .map(|(lane, row)| row.map_err(|error| error.at(lane)))
+            .collect()
     }
 
-    fn execute_lanes(
+    fn dispatch_call(
         &mut self,
         kernel: &Kernel,
-        inputs: &[Vec<Value>],
+        inputs: CallInputs<'_>,
         fail_fast: bool,
-    ) -> Result<(Vec<LaneResult>, Option<Duration>), Error> {
+    ) -> Result<(Buffer, Option<Duration>, Option<Buffer>), Error> {
         self.check()?;
-        for (lane, row) in inputs.iter().enumerate() {
-            if row.len() != kernel.params.len()
-                || row
-                    .iter()
-                    .zip(&kernel.params)
-                    .any(|(&v, &t)| !self.accepts(v, t, lane))
-            {
+        let fast = kernel.params == [ValType::I32] && kernel.results == [ValType::I32];
+        match inputs {
+            CallInputs::I32(_) if !fast => {
                 return Err(Error::Unsupported(
-                    "input values do not match the export signature or lane".into(),
+                    "export must have signature (i32) -> i32".into(),
                 ));
             }
+            CallInputs::Rows(rows) => {
+                for (lane, row) in rows.iter().enumerate() {
+                    if row.len() != kernel.params.len()
+                        || row
+                            .iter()
+                            .zip(&kernel.params)
+                            .any(|(&v, &t)| !self.accepts(v, t, lane))
+                    {
+                        return Err(Error::Unsupported(
+                            "input values do not match the export signature or lane".into(),
+                        ));
+                    }
+                }
+            }
+            CallInputs::I32(_) => {}
         }
-        let fast = kernel.params == [ValType::I32] && kernel.results == [ValType::I32];
-        let mut input = Vec::new();
         let mut metadata = self.metadata_words().to_vec();
         let retained = self.trace_references(false, &metadata, &self.host_exception_slots)?;
         let mut host_slots = self.host_exception_slots.clone();
         host_slots.retain(|&(_, id), _| retained.host_exceptions.contains(&(id as usize - 1)));
-        for (lane, row) in inputs.iter().enumerate() {
-            for &value in row {
-                let words = self.encode(value, lane, &mut metadata, &mut host_slots)?;
-                for word in words {
-                    if fast {
-                        input.extend_from_slice(&(word as u32).to_ne_bytes());
-                    } else {
-                        input.extend_from_slice(&word.to_ne_bytes());
-                    }
+        let mut encoded = Vec::new();
+        let input = match inputs {
+            CallInputs::I32(values) => {
+                // u32 has no padding. Metal copies the borrowed bytes during dispatch.
+                unsafe {
+                    std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values))
                 }
             }
-        }
+            CallInputs::Rows(rows) => {
+                for (lane, row) in rows.iter().enumerate() {
+                    for &value in row {
+                        for word in self.encode(value, lane, &mut metadata, &mut host_slots)? {
+                            if fast {
+                                encoded.extend_from_slice(&(word as u32).to_ne_bytes());
+                            } else {
+                                encoded.extend_from_slice(&word.to_ne_bytes());
+                            }
+                        }
+                    }
+                }
+                &encoded
+            }
+        };
         let mut buffers = vec![vec![
             (4, self.resource_buffer.as_ref().unwrap().clone()),
             (6, self.metadata_buffer.as_ref().unwrap().clone()),
@@ -877,7 +872,7 @@ impl Store {
         self.install_metadata(&metadata, host_slots);
         let result_words: usize = kernel.results.iter().map(|t| value_words(*t)).sum();
         let dispatched = kernel.dispatch_lanes(
-            &input,
+            input,
             self.lanes * result_words * if fast { 4 } else { 8 },
             self.lanes as u32,
             &buffers,
@@ -902,6 +897,18 @@ impl Store {
             self.collect_garbage()?;
             return Err(error.at(lane));
         }
+        Ok((output, time, traps))
+    }
+
+    fn execute_lanes(
+        &mut self,
+        kernel: &Kernel,
+        inputs: &[Vec<Value>],
+        fail_fast: bool,
+    ) -> Result<Vec<LaneResult>, Error> {
+        let (output, _, traps) = self.dispatch_call(kernel, CallInputs::Rows(inputs), fail_fast)?;
+        let fast = kernel.params == [ValType::I32] && kernel.results == [ValType::I32];
+        let result_words: usize = kernel.results.iter().map(|t| value_words(*t)).sum();
         let mut rows = Vec::new();
         for lane in 0..self.lanes {
             if let Some(error) = lane_failure(&traps, lane) {
@@ -932,7 +939,7 @@ impl Store {
             rows.push(Ok(row));
         }
         self.collect_garbage()?;
-        Ok((rows, time))
+        Ok(rows)
     }
     /// Read one value per lane from an exported global, including provider globals.
     /// Returned references receive host leases and retain their lane identity.

@@ -5,7 +5,7 @@ Run many independent invocations of one WebAssembly function on a Metal GPU. Eac
 ## Requirements
 
 - macOS 15 or later with a Metal GPU. Linux and Windows are unsupported.
-- Rust 1.98 or later. The repository pins Rust 1.100.0 for development and release checks.
+- Rust 1.100 or later. The repository pins Rust 1.100.0 for development and release checks.
 - The Xcode command-line tools for local builds.
 
 ## Quick start
@@ -29,7 +29,7 @@ The kernel compiles once and can run repeatedly with different input batches. Ea
 
 ### Numeric operations and control flow
 
-The runtime accepts exported functions with any number of `i32`, `i64`, `f32`, `f64`, `v128`, and function, external, exception, or GC reference parameters and results. `Kernel::run` retains the fast `(i32) -> i32` interface; `Kernel::run_values` accepts a row of raw `Value` bit patterns per invocation. `Value::V128` stores 16 bytes in Wasm lane order. It supports scalar numeric operations, SIMD operations, conversions, structured control flow, direct and indirect calls, and `return_call`, `return_call_indirect`, and `return_call_ref`. Wide arithmetic supports `i64.add128`, `i64.sub128`, `i64.mul_wide_s`, and `i64.mul_wide_u`, with low/high `i64` results. Add/subtract propagate carry/borrow; multiplication uses Metal's signed or unsigned `mulhi`.
+The runtime accepts exported functions with any number of `i32`, `i64`, `f32`, `f64`, `v128`, and function, external, exception, or GC reference parameters and results. `Kernel::run` retains the fast `(i32) -> i32` interface; `Kernel::run_values` accepts a row of raw `Value` bit patterns per invocation. `Value::V128` stores 16 bytes in Wasm lane order. It supports scalar numeric operations, SIMD operations, conversions, structured control flow, direct and indirect calls, and `return_call`, `return_call_indirect`, and `return_call_ref`. Wide arithmetic supports `i64.add128`, `i64.sub128`, `i64.mul_wide_s`, and `i64.mul_wide_u`, with low/high `i64` results. Add/subtract propagate carry/borrow; multiplication uses Metal's signed or unsigned `mulhi`. Relaxed SIMD dot products use signed byte multiplication. The i16 result wraps each pair sum, and dot-add accumulates full products and wraps the i32 result.
 
 Tail calls reuse a shader call frame. Ordinary recursion is limited to 32 call frames by default; deeper calls trap. Larger call-depth limits can exceed the device’s stack capacity.
 
@@ -113,10 +113,11 @@ let second = store.call_i32(instance, "calculate", &[4, 5, 6])?;
 ```
 
 Use `Store::new_with_limits(lanes, limits)` to change resource bounds.
-`call(instance, export, rows)` supports general signatures. Every call needs
-exactly one input row per lane. `call_i32_timed` supplies the `(i32) -> i32`
-interface and GPU command time. Pipelines compile on their first use; adding
-an instance invalidates cached pipelines so indirect calls can reach new functions.
+`call(instance, export, rows)` supports general signatures and takes one input row
+per lane. `call_i32` and `call_i32_timed` take a flat slice of raw i32 bit patterns
+with one value per lane and return flat output. `call_i32_timed` also reports GPU
+command time. Pipelines compile on their first use. Adding an instance invalidates
+cached pipelines so indirect calls can reach new functions.
 
 `instantiate(wasm, &[("provider", existing_instance)])` links to live provider
 resources, including reexports and namespace aliases. Import limits are checked
@@ -215,7 +216,7 @@ bulk operations and collection still depend on the configured resource reserves.
 
 Run `cargo run --example compat -- MODULE.wasm EXPORT I32_INPUT ...` with chosen inputs to check an exported `(i32) -> i32` function against fresh Wasmtime instances. It reports an unsupported module or signature with the reason, accepts matching traps and uncaught exceptions, and fails if Metal and Wasmtime disagree. For example, `cargo run --example compat -- tests/corpus/memory.wasm calculate 0 1 42` checks a compiled Rust memory workload. Use terminating functions: the GPU has a fuel budget, while this CPU comparison does not.
 
-`cargo test --test compiled_corpus` checks eight compiled Rust, C, and C++ modules against Wasmtime and checks that a ninth compiled module reports its unsupported host import. The C and C++ fixtures include unoptimized and optimized builds. Tests cover numeric compiler lowering, SIMD, indirect calls, memory, and persistent C++ statics. `cargo test --test persistent_runtime` also compares a compiled Rust static with persistent Wasmtime instances and checks lane state, linking, traps, live references, and collection. Sources, binaries, and build commands are in `tests/corpus/`. `cargo test --test spec_runtime` runs all 258 scripts from the pinned official core tree, including scalar, control-flow, binary validation, SIMD and relaxed SIMD, references, exceptions, tail calls, multiple memories, memory64/table64, GC, linking, initialization, and bulk operations. No assertions are skipped. It uses actual persistent instances, including actions after traps, named invocations, registrations, global reads, and module definitions; see `tests/spec/README.md` for provenance and test resource limits. The harness also runs the complete wide arithmetic proposal script and four custom page size proposal scripts. These checks do not establish full Wasm conformance.
+`cargo test --test compiled_corpus` checks eight compiled Rust, C, and C++ modules against Wasmtime and checks that a ninth compiled module reports its unsupported host import. The C and C++ fixtures include unoptimized and optimized builds. Tests cover numeric compiler lowering, SIMD, indirect calls, memory, and persistent C++ statics. `cargo test --test persistent_runtime` also compares a compiled Rust static with persistent Wasmtime instances and checks lane state, linking, traps, live references, and collection. Sources, binaries, and build commands are in `tests/corpus/`. `cargo test --test spec_runtime` runs all 259 scripts from the pinned official core tree, including scalar, control-flow, binary validation, SIMD and relaxed SIMD, references, exceptions, tail calls, multiple memories, memory64/table64, GC, linking, initialization, and bulk operations. No assertions are skipped. It uses actual persistent instances, including actions after traps, named invocations, registrations, global reads, and module definitions; see `tests/spec/README.md` for provenance and test resource limits. The harness also runs the complete wide arithmetic proposal script and four custom page size proposal scripts. These checks do not establish full Wasm conformance.
 
 `cargo test --test generated_runtime` compares 24 reproducible generated programs
 with Wasmtime across 2,352 fresh and persistent invocations. Seeds select arithmetic
