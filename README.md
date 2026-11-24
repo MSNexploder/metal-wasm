@@ -5,7 +5,7 @@ Run many independent invocations of one WebAssembly function on a Metal GPU. Eac
 ## Requirements
 
 - macOS 15 or later with a Metal GPU. Linux and Windows are unsupported.
-- Rust 1.98 or later. Rust 1.98 is the declared minimum and release validation toolchain.
+- Rust 1.98 or later. The repository pins Rust 1.100.0 for development and release checks.
 - The Xcode command-line tools for local builds.
 
 ## Quick start

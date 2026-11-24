@@ -2,8 +2,10 @@
 
 ## Environment
 
-Use a Mac running macOS 15 or later with a Metal GPU, Rust 1.98 or later,
-and Xcode command-line tools. The test suite executes real Metal commands.
+Use a Mac running macOS 15 or later with a Metal GPU and Xcode command-line
+tools. Rustup selects the Rust, Clippy, and rustfmt versions from
+`rust-toolchain.toml`. The crate supports Rust 1.98 or later.
+The test suite executes real Metal commands.
 A machine without a Metal device cannot provide runtime validation.
 The checked-in compiler corpus needs no Wasm compiler to run.
 

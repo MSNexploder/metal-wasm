@@ -9,7 +9,10 @@ unsupported host dependency when no Wasm provider is registered.
 `persistent` keeps a mutable Rust static across calls. Its test compares each
 Metal lane with its own persistent Wasmtime instance through two exports.
 
-Rebuild with the `wasm32-wasip1` target installed:
+The commands below use the repository's pinned development toolchain.
+To use the original Rust compiler and linker, set `RUSTUP_TOOLCHAIN=1.98.0`
+for the shell before running the commands. Install the `wasm32-wasip1`
+target for the selected toolchain with `rustup target add wasm32-wasip1`.
 
 ```sh
 for name in scalar memory persistent; do
