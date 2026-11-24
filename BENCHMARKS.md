@@ -1,4 +1,50 @@
-# Benchmark overview — 2026-10-01
+# Benchmark overview
+
+## Store scalar calls on 2026-11-24
+
+Both revisions ran sequentially on the same Apple M1 Max with macOS 27.2.1,
+Xcode 27.2, and Rust 1.100.0. Both used release builds with Metal API Validation
+disabled. The baseline was `3e45299`, and the flat scalar path was `114b6cc`.
+
+### Persistent state
+
+Run `cargo run --locked --release --example compare -- --persistent` at each
+revision. Each sample executes 16 calls per lane, and every final digest matches
+the configured CPU references. Times are medians of three samples in
+milliseconds. Metal total includes argument handling, dispatch, synchronization,
+and result extraction. GPU time measures the command buffers.
+[Raw persistent results for both revisions](examples/persistent-benchmark-results-2026-11-24.csv).
+
+| Lanes | Baseline total | Flat path total | Baseline GPU | Flat path GPU |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 4.273 | 3.976 | 0.450 | 0.452 |
+| 1,000 | 6.488 | 4.932 | 0.526 | 0.557 |
+| 4,096 | 14.315 | 5.994 | 1.198 | 0.637 |
+| 10,000 | 28.051 | 8.379 | 2.181 | 2.304 |
+
+### Warmed scalar calls
+
+A separate probe called `Store::call_i32_timed` on a Wasm export that increments
+a per-lane global and adds the new count to its input. Each revision ran four
+times, alternating which revision ran first. Each run warmed the export before
+taking 101 timed calls per lane count. The table reports the median across the
+four run medians. It also reports the Rust allocation and reallocation calls
+counted during one separately measured Store call in each run. The allocation count covers
+the Rust global allocator. Every call's output was verified outside timing.
+[Raw scalar probe data](examples/store-scalar-profile-2026-11-24.csv).
+
+| Lanes | Baseline total (µs) | Flat path total (µs) | Baseline allocator calls | Flat path allocator calls |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 197.02 | 197.98 | 12 | 5 |
+| 64 | 202.15 | 189.79 | 277 | 5 |
+| 1,000 | 317.69 | 196.58 | 4,033 | 5 |
+| 10,000 | 1,501.92 | 295.35 | 40,045 | 5 |
+
+The one-lane median was about 198 µs on both revisions. The largest latency
+reduction occurred at 10,000 lanes. These results describe the two workloads
+on this Mac.
+
+## Full suite on 2026-10-01
 
 All five benchmark modes completed successfully. All returned results or final lane digests matched their native references. The dataset contains **89 result rows across 21 named workloads**. `control_flow` has two input patterns.
 
