@@ -15,17 +15,17 @@ default-target = "aarch64-apple-darwin"
 targets = []
 
 [dependencies]
-objc2 = "0.6.4"
+objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSString"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = [
     "std", "MTLAllocation", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder",
     "MTLCommandQueue", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLDevice",
     "MTLLibrary", "MTLResource", "MTLTypes", "objc2-core-foundation",
 ] }
-wasmparser = { version = "0.259", default-features = false, features = ["std", "validate", "features", "simd"] }
+wasmparser = { version = "0.263", default-features = false, features = ["std", "validate", "features", "simd"] }
 
 [dev-dependencies]
-wasmi = { version = "2.0", default-features = false, features = ["stable", "std", "validate"] }
-wasmtime = { version = "49.0.1", default-features = false, features = ["cranelift", "runtime", "std", "gc", "gc-drc"] }
-wast = "259"
-wat = "1"
+wasmi = { version = "2.0.2", default-features = false, features = ["stable", "std", "validate"] }
+wasmtime = { version = "51.0.0", default-features = false, features = ["cranelift", "runtime", "std", "gc", "gc-drc"] }
+wast = "263"
+wat = "1.263.0"

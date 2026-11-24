@@ -5581,7 +5581,13 @@ impl Compiler<'_> {
         memarg: &wasmparser::MemArg,
         width: usize,
     ) -> Result<String, Error> {
-        let memory = self.select_memory(memarg.memory)?;
+        let (wasmparser::MemArgTarget::Memory(memory), None) = (memarg.target, memarg.ordering)
+        else {
+            return Err(Error::Unsupported(
+                "unsupported memory access target or ordering".into(),
+            ));
+        };
+        let memory = self.select_memory(memory)?;
         let is64 = memory.is64;
         let page_size = memory.page_size;
         let index = self.fresh_value();
