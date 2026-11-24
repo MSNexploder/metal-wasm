@@ -232,7 +232,16 @@ handles, retained graphs, and cyclic record reclamation.
 
 ## Performance comparison
 
-See the [complete benchmark overview](BENCHMARKS.md) for the 2026-10-01 run on the `objc2-metal` backend: all 89 rows, invocation counts, Metal total and GPU-only times, CPU comparisons, and methodology. The historical results below remain available.
+On an M1 Max, the flat `Store::call_i32` path reduced the persistent-state
+benchmark from **28.05 ms to 8.38 ms** at 10,000 lanes and 16 calls per lane
+(**3.35× faster**). In a separate warmed scalar probe at 10,000 lanes, median
+call time fell from **1.502 ms to 0.295 ms**, and Rust allocation and reallocation
+calls per Store call fell from **40,045 to 5**. Both measurements use the
+end-to-end Metal API on the same Mac.
+[November 2026 results, methodology, and raw data](BENCHMARKS.md#store-scalar-calls-on-2026-11-24).
+
+The [October 2026 full suite](BENCHMARKS.md#full-suite-on-2026-10-01) covers
+89 rows across 21 workloads, with Metal total and GPU command times and CPU comparisons.
 
 Run `cargo run --release --example compare -- --wide-arithmetic` or
 `--byte-pages` for the new feature workloads. Both also run in `--suite`.
